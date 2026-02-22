@@ -1,0 +1,137 @@
+<!-- Тулбар зума -->
+
+<div class="diagram-toolbar">
+  <button (click)="zoomOut()">−</button>
+  <span class="diagram-zoom-label">{{ zoomLabel }}</span>
+  <button (click)="zoomIn()">+</button>
+  <button (click)="resetView()">Reset</button>
+</div>
+
+<!-- Область диаграммы: pan и wheel слушаются здесь -->
+
+<div
+  class="diagram-host"
+  #host
+  [class.panning]="isPanning"
+  (mousedown)="onHostMouseDown($event)"
+  (wheel)="onWheel($event)">
+
+  <!--
+    SVG ПОВЕРХ всего, занимает весь host, НЕ трансформируется.
+    Рёбра уже содержат готовые экранные координаты из render().
+  -->
+
+  <svg class="diagram-edges">
+    <defs>
+      <marker
+        id="diagram-arrow"
+        markerWidth="8"
+        markerHeight="8"
+        refX="7"
+        refY="4"
+        orient="auto">
+        <path d="M0,0 L0,8 L8,4 z" fill="#555" />
+      </marker>
+    </defs>
+
+    @for (edge of iEdges; track edge.id) {
+      <path
+        [attr.d]="edge.path"
+        class="diagram-edge"
+        marker-end="url(#diagram-arrow)" />
+    }
+  </svg>
+
+  <!--
+    Узлы. Каждый — div-обёртка (ловит drag) + button внутри (ловит click).
+    left/top задают ЦЕНТР узла; transform сдвигает на -50%/-50% и масштабирует.
+    Важно: z-index обёртки > z-index SVG, чтобы узлы были кликабельны.
+  -->
+
+  @for (node of iNodes; track node.id; let i = $index) {
+    <div
+      class="diagram-node-wrapper"
+      [class.dragging]="dragIdx === i"
+      [style.left.px]="sx(i)"
+      [style.top.px]="sy(i)"
+      [style.transform]="nodeTransform()"
+      (mousedown)="onNodeMouseDown($event, i)">
+
+    <button
+      class="diagram-node"
+      (click)="onNodeClick($event, node)">
+      {{ node.label }}
+    </button>
+    </div>
+  }
+
+</div>
+
+
+<!--<div class="header">-->
+<!--  <div class="header-title"><span>app</span>/diagram.component &nbsp;·&nbsp; Angular 18</div>-->
+<!--  <div class="zoom-controls">-->
+<!--    <button class="zoom-btn" (click)="zoomOut()">−</button>-->
+<!--    <div class="zoom-label">{{ zoomPercent }}%</div>-->
+<!--    <button class="zoom-btn" (click)="zoomIn()">+</button>-->
+<!--    <button class="zoom-btn zoom-reset" (click)="resetView()">Reset</button>-->
+<!--  </div>-->
+<!--</div>-->
+
+<!--<div-->
+<!--  class="diagram-host"-->
+<!--  #host-->
+<!--  [class.panning]="isPanning"-->
+<!--  (mousedown)="onHostMouseDown($event)"-->
+<!--  (wheel)="onWheel($event)">-->
+
+<!--  &lt;!&ndash; SVG не трансформируется — рёбра рисуются в экранных координатах &ndash;&gt;-->
+<!--  <svg class="edges-svg">-->
+<!--    <defs>-->
+<!--      <marker id="arr1" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">-->
+<!--        <path d="M0,0 L0,7 L7,3.5 z" fill="var(&#45;&#45;accent1)"/>-->
+<!--      </marker>-->
+<!--      <marker id="arr2" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">-->
+<!--        <path d="M0,0 L0,7 L7,3.5 z" fill="var(&#45;&#45;accent2)"/>-->
+<!--      </marker>-->
+<!--      <marker id="arr3" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">-->
+<!--        <path d="M0,0 L0,7 L7,3.5 z" fill="var(&#45;&#45;accent3)"/>-->
+<!--      </marker>-->
+<!--    </defs>-->
+
+<!--    @for (edge of edges; track edge.id) {-->
+<!--      <path-->
+<!--        [attr.d]="edge.path"-->
+<!--        class="edge"-->
+<!--        [class]="'edge edge-' + edge.colorIdx"-->
+<!--        [attr.marker-end]="'url(#arr' + edge.colorIdx + ')'"/>-->
+<!--      <circle-->
+<!--        class="edge-dot"-->
+<!--        [attr.cx]="edge.dotX"-->
+<!--        [attr.cy]="edge.dotY"-->
+<!--        r="4"-->
+<!--        [attr.fill]="'var(&#45;&#45;accent' + edge.colorIdx + ')'"-->
+<!--        [style.animation-delay]="edge.dotDelay"/>-->
+<!--    }-->
+<!--  </svg>-->
+
+<!--  &lt;!&ndash; Узлы &ndash;&gt;-->
+<!--  @for (node of nodes; track node.id; let i = $index) {-->
+<!--    <div-->
+<!--      class="node"-->
+<!--      [class]="'node node-' + (i + 1)"-->
+<!--      [class.dragging]="dragIndex === i"-->
+<!--      [style.left.px]="screenX(i)"-->
+<!--      [style.top.px]="screenY(i)"-->
+<!--      [style.transform]="'translate(-50%,-50%) scale(' + zoom + ')'"-->
+<!--      (mousedown)="onNodeMouseDown($event, i)">-->
+<!--      <div class="node-inner">-->
+<!--        <div class="node-icon">{{ node.icon }}</div>-->
+<!--        <div class="node-label">{{ node.label }}</div>-->
+<!--        <div class="node-sub">{{ node.sub }}</div>-->
+<!--      </div>-->
+<!--    </div>-->
+<!--  }-->
+
+<!--  <div class="hint">⌃ Ctrl + колёсико — зум &nbsp;·&nbsp; Тащите узлы или фон</div>-->
+<!--</div>-->

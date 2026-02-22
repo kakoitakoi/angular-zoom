@@ -1,0 +1,331 @@
+// diagram.component.scss
+// Минимальные стили строго для функционала.
+
+:host {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  // Блокируем выделение текста во время drag
+  user-select: none;
+}
+
+// ── Тулбар ────────────────────────────────────────────────────
+.diagram-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  flex-shrink: 0;
+}
+
+.diagram-zoom-label {
+  min-width: 48px;
+  text-align: center;
+}
+
+// ── Область диаграммы ─────────────────────────────────────────
+.diagram-host {
+  flex: 1;
+  position: relative;  // нужно для absolute-позиционирования узлов и SVG
+  overflow: hidden;
+  cursor: grab;
+
+  &.panning { cursor: grabbing; }
+}
+
+// ── SVG рёбра ─────────────────────────────────────────────────
+// Растянуто на весь host, НЕ трансформируется,
+// pointer-events: none — чтобы не мешать drag/click узлов
+.diagram-edges {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  overflow: visible;
+  z-index: 1;
+}
+
+.diagram-edge {
+  fill: none;
+  stroke: #555;
+  stroke-width: 1.5px;
+}
+
+// ── Обёртка узла (ловит mousedown для drag) ───────────────────
+// left/top = центр узла; transform = translate(-50%,-50%) scale(zoom)
+// z-index > SVG — чтобы узлы перекрывали рёбра и были интерактивны
+.diagram-node-wrapper {
+  position: absolute;
+  z-index: 2;
+  cursor: grab;
+
+  &.dragging { cursor: grabbing; z-index: 10; }
+}
+
+// ── Кнопка-узел ───────────────────────────────────────────────
+// Размеры ДОЛЖНЫ совпадать с NODE_W/NODE_H в .ts (120 x 40)
+.diagram-node {
+  display: block;
+  width: 120px;
+  height: 40px;
+  cursor: grab;
+
+  // Не даём кнопке перетягивать фокус при быстром drag
+  &:active { cursor: grabbing; }
+}
+
+
+//// ================================================================
+//// diagram.component.scss  —  Angular 21 / dart-sass compatible
+//// ================================================================
+//
+//// Анимации объявляем ГЛОБАЛЬНО (вне :host) — dart-sass требует этого
+//@keyframes dash {
+//  to { stroke-dashoffset: -26; }
+//}
+//
+//@keyframes pulse-dot {
+//  0%, 100% { opacity: 1; }
+//  50%       { opacity: 0.35; }
+//}
+//
+//// ── Хост-компонент ─────────────────────────────────────────────
+//:host {
+//  // CSS-переменные для SVG (fill="var(--accent1)" в шаблоне)
+//  --accent1: #4f8ef7;
+//  --accent2: #a855f7;
+//  --accent3: #22d3a5;
+//
+//  display: flex;
+//  flex-direction: column;
+//  height: 100vh;
+//  overflow: hidden;
+//  user-select: none;
+//  font-family: 'Syne', 'Segoe UI', sans-serif;
+//  background: #0a0c12;
+//  color: #e2e8f0;
+//}
+//
+//// ── Header ─────────────────────────────────────────────────────
+//.header {
+//  display: flex;
+//  align-items: center;
+//  justify-content: space-between;
+//  padding: 14px 24px;
+//  border-bottom: 1px solid #1e2535;
+//  background: #111520;
+//  flex-shrink: 0;
+//  z-index: 10;
+//}
+//
+//.header-title {
+//  font-size: 13px;
+//  font-family: 'JetBrains Mono', 'Courier New', monospace;
+//  color: #64748b;
+//  letter-spacing: 0.08em;
+//
+//  span {
+//    color: #4f8ef7;
+//  }
+//}
+//
+//// ── Zoom controls ──────────────────────────────────────────────
+//.zoom-controls {
+//  display: flex;
+//  align-items: center;
+//  gap: 6px;
+//}
+//
+//.zoom-btn {
+//  width: 32px;
+//  height: 32px;
+//  border: 1px solid #1e2535;
+//  background: #0a0c12;
+//  color: #e2e8f0;
+//  border-radius: 8px;
+//  cursor: pointer;
+//  font-size: 16px;
+//  font-weight: 700;
+//  font-family: inherit;
+//  display: flex;
+//  align-items: center;
+//  justify-content: center;
+//  transition: background 0.15s, border-color 0.15s, transform 0.1s;
+//
+//  &:hover {
+//    background: #1e2535;
+//    border-color: #4f8ef7;
+//  }
+//
+//  &:active {
+//    transform: scale(0.92);
+//  }
+//
+//  &.zoom-reset {
+//    width: auto;
+//    padding: 0 12px;
+//    font-size: 11px;
+//    letter-spacing: 0.06em;
+//  }
+//}
+//
+//.zoom-label {
+//  font-family: 'JetBrains Mono', 'Courier New', monospace;
+//  font-size: 12px;
+//  min-width: 52px;
+//  text-align: center;
+//  color: #64748b;
+//}
+//
+//// ── Diagram canvas ─────────────────────────────────────────────
+//.diagram-host {
+//  flex: 1;
+//  overflow: hidden;
+//  position: relative;
+//  background:
+//    radial-gradient(ellipse 60% 50% at 20% 30%, rgba(79, 142, 247, 0.06) 0%, transparent 70%),
+//    radial-gradient(ellipse 50% 40% at 80% 70%, rgba(168, 85, 247, 0.05) 0%, transparent 70%),
+//    #0a0c12;
+//  cursor: grab;
+//
+//  &.panning {
+//    cursor: grabbing;
+//  }
+//
+//  &::before {
+//    content: '';
+//    position: absolute;
+//    inset: 0;
+//    background-image: radial-gradient(circle, rgba(255, 255, 255, 0.08) 1px, transparent 1px);
+//    background-size: 28px 28px;
+//    pointer-events: none;
+//  }
+//}
+//
+//// ── SVG рёбра ─────────────────────────────────────────────────
+//.edges-svg {
+//  position: absolute;
+//  inset: 0;
+//  width: 100%;
+//  height: 100%;
+//  pointer-events: none;
+//  z-index: 2;
+//  overflow: visible;
+//}
+//
+//.edge {
+//  fill: none;
+//  stroke-width: 2.5;
+//  stroke-linecap: round;
+//  stroke-dasharray: 8 5;
+//  animation: dash 1.4s linear infinite;
+//
+//  &.edge-1 { stroke: var(--accent1); }
+//  &.edge-2 { stroke: var(--accent2); }
+//  &.edge-3 { stroke: var(--accent3); }
+//}
+//
+//.edge-dot {
+//  animation: pulse-dot 1.8s ease-in-out infinite;
+//}
+//
+//// ── Узлы ──────────────────────────────────────────────────────
+//.node {
+//  position: absolute;
+//  width: 160px;
+//  height: 64px;
+//  cursor: grab;
+//  z-index: 3;
+//
+//  &.dragging {
+//    cursor: grabbing;
+//    z-index: 20;
+//  }
+//
+//  &:not(.dragging):hover .node-inner {
+//    transform: scale(1.05);
+//  }
+//}
+//
+//.node-inner {
+//  width: 100%;
+//  height: 100%;
+//  border-radius: 14px;
+//  border: 1.5px solid transparent;
+//  display: flex;
+//  align-items: center;
+//  justify-content: center;
+//  flex-direction: column;
+//  gap: 2px;
+//  transition: box-shadow 0.2s, transform 0.15s;
+//}
+//
+//.node-1 {
+//  .node-inner {
+//    border-color: #4f8ef7;
+//    background: rgba(79, 142, 247, 0.12);
+//    box-shadow: 0 0 22px rgba(79, 142, 247, 0.3);
+//  }
+//  &:hover .node-inner {
+//    box-shadow: 0 0 40px rgba(79, 142, 247, 0.6);
+//  }
+//}
+//
+//.node-2 {
+//  .node-inner {
+//    border-color: #a855f7;
+//    background: rgba(168, 85, 247, 0.12);
+//    box-shadow: 0 0 22px rgba(168, 85, 247, 0.3);
+//  }
+//  &:hover .node-inner {
+//    box-shadow: 0 0 40px rgba(168, 85, 247, 0.6);
+//  }
+//}
+//
+//.node-3 {
+//  .node-inner {
+//    border-color: #22d3a5;
+//    background: rgba(34, 211, 165, 0.12);
+//    box-shadow: 0 0 22px rgba(34, 211, 165, 0.3);
+//  }
+//  &:hover .node-inner {
+//    box-shadow: 0 0 40px rgba(34, 211, 165, 0.6);
+//  }
+//}
+//
+//.node-icon {
+//  font-size: 18px;
+//}
+//
+//.node-label {
+//  font-size: 13px;
+//  font-weight: 700;
+//  letter-spacing: 0.04em;
+//}
+//
+//.node-sub {
+//  font-size: 10px;
+//  color: #64748b;
+//  font-family: 'JetBrains Mono', monospace;
+//}
+//
+//// ── Подсказка ─────────────────────────────────────────────────
+//.hint {
+//  position: absolute;
+//  bottom: 16px;
+//  left: 50%;
+//  transform: translateX(-50%);
+//  font-family: 'JetBrains Mono', monospace;
+//  font-size: 11px;
+//  color: #64748b;
+//  background: rgba(10, 12, 18, 0.9);
+//  border: 1px solid #1e2535;
+//  padding: 7px 16px;
+//  border-radius: 99px;
+//  pointer-events: none;
+//  letter-spacing: 0.05em;
+//  z-index: 10;
+//  white-space: nowrap;
+//}
