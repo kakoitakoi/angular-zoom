@@ -1,0 +1,201 @@
+graph.model.ts
+export interface GraphNode {
+  id: string;
+  label: string;
+  x: number;
+  y: number;
+  children?: GraphNode[];
+}
+
+query-plan.component.ts
+import {
+  Component,
+  AfterViewInit,
+  ElementRef,
+  ViewChild,
+  signal
+} from '@angular/core';
+
+import { GraphNode } from './graph.model';
+import { GraphRenderer } from './graph-renderer';
+
+@Component({
+  selector: 'app-query-plan',
+  standalone: true,
+  templateUrl: './query-plan.component.html',
+  styleUrls: ['./query-plan.component.scss']
+})
+export class QueryPlanComponent implements AfterViewInit {
+
+  @ViewChild('container', { static: true })
+  container!: ElementRef<HTMLDivElement>;
+
+  private renderer!: GraphRenderer;
+
+  nodes = signal<GraphNode[]>(this.generateMockTree());
+
+  ngAfterViewInit() {
+    this.renderer = new GraphRenderer(this.container.nativeElement);
+    this.renderer.render(this.nodes());
+  }
+
+  private generateMockTree(): GraphNode[] {
+    return [
+      {
+        id: '1',
+        label: 'Root',
+        x: 400,
+        y: 50,
+        children: [
+          {
+            id: '2',
+            label: 'Node A',
+            x: 250,
+            y: 150
+          },
+          {
+            id: '3',
+            label: 'Node B',
+            x: 550,
+            y: 150
+          }
+        ]
+      }
+    ];
+  }
+}
+
+query-plan.component.html
+<div #container class="graph-container"></div>
+
+query-plan.component.scss
+.graph-container {
+  width: 100%;
+  height: 100vh;
+  background: #f8f9fa;
+  overflow: hidden;
+}
+
+graph-renderer.ts
+import * as d3 from 'd3';
+import { GraphNode } from './graph.model';
+
+export class GraphRenderer {
+
+  private svg: any;
+  private g: any;
+
+  constructor(private container: HTMLElement) {
+    this.init();
+  }
+
+  private init() {
+    this.svg = d3.select(this.container)
+      .append('svg')
+      .attr('width', '100%')
+      .attr('height', '100%');
+
+    this.g = this.svg.append('g');
+
+    this.svg.call(
+      d3.zoom()
+        .scaleExtent([0.3, 3])
+        .on('zoom', (event) => {
+          this.g.attr('transform', event.transform);
+        })
+    );
+  }
+
+  render(nodes: GraphNode[]) {
+    const flatNodes = this.flatten(nodes);
+    const links = this.generateLinks(nodes);
+
+    // LINKS
+    this.g.selectAll('line')
+      .data(links)
+      .enter()
+      .append('line')
+      .attr('x1', d => d.source.x)
+      .attr('y1', d => d.source.y)
+      .attr('x2', d => d.target.x)
+      .attr('y2', d => d.target.y)
+      .attr('stroke', '#999');
+
+    // NODES
+    const node = this.g.selectAll('g.node')
+      .data(flatNodes)
+      .enter()
+      .append('g')
+      .attr('class', 'node')
+      .attr('transform', d => `translate(${d.x}, ${d.y})`)
+      .call(
+        d3.drag()
+          .on('drag', (event, d: any) => {
+            d.x = event.x;
+            d.y = event.y;
+
+            d3.select(event.sourceEvent.target.parentNode)
+              .attr('transform', `translate(${d.x}, ${d.y})`);
+
+            this.updateLinks();
+          })
+      );
+
+    node.append('rect')
+      .attr('width', 100)
+      .attr('height', 40)
+      .attr('rx', 6)
+      .attr('fill', '#ffffff')
+      .attr('stroke', '#333');
+
+    node.append('text')
+      .attr('x', 50)
+      .attr('y', 25)
+      .attr('text-anchor', 'middle')
+      .text(d => d.label);
+  }
+
+  private updateLinks() {
+    this.g.selectAll('line')
+      .attr('x1', d => d.source.x)
+      .attr('y1', d => d.source.y)
+      .attr('x2', d => d.target.x)
+      .attr('y2', d => d.target.y);
+  }
+
+  private flatten(nodes: GraphNode[]): GraphNode[] {
+    const result: GraphNode[] = [];
+
+    const recurse = (node: GraphNode) => {
+      result.push(node);
+      node.children?.forEach(recurse);
+    };
+
+    nodes.forEach(recurse);
+    return result;
+  }
+
+  private generateLinks(nodes: GraphNode[]) {
+    const links: any[] = [];
+
+    const recurse = (node: GraphNode) => {
+      node.children?.forEach(child => {
+        links.push({ source: node, target: child });
+        recurse(child);
+      });
+    };
+
+    nodes.forEach(recurse);
+    return links;
+  }
+}
+
+
+query-plan/
+ ├── query-plan.component.ts
+ ├── query-plan.component.html
+ ├── query-plan.component.scss
+ ├── graph.model.ts
+ └── graph-renderer.ts
+
+
