@@ -1,3 +1,7 @@
+
+
+
+
 flow-editor.component.ts
 import { Component } from '@angular/core';
 import { CommonModule } from '@angular/common';
@@ -159,4 +163,162 @@ flow-editor.component.scss
 }
 
 
+
+
+
+
+V2
+
+ts
+
+import { Component } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { FFlowModule } from '@foblex/flow';
+
+interface NodeModel {
+  id: string;
+  x: number;
+  y: number;
+  label: string;
+}
+
+interface ConnectionModel {
+  id: string;
+  from: string;
+  to: string;
+}
+
+@Component({
+  selector: 'app-flow-editor',
+  standalone: true,
+  imports: [CommonModule, FFlowModule],
+  templateUrl: './flow-editor.component.html',
+  styleUrls: ['./flow-editor.component.scss']
+})
+export class FlowEditorComponent {
+
+  nodes: NodeModel[] = [
+    { id: '1', x: 100, y: 100, label: 'Source' },
+    { id: '2', x: 350, y: 120, label: 'Transform' },
+    { id: '3', x: 600, y: 250, label: 'Filter' },
+    { id: '4', x: 350, y: 350, label: 'Aggregator' },
+    { id: '5', x: 100, y: 350, label: 'Sink' }
+  ];
+
+  connections: ConnectionModel[] = [
+    { id: 'c1', from: 'out-1', to: 'in-2' }
+  ];
+
+  onConnectionCreated(event: any) {
+    const id = crypto.randomUUID();
+
+    this.connections = [
+      ...this.connections,
+      {
+        id,
+        from: event.fOutputId,
+        to: event.fInputId
+      }
+    ];
+  }
+
+  removeConnection(id: string) {
+    this.connections = this.connections.filter(c => c.id !== id);
+  }
+}
+
+
+html
+
+<f-flow
+  class="flow-container"
+  [fZoom]="true"
+  [fDraggable]="true"
+  (fConnectionCreated)="onConnectionCreated($event)"
+>
+
+  <f-canvas>
+
+    <!-- NODES -->
+    <f-node
+      *ngFor="let node of nodes"
+      [fNodeId]="node.id"
+      [fPosition]="{ x: node.x, y: node.y }"
+      fDragHandle
+      class="node"
+    >
+
+      <div class="node-header">
+        {{ node.label }}
+      </div>
+
+      <!-- INPUT -->
+      <f-input
+        [attr.fInputId]="'in-' + node.id"
+        class="port input"
+      ></f-input>
+
+      <!-- OUTPUT -->
+      <f-output
+        [attr.fOutputId]="'out-' + node.id"
+        class="port output"
+      ></f-output>
+
+    </f-node>
+
+    <!-- CONNECTIONS -->
+    <f-connection
+      *ngFor="let connection of connections"
+      [attr.fOutputId]="connection.from"
+      [attr.fInputId]="connection.to"
+      (click)="removeConnection(connection.id)"
+    ></f-connection>
+
+  </f-canvas>
+
+</f-flow>
+
+
+scss
+
+.flow-container {
+  width: 100%;
+  height: 100vh;
+  background: #f3f4f6;
+}
+
+.node {
+  width: 200px;
+  background: white;
+  border-radius: 14px;
+  padding: 16px;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.08);
+  position: relative;
+}
+
+.node-header {
+  font-weight: 600;
+  margin-bottom: 20px;
+}
+
+.port {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  position: absolute;
+  background: #6366f1;
+  cursor: crosshair;
+}
+
+.input {
+  left: -7px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.output {
+  right: -7px;
+  top: 50%;
+  transform: translateY(-50%);
+}
 
