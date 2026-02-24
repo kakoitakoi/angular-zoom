@@ -322,3 +322,61 @@ scss
   transform: translateY(-50%);
 }
 
+
+
+
+v3
+ts
+import { Component } from '@angular/core';
+import { CommonModule } from '@angular/common';
+
+import {
+  FFlowComponent,
+  FCanvasComponent,
+  FNodeComponent,
+  FInputComponent,
+  FOutputComponent,
+  FConnectionComponent
+} from '@foblex/flow';
+
+@Component({
+  selector: 'app-flow-editor',
+  standalone: true,
+  imports: [
+    CommonModule,
+
+    // 🔥 импортируем standalone компоненты
+    FFlowComponent,
+    FCanvasComponent,
+    FNodeComponent,
+    FInputComponent,
+    FOutputComponent,
+    FConnectionComponent
+  ],
+  templateUrl: './flow-editor.component.html',
+  styleUrls: ['./flow-editor.component.scss']
+})
+export class FlowEditorComponent {}
+
+
+httml
+<f-flow [zoom]="true" [draggable]="true">
+
+  <f-canvas>
+
+    <f-node nodeId="1" [position]="{ x: 100, y: 100 }">
+      <f-output outputId="out-1"></f-output>
+    </f-node>
+
+    <f-node nodeId="2" [position]="{ x: 300, y: 200 }">
+      <f-input inputId="in-2"></f-input>
+    </f-node>
+
+    <f-connection
+      outputId="out-1"
+      inputId="in-2">
+    </f-connection>
+
+  </f-canvas>
+
+</f-flow>
