@@ -380,3 +380,25 @@ httml
   </f-canvas>
 
 </f-flow>
+
+
+SELECT
+    json_object(
+        table_name,
+        CAST(
+            CONCAT(
+                '[',
+                GROUP_CONCAT(
+                    json_object(column_name, data_type)
+                    ORDER BY ordinal_position
+                    SEPARATOR ','
+                ),
+                ']'
+            ) AS JSON
+        )
+    ) AS result_json
+FROM information_schema.columns
+WHERE table_schema = 'your_db'
+GROUP BY table_name;
+
+
