@@ -1,3 +1,19 @@
+
+@for (node of diagramState().nodes; track node.id) {
+  <f-node
+    [fNodeId]="node.id"
+    [fPosition]="node.position">
+  </f-node>
+}
+
+@for (conn of diagramState().connections; track conn.id) {
+  <f-connection
+    [fConnectionId]="conn.id"
+    [fSourceId]="conn.source"
+    [fTargetId]="conn.target">
+  </f-connection>
+}
+
 import { Component, signal } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FFlowModule } from '@foblex/flow';
