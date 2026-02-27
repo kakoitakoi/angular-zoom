@@ -1,481 +1,177 @@
-graph.model.ts
-export interface GraphNode {
-  id: string;
-  label: string;
-  x: number;
-  y: number;
-  children?: GraphNode[];
-}
-
-query-plan.component.ts
-import {
-  Component,
-  AfterViewInit,
-  ElementRef,
-  ViewChild,
-  signal
-} from '@angular/core';
-
-import { GraphNode } from './graph.model';
-import { GraphRenderer } from './graph-renderer';
-
-@Component({
-  selector: 'app-query-plan',
-  standalone: true,
-  templateUrl: './query-plan.component.html',
-  styleUrls: ['./query-plan.component.scss']
-})
-export class QueryPlanComponent implements AfterViewInit {
-
-  @ViewChild('container', { static: true })
-  container!: ElementRef<HTMLDivElement>;
-
-  private renderer!: GraphRenderer;
-
-  nodes = signal<GraphNode[]>(this.generateMockTree());
-
-  ngAfterViewInit() {
-    this.renderer = new GraphRenderer(this.container.nativeElement);
-    this.renderer.render(this.nodes());
-  }
-
-  private generateMockTree(): GraphNode[] {
-    return [
-      {
-        id: '1',
-        label: 'Root',
-        x: 400,
-        y: 50,
-        children: [
-          {
-            id: '2',
-            label: 'Node A',
-            x: 250,
-            y: 150
-          },
-          {
-            id: '3',
-            label: 'Node B',
-            x: 550,
-            y: 150
-          }
-        ]
-      }
-    ];
-  }
-}
-
-query-plan.component.html
-<div #container class="graph-container"></div>
-
-query-plan.component.scss
-.graph-container {
-  width: 100%;
-  height: 100vh;
-  background: #f8f9fa;
-  overflow: hidden;
-}
-
-graph-renderer.ts
-import * as d3 from 'd3';
-import { GraphNode } from './graph.model';
-
-export class GraphRenderer {
-
-  private svg: any;
-  private g: any;
-
-  constructor(private container: HTMLElement) {
-    this.init();
-  }
-
-  private init() {
-    this.svg = d3.select(this.container)
-      .append('svg')
-      .attr('width', '100%')
-      .attr('height', '100%');
-
-    this.g = this.svg.append('g');
-
-    this.svg.call(
-      d3.zoom()
-        .scaleExtent([0.3, 3])
-        .on('zoom', (event) => {
-          this.g.attr('transform', event.transform);
-        })
-    );
-  }
-
-  render(nodes: GraphNode[]) {
-    const flatNodes = this.flatten(nodes);
-    const links = this.generateLinks(nodes);
-
-    // LINKS
-    this.g.selectAll('line')
-      .data(links)
-      .enter()
-      .append('line')
-      .attr('x1', d => d.source.x)
-      .attr('y1', d => d.source.y)
-      .attr('x2', d => d.target.x)
-      .attr('y2', d => d.target.y)
-      .attr('stroke', '#999');
-
-    // NODES
-    const node = this.g.selectAll('g.node')
-      .data(flatNodes)
-      .enter()
-      .append('g')
-      .attr('class', 'node')
-      .attr('transform', d => `translate(${d.x}, ${d.y})`)
-      .call(
-        d3.drag()
-          .on('drag', (event, d: any) => {
-            d.x = event.x;
-            d.y = event.y;
-
-            d3.select(event.sourceEvent.target.parentNode)
-              .attr('transform', `translate(${d.x}, ${d.y})`);
-
-            this.updateLinks();
-          })
-      );
-
-    node.append('rect')
-      .attr('width', 100)
-      .attr('height', 40)
-      .attr('rx', 6)
-      .attr('fill', '#ffffff')
-      .attr('stroke', '#333');
-
-    node.append('text')
-      .attr('x', 50)
-      .attr('y', 25)
-      .attr('text-anchor', 'middle')
-      .text(d => d.label);
-  }
-
-  private updateLinks() {
-    this.g.selectAll('line')
-      .attr('x1', d => d.source.x)
-      .attr('y1', d => d.source.y)
-      .attr('x2', d => d.target.x)
-      .attr('y2', d => d.target.y);
-  }
-
-  private flatten(nodes: GraphNode[]): GraphNode[] {
-    const result: GraphNode[] = [];
-
-    const recurse = (node: GraphNode) => {
-      result.push(node);
-      node.children?.forEach(recurse);
-    };
-
-    nodes.forEach(recurse);
-    return result;
-  }
-
-  private generateLinks(nodes: GraphNode[]) {
-    const links: any[] = [];
-
-    const recurse = (node: GraphNode) => {
-      node.children?.forEach(child => {
-        links.push({ source: node, target: child });
-        recurse(child);
-      });
-    };
-
-    nodes.forEach(recurse);
-    return links;
-  }
-}
-
-
-query-plan/
- ├── query-plan.component.ts
- ├── query-plan.component.html
- ├── query-plan.component.scss
- ├── graph.model.ts
- └── graph-renderer.ts
-
-
-
-
-d3 без any
-graph.model.ts
-export interface GraphNode {
-  id: string;
-  label: string;
-  x: number;
-  y: number;
-  children?: GraphNode[];
-}
-
-export interface GraphLink {
-  source: GraphNode;
-  target: GraphNode;
-}
-
-graph-renderer.ts (строго типизировано)
-import * as d3 from 'd3';
-import { GraphNode, GraphLink } from './graph.model';
-
-export class GraphRenderer {
-
-  private svg!: d3.Selection<SVGSVGElement, unknown, null, undefined>;
-  private g!: d3.Selection<SVGGElement, unknown, null, undefined>;
-  private links: GraphLink[] = [];
-
-  constructor(private container: HTMLElement) {
-    this.init();
-  }
-
-  private init(): void {
-    this.svg = d3.select(this.container)
-      .append<SVGSVGElement>('svg')
-      .attr('width', '100%')
-      .attr('height', '100%');
-
-    this.g = this.svg.append<SVGGElement>('g');
-
-    const zoomBehavior = d3.zoom<SVGSVGElement, unknown>()
-      .scaleExtent([0.3, 3])
-      .on('zoom', (event: d3.D3ZoomEvent<SVGSVGElement, unknown>) => {
-        this.g.attr('transform', event.transform.toString());
-      });
-
-    this.svg.call(zoomBehavior);
-  }
-
-  render(nodes: GraphNode[]): void {
-    const flatNodes = this.flatten(nodes);
-    this.links = this.generateLinks(nodes);
-
-    // LINKS
-    this.g.selectAll<SVGLineElement, GraphLink>('line')
-      .data(this.links)
-      .join('line')
-      .attr('x1', (d) => d.source.x)
-      .attr('y1', (d) => d.source.y)
-      .attr('x2', (d) => d.target.x)
-      .attr('y2', (d) => d.target.y)
-      .attr('stroke', '#999');
-
-    // NODES
-    const nodeSelection = this.g
-      .selectAll<SVGGElement, GraphNode>('g.node')
-      .data(flatNodes)
-      .join('g')
-      .attr('class', 'node')
-      .attr('transform', (d) => `translate(${d.x}, ${d.y})`);
-
-    const dragBehavior = d3.drag<SVGGElement, GraphNode>()
-      .on('drag', (event: d3.D3DragEvent<SVGGElement, GraphNode, GraphNode>, d) => {
-        d.x = event.x;
-        d.y = event.y;
-
-        d3.select<SVGGElement, GraphNode>(event.subject)
-          .attr('transform', `translate(${d.x}, ${d.y})`);
-
-        this.updateLinks();
-      });
-
-    nodeSelection.call(dragBehavior);
-
-    nodeSelection.append('rect')
-      .attr('width', 100)
-      .attr('height', 40)
-      .attr('rx', 6)
-      .attr('fill', '#fff')
-      .attr('stroke', '#333');
-
-    nodeSelection.append('text')
-      .attr('x', 50)
-      .attr('y', 25)
-      .attr('text-anchor', 'middle')
-      .text((d) => d.label);
-  }
-
-  private updateLinks(): void {
-    this.g.selectAll<SVGLineElement, GraphLink>('line')
-      .attr('x1', (d) => d.source.x)
-      .attr('y1', (d) => d.source.y)
-      .attr('x2', (d) => d.target.x)
-      .attr('y2', (d) => d.target.y);
-  }
-
-  private flatten(nodes: GraphNode[]): GraphNode[] {
-    const result: GraphNode[] = [];
-
-    const recurse = (node: GraphNode): void => {
-      result.push(node);
-      node.children?.forEach(recurse);
-    };
-
-    nodes.forEach(recurse);
-    return result;
-  }
-
-  private generateLinks(nodes: GraphNode[]): GraphLink[] {
-    const links: GraphLink[] = [];
-
-    const recurse = (node: GraphNode): void => {
-      node.children?.forEach(child => {
-        links.push({ source: node, target: child });
-        recurse(child);
-      });
-    };
-
-    nodes.forEach(recurse);
-    return links;
-  }
-}
-
-
-
-без d3
-query-plan.component.html
-
-<svg #svg
-     class="graph"
-     (wheel)="onWheel($event)"
-     (pointerdown)="onPanStart($event)"
-     (pointermove)="onPanMove($event)"
-     (pointerup)="onPanEnd()">
-
-  <g [attr.transform]="transform">
-
-    <!-- Links -->
-    <line *ngFor="let link of links"
-          [attr.x1]="link.source.x"
-          [attr.y1]="link.source.y"
-          [attr.x2]="link.target.x"
-          [attr.y2]="link.target.y"
-          stroke="#999" />
-
-    <!-- Nodes -->
-    <g *ngFor="let node of flatNodes"
-       class="node"
-       [attr.transform]="'translate(' + node.x + ',' + node.y + ')'"
-       (pointerdown)="onNodeDragStart($event, node)">
-
-      <rect width="100" height="40" rx="6"></rect>
-      <text x="50" y="25" text-anchor="middle">
-        {{ node.label }}
-      </text>
-    </g>
-
-  </g>
-</svg>
-
-
-query-plan.component.ts
-
 import { Component, signal } from '@angular/core';
-import { GraphNode, GraphLink } from './graph.model';
+import { CommonModule } from '@angular/common';
+import { FFlowModule } from '@foblex/flow';
 
-@Component({
-  selector: 'app-query-plan',
-  standalone: true,
-  templateUrl: './query-plan.component.html',
-  styleUrls: ['./query-plan.component.scss']
-})
-export class QueryPlanComponent {
-
-  scale = 1;
-  offsetX = 0;
-  offsetY = 0;
-
-  private isPanning = false;
-  private isDraggingNode = false;
-  private dragNode?: GraphNode;
-  private lastX = 0;
-  private lastY = 0;
-
-  nodes = signal<GraphNode[]>([
-    {
-      id: '1',
-      label: 'Root',
-      x: 400,
-      y: 50,
-      children: [
-        { id: '2', label: 'A', x: 300, y: 150 },
-        { id: '3', label: 'B', x: 500, y: 150 }
-      ]
-    }
-  ]);
-
-  get flatNodes(): GraphNode[] {
-    const result: GraphNode[] = [];
-    const recurse = (n: GraphNode) => {
-      result.push(n);
-      n.children?.forEach(recurse);
-    };
-    this.nodes().forEach(recurse);
-    return result;
-  }
-
-  get links(): GraphLink[] {
-    const result: GraphLink[] = [];
-    const recurse = (n: GraphNode) => {
-      n.children?.forEach(c => {
-        result.push({ source: n, target: c });
-        recurse(c);
-      });
-    };
-    this.nodes().forEach(recurse);
-    return result;
-  }
-
-  get transform(): string {
-    return `translate(${this.offsetX},${this.offsetY}) scale(${this.scale})`;
-  }
-
-  // ZOOM
-  onWheel(event: WheelEvent): void {
-    event.preventDefault();
-    const delta = event.deltaY > 0 ? -0.1 : 0.1;
-    this.scale = Math.min(3, Math.max(0.3, this.scale + delta));
-  }
-
-  // PAN
-  onPanStart(event: PointerEvent): void {
-    if (this.isDraggingNode) return;
-    this.isPanning = true;
-    this.lastX = event.clientX;
-    this.lastY = event.clientY;
-  }
-
-  onPanMove(event: PointerEvent): void {
-    if (this.isDraggingNode && this.dragNode) {
-      this.dragNode.x += event.movementX / this.scale;
-      this.dragNode.y += event.movementY / this.scale;
-      return;
-    }
-
-    if (!this.isPanning) return;
-
-    this.offsetX += event.clientX - this.lastX;
-    this.offsetY += event.clientY - this.lastY;
-
-    this.lastX = event.clientX;
-    this.lastY = event.clientY;
-  }
-
-  onPanEnd(): void {
-    this.isPanning = false;
-    this.isDraggingNode = false;
-    this.dragNode = undefined;
-  }
-
-  // NODE DRAG
-  onNodeDragStart(event: PointerEvent, node: GraphNode): void {
-    event.stopPropagation();
-    this.isDraggingNode = true;
-    this.dragNode = node;
-  }
+interface FlowNode {
+  id: string;
+  position: { x: number; y: number };
 }
 
+interface FlowConnection {
+  id: string;
+  source: string;
+  target: string;
+}
 
+interface DiagramState {
+  nodes: FlowNode[];
+  connections: FlowConnection[];
+}
 
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  imports: [CommonModule, FFlowModule],
+  templateUrl: './app.component.html',
+  styleUrls: ['./app.component.css']
+})
+export class AppComponent {
 
+  diagramState = signal<DiagramState>({
+    nodes: [
+      { id: 'node1', position: { x: 100, y: 150 } },
+      { id: 'node2', position: { x: 450, y: 200 } }
+    ],
+    connections: []
+  });
+
+  // 🔹 Создание связи
+  onCreateConnection(event: any) {
+
+    const newConnection: FlowConnection = {
+      id: crypto.randomUUID(),
+      source: event.sourceId,
+      target: event.targetId
+    };
+
+    this.diagramState.update(state => ({
+      ...state,
+      connections: [...state.connections, newConnection]
+    }));
+  }
+
+  // 🔹 Удаление связи
+  removeConnection(id: string) {
+    this.diagramState.update(state => ({
+      ...state,
+      connections: state.connections.filter(c => c.id !== id)
+    }));
+  }
+
+}
+
+<f-flow
+  fDraggable
+  fZoom
+  (fCreateConnection)="onCreateConnection($event)">
+
+  <!-- НОДЫ -->
+  <f-node
+    *ngFor="let node of diagramState().nodes"
+    [fNodeId]="node.id"
+    [fPosition]="node.position">
+
+    <div class="node">
+      {{ node.id }}
+
+      <!-- Порты -->
+      <div fOutput></div>
+      <div fInput></div>
+
+    </div>
+
+  </f-node>
+
+  <!-- СВЯЗИ -->
+  <f-connection
+    *ngFor="let conn of diagramState().connections"
+    [fConnectionId]="conn.id"
+    [fSourceId]="conn.source"
+    [fTargetId]="conn.target">
+
+    <!-- КНОПКА УДАЛЕНИЯ -->
+    <foreignObject
+      width="30"
+      height="30"
+      style="overflow: visible; pointer-events: none;">
+
+      <div
+        xmlns="http://www.w3.org/1999/xhtml"
+        class="delete-btn"
+        (click)="removeConnection(conn.id)">
+
+        ✕
+      </div>
+
+    </foreignObject>
+
+  </f-connection>
+
+</f-flow>
+
+f-flow {
+  width: 100vw;
+  height: 100vh;
+  display: block;
+  background: #f5f5f5;
+}
+
+/* Нода */
+.node {
+  width: 120px;
+  height: 60px;
+  background: white;
+  border: 1px solid #999;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+}
+
+/* Порты */
+[fOutput],
+[fInput] {
+  width: 10px;
+  height: 10px;
+  background: #333;
+  border-radius: 50%;
+  position: absolute;
+}
+
+[fOutput] {
+  right: -5px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+[fInput] {
+  left: -5px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+/* Кнопка удаления */
+.delete-btn {
+  pointer-events: all;
+  width: 24px;
+  height: 24px;
+  background: white;
+  border: 1px solid #ccc;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 14px;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+}
+
+f-connection foreignObject {
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+f-connection:hover foreignObject {
+  opacity: 1;
+}
