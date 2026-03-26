@@ -1,22 +1,107 @@
 import cx_Oracle
-import re
 
+# --- Подключение к Oracle ---
 conn = cx_Oracle.connect("X/password@host:1521/ORCL")
 cur = conn.cursor()
 
-cur.execute("""
-  SELECT column_name, data_type, data_length, data_precision, data_scale
-  FROM all_tab_columns
-  WHERE owner = 'X'
-  ORDER BY table_name, column_id
-""")
+TABLE_NAME = "TEST"
+SCHEMA = "X"
 
-# маппинг типов Oracle -> StarRocks
-TYPE_MAP = {
-    'NUMBER': lambda p, s: f'DECIMAL({p or 18},{s or 0})' if p else 'BIGINT',
-    'VARCHAR2': lambda p, s: f'VARCHAR({p})',
-    'DATE': lambda p, s: 'DATETIME',
-    'TIMESTAMP': lambda p, s: 'DATETIME',
-    'CLOB': lambda p, s: 'STRING',
-    'FLOAT': lambda p, s: 'DOUBLE',
-}
+# --- Получаем колонки таблицы ---
+cur.execute("""
+    SELECT column_name, data_type, data_length, data_precision, data_scale, nullable
+    FROM all_tab_columns
+    WHERE owner = :schema AND table_name = :table
+    ORDER BY column_id
+""", schema=SCHEMA, table=TABLE_NAME)
+
+columns = cur.fetchall()
+
+# --- Получаем первичный ключ ---
+cur.execute("""
+    SELECT col.column_name
+    FROM all_constraints con
+    JOIN all_cons_columns col
+      ON con.constraint_name = col.constraint_name
+     AND con.owner = col.owner
+    WHERE con.owner = :schema
+      AND con.table_name = :table
+      AND con.constraint_type = 'P'
+    ORDER BY col.position
+""", schema=SCHEMA, table=TABLE_NAME)
+
+pk_columns = [row[0] for row in cur.fetchall()]
+
+cur.close()
+conn.close()
+
+# --- Маппинг типов Oracle -> StarRocks ---
+def map_type(data_type, length, precision, scale):
+    dt = data_type.upper()
+
+    if dt == 'NUMBER':
+        if precision is None:
+            return 'BIGINT'
+        if scale and scale > 0:
+            return f'DECIMAL({precision}, {scale})'
+        if precision <= 3:
+            return 'TINYINT'
+        if precision <= 5:
+            return 'SMALLINT'
+        if precision <= 10:
+            return 'INT'
+        if precision <= 18:
+            return 'BIGINT'
+        return f'DECIMAL({precision}, {scale or 0})'
+
+    if dt in ('VARCHAR2', 'NVARCHAR2', 'CHAR', 'NCHAR'):
+        return f'VARCHAR({min(length or 255, 65533)})'
+
+    if dt in ('DATE', 'TIMESTAMP') or dt.startswith('TIMESTAMP'):
+        return 'DATETIME'
+
+    if dt in ('CLOB', 'NCLOB', 'LONG', 'XMLTYPE'):
+        return 'STRING'
+
+    if dt in ('BLOB', 'RAW', 'LONG RAW'):
+        return 'STRING'  # или VARBINARY — зависит от задачи
+
+    if dt in ('FLOAT', 'BINARY_FLOAT'):
+        return 'FLOAT'
+
+    if dt == 'BINARY_DOUBLE':
+        return 'DOUBLE'
+
+    # fallback
+    return 'STRING'
+
+# --- Генерация CREATE TABLE для StarRocks ---
+def generate_starrocks_ddl(table_name, columns, pk_columns):
+    col_defs = []
+
+    for col_name, data_type, length, precision, scale, nullable in columns:
+        sr_type = map_type(data_type, length, precision, scale)
+        null_clause = "" if nullable == 'Y' else " NOT NULL"
+        col_defs.append(f"    {col_name} {sr_type}{null_clause}")
+
+    # Если PK есть — используем его, иначе берём первую колонку
+    key_cols = pk_columns if pk_columns else [columns[0][0]]
+    key_type = "PRIMARY KEY" if pk_columns else "DUPLICATE KEY"
+
+    ddl = f"CREATE TABLE {table_name} (\n"
+    ddl += ",\n".join(col_defs)
+    ddl += f"\n)\n"
+    ddl += f"{key_type} ({', '.join(key_cols)})\n"
+    ddl += f"DISTRIBUTED BY HASH({key_cols[0]}) BUCKETS 10\n"
+    ddl += f"PROPERTIES (\"replication_num\" = \"1\");"
+
+    return ddl
+
+# --- Запуск ---
+ddl = generate_starrocks_ddl(TABLE_NAME, columns, pk_columns)
+print(ddl)
+
+# --- Опционально: сохранить в файл ---
+with open(f"{TABLE_NAME}.sql", "w") as f:
+    f.write(ddl)
+    print(f"\nСохранено в {TABLE_NAME}.sql")
