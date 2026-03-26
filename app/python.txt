@@ -1,0 +1,22 @@
+import cx_Oracle
+import re
+
+conn = cx_Oracle.connect("X/password@host:1521/ORCL")
+cur = conn.cursor()
+
+cur.execute("""
+  SELECT column_name, data_type, data_length, data_precision, data_scale
+  FROM all_tab_columns
+  WHERE owner = 'X'
+  ORDER BY table_name, column_id
+""")
+
+# маппинг типов Oracle -> StarRocks
+TYPE_MAP = {
+    'NUMBER': lambda p, s: f'DECIMAL({p or 18},{s or 0})' if p else 'BIGINT',
+    'VARCHAR2': lambda p, s: f'VARCHAR({p})',
+    'DATE': lambda p, s: 'DATETIME',
+    'TIMESTAMP': lambda p, s: 'DATETIME',
+    'CLOB': lambda p, s: 'STRING',
+    'FLOAT': lambda p, s: 'DOUBLE',
+}
