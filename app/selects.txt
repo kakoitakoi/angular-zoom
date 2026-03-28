@@ -1,0 +1,60 @@
+SELECT
+    -- Таблица
+    t.owner,
+    t.table_name,
+    tc.comments AS table_comment,
+    -- Колонки
+    c.column_name,
+    c.data_type,
+    c.data_length,
+    c.data_precision,
+    c.data_scale,
+    c.nullable,
+    c.column_id,
+    cc.comments AS column_comment
+FROM
+    all_tables t
+    JOIN all_tab_comments tc ON tc.owner      = t.owner
+                             AND tc.table_name = t.table_name
+    JOIN all_tab_columns c  ON c.owner        = t.owner
+                             AND c.table_name  = t.table_name
+    JOIN all_col_comments cc ON cc.owner       = t.owner
+                             AND cc.table_name  = c.table_name
+                             AND cc.column_name = c.column_name
+WHERE
+    t.owner = 'SCHEMA_NAME'   -- обязательно указать схему
+-- AND t.table_name = 'MY_TABLE'
+ORDER BY
+    t.owner,
+    t.table_name,
+    c.column_id;
+
+
+SELECT
+    -- Таблица
+    t.table_schema        AS owner,
+    t.table_name,
+    t.table_comment,
+    -- Колонки
+    c.ordinal_position    AS column_id,
+    c.column_name,
+    c.data_type,
+    c.character_maximum_length AS data_length,
+    c.numeric_precision,
+    c.numeric_scale,
+    c.is_nullable         AS nullable,
+    c.column_comment
+FROM
+    information_schema.tables t
+    JOIN information_schema.columns c
+        ON  c.table_schema = t.table_schema
+        AND c.table_name   = t.table_name
+WHERE
+    t.table_schema = 'your_database'   -- название БД/схемы
+--  AND t.table_name = 'my_table'
+    AND t.table_type = 'BASE TABLE'    -- исключить views
+ORDER BY
+    t.table_schema,
+    t.table_name,
+    c.ordinal_position;
+
