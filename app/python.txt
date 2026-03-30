@@ -105,3 +105,106 @@ print(ddl)
 with open(f"{TABLE_NAME}.sql", "w") as f:
     f.write(ddl)
     print(f"\nСохранено в {TABLE_NAME}.sql")
+
+
+
+
+
+import torch
+import json
+import pymysql
+from transformers import AutoTokenizer, AutoModel
+
+# --- Модель ---
+path = r"C:\models\bge-m3"
+tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True)
+model = AutoModel.from_pretrained(path, local_files_only=True)
+model.eval()
+
+def embed(texts: list[str]) -> list[list[float]]:
+    enc = tokenizer(texts, padding=True, truncation=True,
+                    max_length=512, return_tensors="pt")
+    with torch.no_grad():
+        out = model(**enc)
+        vecs = out.last_hidden_state[:, 0]
+        vecs = torch.nn.functional.normalize(vecs, dim=-1)
+    return vecs.tolist()
+
+# --- Подключение к Doris ---
+conn = pymysql.connect(
+    host="your_doris_host", port=9030,
+    user="root", password="", database="your_db"
+)
+
+def insert_chunks(chunks: list[dict]):
+    """
+    chunk = {
+        'id': 1,
+        'doc_id': 'schema_orders',
+        'source': 'orders.sql',
+        'chunk_text': 'Таблица orders содержит...'
+    }
+    """
+    texts = [c["chunk_text"] for c in chunks]
+    embeddings = embed(texts)
+
+    sql = """
+        INSERT INTO chunks (id, doc_id, source, chunk_text, embedding, created_at)
+        VALUES (%s, %s, %s, %s, %s, NOW())
+    """
+    rows = [
+        (c["id"], c["doc_id"], c["source"], c["chunk_text"],
+         json.dumps(emb))          # ARRAY<FLOAT> принимает JSON-массив
+        for c, emb in zip(chunks, embeddings)
+    ]
+
+    with conn.cursor() as cur:
+        cur.executemany(sql, rows)
+    conn.commit()
+
+
+
+import numpy as np
+
+def search(query: str, source_filter: str = None, top_k: int = 5) -> list[dict]:
+    # Эмбеддинг запроса
+    q_vec = embed([query])[0]
+    q_arr = json.dumps(q_vec)
+
+    # Doris не поддерживает ANN нативно через SQL в ARRAY<FLOAT>,
+    # поэтому считаем cosine similarity через встроенную функцию
+    where = "WHERE 1=1"
+    params = []
+
+    if source_filter:
+        where += " AND source = %s"
+        params.append(source_filter)
+
+    sql = f"""
+        SELECT
+            id,
+            doc_id,
+            source,
+            chunk_text,
+            cosine_distance(embedding, CAST({q_arr} AS ARRAY<FLOAT>)) AS score
+        FROM chunks
+        {where}
+        ORDER BY score ASC          -- cosine_distance: меньше = ближе
+        LIMIT %s
+    """
+    params.append(top_k)
+
+    with conn.cursor(pymysql.cursors.DictCursor) as cur:
+        cur.execute(sql, params)
+        return cur.fetchall()
+
+# Использование
+results = search(
+    query="какие колонки есть в таблице заказов?",
+    source_filter="orders.sql",
+    top_k=5
+)
+for r in results:
+    print(f"[{r['score']:.4f}] {r['chunk_text'][:80]}")
+
+
