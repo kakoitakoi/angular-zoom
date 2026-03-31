@@ -208,3 +208,56 @@ for r in results:
     print(f"[{r['score']:.4f}] {r['chunk_text'][:80]}")
 
 
+
+
+
+
+
+
+
+
+from fastapi import FastAPI
+from pydantic import BaseModel
+from transformers import AutoTokenizer, AutoModel
+import torch
+import torch.nn.functional as F
+import psycopg2  # или mysql client для Doris
+
+app = FastAPI()
+
+# --- модель ---
+tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-m3")
+model = AutoModel.from_pretrained("BAAI/bge-m3")
+
+def embed(text):
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
+    with torch.no_grad():
+        outputs = model(**inputs)
+        emb = outputs.last_hidden_state[:, 0]
+        emb = F.normalize(emb, p=2, dim=1)
+    return emb[0].tolist()
+
+# --- запрос ---
+class SearchRequest(BaseModel):
+    query: str
+    top_k: int = 10
+
+@app.post("/search")
+def search(req: SearchRequest):
+    vector = embed(req.query)
+
+    # ⚠️ псевдо-код SQL
+    sql = f"""
+    SELECT chunk_text
+    FROM chunks
+    ORDER BY cosine_similarity(embedding, {vector}) DESC
+    LIMIT {req.top_k}
+    """
+
+    # выполнить SQL → получить результаты
+    results = ["chunk1", "chunk2"]  # заглушка
+
+    return {
+        "query": req.query,
+        "results": results
+    }
