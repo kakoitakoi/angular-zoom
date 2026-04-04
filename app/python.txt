@@ -261,3 +261,190 @@ def search(req: SearchRequest):
         "query": req.query,
         "results": results
     }
+
+
+
+
+
+
+
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+
+BASE_URL = "https://your-confluence.local"
+AUTH = ("username", "password")  # или token
+HEADERS = {"Content-Type": "application/json"}
+
+
+# =========================
+# 1. CQL поиск (строгое совпадение)
+# =========================
+def build_cql_exact(term: str) -> str:
+    # строгое совпадение через кавычки
+    return f'type IN (page, comment) AND text ~ "\\"{term}\\"" ORDER BY lastmodified DESC'
+
+
+def fetch_all_cql(cql: str):
+    url = f"{BASE_URL}/rest/api/content/search"
+    params = {
+        "cql": cql,
+        "limit": 100,
+        "expand": "body.storage"
+    }
+
+    results = []
+
+    while url:
+        resp = requests.get(url, params=params, auth=AUTH, headers=HEADERS)
+        resp.raise_for_status()
+        data = resp.json()
+
+        results.extend(data.get("results", []))
+
+        next_link = data.get("_links", {}).get("next")
+        if next_link:
+            url = urljoin(BASE_URL, next_link)
+            params = None  # дальше параметры уже внутри next
+        else:
+            url = None
+
+    return results
+
+
+# =========================
+# 2. Получение комментариев страницы
+# =========================
+def fetch_comments(page_id: str):
+    url = f"{BASE_URL}/rest/api/content/{page_id}/child/comment"
+    params = {
+        "limit": 100,
+        "expand": "body.storage"
+    }
+
+    comments = []
+
+    while url:
+        resp = requests.get(url, params=params, auth=AUTH, headers=HEADERS)
+        resp.raise_for_status()
+        data = resp.json()
+
+        comments.extend(data.get("results", []))
+
+        next_link = data.get("_links", {}).get("next")
+        if next_link:
+            url = urljoin(BASE_URL, next_link)
+            params = None
+        else:
+            url = None
+
+    return comments
+
+
+# =========================
+# 3. HTML → структурированный текст
+# =========================
+def html_to_structured_text(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+
+    # удаляем мусор
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+
+    # удаляем confluence макросы (ac:, ri:)
+    for tag in soup.find_all():
+        if ":" in tag.name:
+            tag.decompose()
+
+    lines = []
+
+    def process(node, indent=0):
+        if node.name in ["h1", "h2", "h3", "h4"]:
+            lines.append("\n" + node.get_text(strip=True).upper())
+
+        elif node.name == "p":
+            lines.append("\n" + node.get_text(strip=True))
+
+        elif node.name == "li":
+            prefix = "  " * indent + "- "
+            lines.append(prefix + node.get_text(strip=True))
+
+        elif node.name in ["ul", "ol"]:
+            for li in node.find_all("li", recursive=False):
+                process(li, indent + 1)
+
+        elif node.name == "pre":
+            lines.append("\n[CODE]")
+            lines.append(node.get_text())
+            lines.append("[/CODE]")
+
+        elif node.name == "code":
+            lines.append(f"`{node.get_text(strip=True)}`")
+
+    for elem in soup.find_all(recursive=False):
+        process(elem)
+
+    # fallback если структура не поймалась
+    if not lines:
+        return soup.get_text(separator="\n").strip()
+
+    # чистим пустые строки
+    return "\n".join([l for l in lines if l.strip()])
+
+
+# =========================
+# 4. Основной pipeline
+# =========================
+def search_and_extract(term: str):
+    cql = build_cql_exact(term)
+    results = fetch_all_cql(cql)
+
+    output = []
+
+    for item in results:
+        content_type = item["type"]
+        content_id = item["id"]
+        title = item.get("title", "")
+
+        html = item.get("body", {}).get("storage", {}).get("value", "")
+        text = html_to_structured_text(html)
+
+        output.append({
+            "type": content_type,
+            "id": content_id,
+            "title": title,
+            "text": text
+        })
+
+        # если это page → подтянуть комментарии
+        if content_type == "page":
+            comments = fetch_comments(content_id)
+
+            for c in comments:
+                c_html = c.get("body", {}).get("storage", {}).get("value", "")
+                c_text = html_to_structured_text(c_html)
+
+                output.append({
+                    "type": "comment",
+                    "parent_page_id": content_id,
+                    "id": c["id"],
+                    "text": c_text
+                })
+
+    return output
+
+
+# =========================
+# 5. Пример запуска
+# =========================
+if __name__ == "__main__":
+    data = search_and_extract("orders")
+
+    for item in data:
+        print("=" * 80)
+        print(f"{item['type'].upper()} | ID: {item['id']}")
+        if item.get("title"):
+            print(f"TITLE: {item['title']}")
+        print(item["text"])
+
+
