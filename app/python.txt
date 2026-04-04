@@ -560,3 +560,183 @@ print_results(results, keyword="batch")
 
 
 
+
+
+
+
+
+
+
+
+from bs4 import BeautifulSoup, NavigableString, Tag
+
+
+def split_into_sections(soup: BeautifulSoup) -> list[dict]:
+    """
+    Разбивает HTML на секции по заголовкам h1-h6.
+    Каждая секция содержит заголовок и все элементы до следующего заголовка.
+    """
+    sections = []
+    current_section = {"heading": None, "heading_level": 0, "elements": []}
+
+    for element in soup.body.children if soup.body else soup.children:
+        if not isinstance(element, Tag):
+            continue
+
+        if element.name in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            # Сохраняем предыдущую секцию если она не пустая
+            if current_section["elements"] or current_section["heading"]:
+                sections.append(current_section)
+
+            current_section = {
+                "heading": element.get_text(strip=True),
+                "heading_level": int(element.name[1]),
+                "elements": [],
+            }
+        else:
+            current_section["elements"].append(element)
+
+    # Последняя секция
+    if current_section["elements"] or current_section["heading"]:
+        sections.append(current_section)
+
+    return sections
+
+
+def extract_text_from_element(element: Tag) -> str:
+    return element.get_text(separator=" ", strip=True)
+
+
+def search_in_table(table: Tag, keyword: str, headers: list[str]) -> list[dict]:
+    """Ищет keyword в строках таблицы."""
+    matches = []
+    rows = table.find_all("tr")
+
+    # Определяем заголовки таблицы
+    table_headers = headers
+    if rows:
+        first_row_cells = rows[0].find_all(["th", "td"])
+        candidate_headers = [c.get_text(strip=True) for c in first_row_cells]
+        # Считаем строку заголовком если есть <th> теги
+        if rows[0].find("th"):
+            table_headers = candidate_headers
+            rows = rows[1:]
+
+    for row_idx, row in enumerate(rows):
+        cells = [td.get_text(strip=True) for td in row.find_all(["th", "td"])]
+        row_text = " ".join(cells)
+
+        if keyword.lower() in row_text.lower():
+            if table_headers:
+                row_data = dict(zip(table_headers, cells))
+            else:
+                row_data = {f"col_{i}": v for i, v in enumerate(cells)}
+
+            matches.append({"row_index": row_idx, "data": row_data, "raw_cells": cells})
+
+    return matches
+
+
+def search_in_section(section: dict, keyword: str) -> list[dict]:
+    """Ищет keyword во всех элементах секции."""
+    results = []
+
+    for element in section["elements"]:
+        # Случай 1: таблица
+        if element.name == "table":
+            table_matches = search_in_table(element, keyword, headers=[])
+            if table_matches:
+                results.append({
+                    "type": "table",
+                    "matches": table_matches,
+                })
+
+        # Случай 2: вложенные таблицы (div/section внутри)
+        elif element.name in ("div", "section", "article"):
+            for table in element.find_all("table"):
+                table_matches = search_in_table(table, keyword, headers=[])
+                if table_matches:
+                    results.append({
+                        "type": "table",
+                        "matches": table_matches,
+                    })
+            # И текст вне таблиц внутри div
+            for child in element.children:
+                if isinstance(child, Tag) and child.name != "table":
+                    text = extract_text_from_element(child)
+                    if keyword.lower() in text.lower():
+                        results.append({
+                            "type": "text",
+                            "element": child.name,
+                            "text": text,
+                        })
+
+        # Случай 3: обычный текстовый элемент
+        else:
+            text = extract_text_from_element(element)
+            if keyword.lower() in text.lower():
+                results.append({
+                    "type": "text",
+                    "element": element.name,
+                    "text": text,
+                })
+
+    return results
+
+
+def find_by_keyword(html: str, keyword: str) -> list[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    sections = split_into_sections(soup)
+
+    all_results = []
+
+    for section in sections:
+        matches = search_in_section(section, keyword)
+        if matches:
+            all_results.append({
+                "section_heading": section["heading"] or "(без заголовка)",
+                "heading_level": section["heading_level"],
+                "matches": matches,
+            })
+
+    return all_results
+
+
+def print_results(results: list[dict], keyword: str):
+    if not results:
+        print(f'"{keyword}" не найдено.')
+        return
+
+    total = sum(len(r["matches"]) for r in results)
+    print(f'Найдено вхождений "{keyword}": {total} в {len(results)} секции(ях)\n')
+
+    for section_result in results:
+        heading = section_result["section_heading"]
+        level = section_result["heading_level"]
+        prefix = "#" * level if level else "~"
+        print(f"{prefix} {heading}")
+        print("=" * 60)
+
+        for match in section_result["matches"]:
+            if match["type"] == "table":
+                print("  [ТАБЛИЦА]")
+                for row in match["matches"]:
+                    print(f"  Строка {row['row_index'] + 1}:")
+                    for col, val in row["data"].items():
+                        marker = " ◄" if keyword.lower() in val.lower() else ""
+                        print(f"    {col}: {val}{marker}")
+            else:
+                tag = match.get("element", "?")
+                text = match["text"]
+                # Подсвечиваем вхождение
+                highlighted = text.replace(
+                    keyword, f"[{keyword.upper()}]"
+                )
+                print(f"  [{tag.upper()}] {highlighted}")
+
+        print()
+
+
+
+
+
