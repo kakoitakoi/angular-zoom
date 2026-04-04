@@ -448,3 +448,115 @@ if __name__ == "__main__":
         print(item["text"])
 
 
+
+
+
+from bs4 import BeautifulSoup
+
+def find_rows_by_keyword(html: str, keyword: str) -> list[dict]:
+    """
+    Ищет строки в таблицах HTML по ключевому слову.
+    Возвращает список найденных строк с контекстом.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    tables = soup.find_all("table")
+
+    if not tables:
+        print("Таблицы в документе не найдены.")
+        return []
+
+    print(f"Найдено таблиц: {len(tables)}")
+    results = []
+
+    for table_idx, table in enumerate(tables):
+        rows = table.find_all("tr")
+
+        # Извлекаем заголовок (первая строка)
+        headers = []
+        if rows:
+            headers = [th.get_text(strip=True) for th in rows[0].find_all(["th", "td"])]
+
+        for row_idx, row in enumerate(rows):
+            cells = row.find_all(["th", "td"])
+            cell_texts = [cell.get_text(strip=True) for cell in cells]
+            row_text = " ".join(cell_texts)
+
+            if keyword.lower() in row_text.lower():
+                results.append({
+                    "table_index": table_idx + 1,
+                    "row_index": row_idx,
+                    "headers": headers,
+                    "cells": cell_texts,
+                })
+
+    return results
+
+
+def print_results(results: list[dict], keyword: str):
+    if not results:
+        print(f'Строки с "{keyword}" не найдены.')
+        return
+
+    print(f'\nНайдено строк с "{keyword}": {len(results)}\n')
+    print("=" * 60)
+
+    for r in results:
+        print(f"Таблица #{r['table_index']}, строка #{r['row_index']}")
+
+        if r["headers"]:
+            # Выводим как пары заголовок: значение
+            pairs = zip(r["headers"], r["cells"])
+            for header, value in pairs:
+                marker = " ◄" if keyword.lower() in value.lower() else ""
+                print(f"  {header or '—'}: {value}{marker}")
+            # Если колонок больше чем заголовков
+            for extra in r["cells"][len(r["headers"]):]:
+                print(f"  —: {extra}")
+        else:
+            print("  " + " | ".join(r["cells"]))
+
+        print("-" * 60)
+
+
+# --- Пример использования ---
+if __name__ == "__main__":
+    sample_html = """
+    <html><body>
+      <h1>Справочник параметров</h1>
+      <table>
+        <tr><th>Параметр</th><th>Значение</th><th>Описание</th></tr>
+        <tr><td>timeout</td><td>30</td><td>Таймаут подключения</td></tr>
+        <tr><td>max_retries</td><td>5</td><td>Максимум попыток</td></tr>
+        <tr><td>batch_size</td><td>100</td><td>Размер пакета</td></tr>
+      </table>
+      <h2>Права доступа</h2>
+      <table>
+        <tr><th>Роль</th><th>Права</th></tr>
+        <tr><td>admin</td><td>полный доступ</td></tr>
+        <tr><td>batch_user</td><td>чтение, запись</td></tr>
+      </table>
+    </body></html>
+    """
+
+    keyword = "batch"
+    results = find_rows_by_keyword(sample_html, keyword)
+    print_results(results, keyword)
+
+
+
+import requests
+
+page = requests.get(
+    f"{CONFLUENCE_URL}/rest/api/content/{PAGE_ID}",
+    params={"expand": "body.storage"},
+    auth=(USER, TOKEN),
+).json()
+
+html = page["body"]["storage"]["value"]
+results = find_rows_by_keyword(html, keyword="batch")
+print_results(results, keyword="batch")
+
+
+
+
+
