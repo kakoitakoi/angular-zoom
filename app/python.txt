@@ -1605,3 +1605,434 @@ if __name__ == "__main__":
         print(f"\n=== {domain} ===")
         for r in domain_rules:
             print(f"  [{r.get('rule_id')}] [{r.get('category')}] {r.get('rule')}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""
+SQL Rules Generator for Text2SQL
+Парсит SQL-запросы из логов StarRocks, обогащает семантическими описаниями,
+кластеризует по доменам и генерирует rules через LLM.
+"""
+
+import json
+import re
+import hashlib
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Optional
+
+import sqlglot
+from sqlglot import exp
+import anthropic
+
+# ─────────────────────────────────────────────
+# 1. ТИПЫ ДАННЫХ
+# ─────────────────────────────────────────────
+
+@dataclass
+class ColumnMeta:
+    name: str
+    data_type: str
+    description: str = ""
+    sample_values: list[str] = field(default_factory=list)
+
+@dataclass
+class TableMeta:
+    name: str
+    description: str = ""
+    columns: dict[str, ColumnMeta] = field(default_factory=dict)
+
+
+@dataclass
+class ParsedQuery:
+    raw_sql: str
+    fingerprint: str                        # хэш нормализованного SQL — для дедупликации
+    tables: list[str] = field(default_factory=list)
+    joins: list[dict] = field(default_factory=list)       # {left, right, condition}
+    filters: list[str] = field(default_factory=list)      # выражения из WHERE/HAVING
+    aggregations: list[str] = field(default_factory=list) # COUNT, SUM, AVG …
+    window_funcs: list[str] = field(default_factory=list) # OVER (…)
+    group_by_cols: list[str] = field(default_factory=list)
+    order_by_cols: list[str] = field(default_factory=list)
+    selected_cols: list[str] = field(default_factory=list)
+    subqueries: int = 0
+    ctes: list[str] = field(default_factory=list)
+    parse_error: Optional[str] = None
+
+
+# ─────────────────────────────────────────────
+# 2. ПАРСИНГ
+# ─────────────────────────────────────────────
+
+def _fingerprint(sql: str) -> str:
+    """Нормализуем SQL и считаем хэш для дедупликации."""
+    try:
+        normalized = sqlglot.transpile(sql, read="starrocks", write="starrocks",
+                                       pretty=False, normalize=True)[0]
+    except Exception:
+        normalized = re.sub(r"\s+", " ", sql.upper().strip())
+    return hashlib.md5(normalized.encode()).hexdigest()
+
+
+def parse_query(sql: str) -> ParsedQuery:
+    pq = ParsedQuery(raw_sql=sql, fingerprint=_fingerprint(sql))
+    try:
+        tree = sqlglot.parse_one(sql, read="starrocks", error_level=sqlglot.ErrorLevel.WARN)
+    except Exception as e:
+        pq.parse_error = str(e)
+        return pq
+
+    # Таблицы
+    pq.tables = sorted({
+        t.name.lower()
+        for t in tree.find_all(exp.Table)
+        if t.name
+    })
+
+    # Колонки в SELECT
+    pq.selected_cols = [
+        col.sql(dialect="starrocks")
+        for col in tree.find_all(exp.Column)
+        if isinstance(col.parent, (exp.Select, exp.Alias))
+    ]
+
+    # JOIN-условия
+    for join in tree.find_all(exp.Join):
+        pq.joins.append({
+            "table": join.this.name if hasattr(join.this, "name") else str(join.this),
+            "kind":  join.args.get("kind", ""),
+            "on":    join.args["on"].sql(dialect="starrocks") if join.args.get("on") else "",
+        })
+
+    # WHERE / HAVING
+    for node_type in (exp.Where, exp.Having):
+        node = tree.find(node_type)
+        if node:
+            pq.filters.append(node.this.sql(dialect="starrocks"))
+
+    # Агрегатные функции
+    AGG_TYPES = (exp.Count, exp.Sum, exp.Avg, exp.Max, exp.Min,
+                 exp.ApproxDistinct, exp.GroupConcat)
+    pq.aggregations = list({
+        a.sql(dialect="starrocks") for a in tree.find_all(*AGG_TYPES)
+    })
+
+    # Оконные функции
+    pq.window_funcs = list({
+        w.sql(dialect="starrocks") for w in tree.find_all(exp.Window)
+    })
+
+    # GROUP BY
+    gb = tree.find(exp.Group)
+    if gb:
+        pq.group_by_cols = [e.sql(dialect="starrocks") for e in gb.expressions]
+
+    # ORDER BY
+    ob = tree.find(exp.Order)
+    if ob:
+        pq.order_by_cols = [e.sql(dialect="starrocks") for e in ob.expressions]
+
+    # Подзапросы
+    pq.subqueries = sum(1 for _ in tree.find_all(exp.Subquery))
+
+    # CTE
+    with_node = tree.find(exp.With)
+    if with_node:
+        pq.ctes = [cte.alias for cte in with_node.find_all(exp.CTE)]
+
+    return pq
+
+
+# ─────────────────────────────────────────────
+# 3. ОБОГАЩЕНИЕ МЕТАДАННЫМИ
+# ─────────────────────────────────────────────
+
+def enrich(pq: ParsedQuery, schema: dict[str, TableMeta]) -> dict:
+    """Добавляем к ParsedQuery семантику из схемы."""
+    enriched_tables = {}
+    for tname in pq.tables:
+        meta = schema.get(tname)
+        if not meta:
+            enriched_tables[tname] = {"description": "unknown table"}
+            continue
+        enriched_tables[tname] = {
+            "description": meta.description,
+            "columns_used": {},
+        }
+        # Какие колонки таблицы реально используются в запросе
+        all_sql = " ".join(
+            pq.selected_cols + pq.filters + pq.aggregations +
+            pq.group_by_cols + pq.order_by_cols +
+            [j["on"] for j in pq.joins]
+        ).lower()
+        for cname, cmeta in meta.columns.items():
+            if cname.lower() in all_sql:
+                enriched_tables[tname]["columns_used"][cname] = {
+                    "type":        cmeta.data_type,
+                    "description": cmeta.description,
+                    "samples":     cmeta.sample_values,
+                }
+
+    return {
+        "tables":       enriched_tables,
+        "joins":        pq.joins,
+        "filters":      pq.filters,
+        "aggregations": pq.aggregations,
+        "window_funcs": pq.window_funcs,
+        "group_by":     pq.group_by_cols,
+        "order_by":     pq.order_by_cols,
+        "subqueries":   pq.subqueries,
+        "ctes":         pq.ctes,
+    }
+
+
+# ─────────────────────────────────────────────
+# 4. КЛАСТЕРИЗАЦИЯ ПО ДОМЕНАМ
+# ─────────────────────────────────────────────
+
+def cluster_by_domain(queries: list[ParsedQuery]) -> dict[str, list[ParsedQuery]]:
+    """
+    Группируем запросы по набору таблиц (доменный ключ).
+    Запросы без таблиц — в кластер '_unparsed'.
+    """
+    clusters: dict[str, list[ParsedQuery]] = defaultdict(list)
+    for pq in queries:
+        key = "+".join(sorted(pq.tables)) if pq.tables else "_unparsed"
+        clusters[key].append(pq)
+    return dict(clusters)
+
+
+def deduplicate(queries: list[ParsedQuery]) -> list[ParsedQuery]:
+    seen: set[str] = set()
+    result = []
+    for pq in queries:
+        if pq.fingerprint not in seen:
+            seen.add(pq.fingerprint)
+            result.append(pq)
+    return result
+
+
+# ─────────────────────────────────────────────
+# 5. ГЕНЕРАЦИЯ RULES ЧЕРЕЗ LLM
+# ─────────────────────────────────────────────
+
+SYSTEM_PROMPT = """\
+Ты — эксперт по SQL и проектированию Text2SQL систем.
+Тебе дают кластер реальных SQL-запросов из production-логов StarRocks
+вместе с обогащёнными метаданными (описания таблиц, колонок, типы данных).
+
+Твоя задача — сформулировать "SQL rules" для этого кластера таблиц.
+Rules — это короткие, однозначные правила, которые LLM будет использовать
+при генерации SQL для данных таблиц.
+
+Формат ответа — строго JSON-массив объектов:
+[
+  {
+    "rule_id": "R001",
+    "category": "join|filter|aggregation|naming|performance|business_logic",
+    "tables":   ["table1", "table2"],
+    "rule":     "Краткое правило на русском языке",
+    "rationale": "Почему это правило важно (1-2 предложения)",
+    "example_sql": "Короткий пример SQL (необязательно)"
+  }
+]
+
+Правила:
+- Выводи только то, что подтверждается паттернами из запросов
+- Не придумывай правила без доказательств в данных
+- Категория business_logic — для правил о бизнес-смысле фильтров/агрегаций
+- Минимум 5, максимум 20 rules на кластер
+- Только JSON, без markdown-обёртки
+"""
+
+
+def build_user_message(
+    cluster_key: str,
+    queries: list[ParsedQuery],
+    schema: dict[str, TableMeta],
+    max_queries: int = 30,
+) -> str:
+    samples = queries[:max_queries]
+    enriched = [enrich(pq, schema) for pq in samples]
+
+    payload = {
+        "domain": cluster_key,
+        "total_queries_in_cluster": len(queries),
+        "sample_size": len(samples),
+        "queries": [
+            {
+                "sql":      pq.raw_sql[:2000],  # обрезаем монстров
+                "metadata": enriched[i],
+            }
+            for i, pq in enumerate(samples)
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def generate_rules_for_cluster(
+    cluster_key: str,
+    queries: list[ParsedQuery],
+    schema: dict[str, TableMeta],
+    client: anthropic.Anthropic,
+    model: str = "claude-opus-4-5",
+) -> list[dict]:
+    user_msg = build_user_message(cluster_key, queries, schema)
+    response = client.messages.create(
+        model=model,
+        max_tokens=4096,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_msg}],
+    )
+    raw = response.content[0].text.strip()
+    # На случай если модель всё же обернула в ```json
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"  [!] JSON parse error for cluster '{cluster_key}': {e}")
+        return [{"rule_id": "ERR", "raw_response": raw}]
+
+
+# ─────────────────────────────────────────────
+# 6. ТОЧКА ВХОДА
+# ─────────────────────────────────────────────
+
+def generate_all_rules(
+    sql_queries: list[str],
+    schema: dict[str, TableMeta],
+    api_key: str,
+    model: str = "claude-opus-4-5",
+    min_cluster_size: int = 2,
+    output_path: str = "sql_rules.json",
+) -> dict[str, list[dict]]:
+    """
+    sql_queries      — список сырых SQL-строк из логов
+    schema           — словарь {table_name: TableMeta}
+    api_key          — Anthropic API key
+    min_cluster_size — кластеры меньше этого размера пропускаем
+    output_path      — куда сохранить итоговый JSON
+    """
+    print(f"[1/4] Парсим {len(sql_queries)} запросов...")
+    parsed = [parse_query(sql) for sql in sql_queries]
+    errors = [p for p in parsed if p.parse_error]
+    print(f"      Ошибок парсинга: {len(errors)}")
+
+    print("[2/4] Дедуплицируем...")
+    parsed = deduplicate(parsed)
+    print(f"      Уникальных запросов: {len(parsed)}")
+
+    print("[3/4] Кластеризуем по доменам...")
+    clusters = cluster_by_domain(parsed)
+    for key, qs in clusters.items():
+        print(f"      {key}: {len(qs)} запросов")
+
+    print("[4/4] Генерируем rules через LLM...")
+    client = anthropic.Anthropic(api_key=api_key)
+    all_rules: dict[str, list[dict]] = {}
+
+    for cluster_key, qs in clusters.items():
+        if cluster_key == "_unparsed":
+            print(f"  [skip] {cluster_key}")
+            continue
+        if len(qs) < min_cluster_size:
+            print(f"  [skip] {cluster_key} (слишком мало запросов: {len(qs)})")
+            continue
+        print(f"  Обрабатываем '{cluster_key}' ({len(qs)} запросов)...")
+        rules = generate_rules_for_cluster(cluster_key, qs, schema, client, model)
+        all_rules[cluster_key] = rules
+        print(f"    → сгенерировано {len(rules)} rules")
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(all_rules, f, ensure_ascii=False, indent=2)
+    print(f"\nГотово! Результат сохранён в {output_path}")
+    return all_rules
+
+
+# ─────────────────────────────────────────────
+# ПРИМЕР ИСПОЛЬЗОВАНИЯ
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    # --- Схема (загружай из своих источников) ---
+    schema: dict[str, TableMeta] = {
+        "orders": TableMeta(
+            name="orders",
+            description="Таблица заказов клиентов",
+            columns={
+                "order_id":   ColumnMeta("order_id",   "BIGINT",  "Уникальный ID заказа"),
+                "client_id":  ColumnMeta("client_id",  "BIGINT",  "ID клиента"),
+                "status":     ColumnMeta("status",     "VARCHAR", "Статус заказа",
+                                         ["new", "paid", "cancelled"]),
+                "created_at": ColumnMeta("created_at", "DATETIME","Дата создания заказа"),
+                "amount":     ColumnMeta("amount",     "DECIMAL", "Сумма заказа"),
+            }
+        ),
+        "clients": TableMeta(
+            name="clients",
+            description="Справочник клиентов",
+            columns={
+                "client_id":  ColumnMeta("client_id",  "BIGINT",  "ID клиента"),
+                "region":     ColumnMeta("region",     "VARCHAR", "Регион клиента"),
+                "segment":    ColumnMeta("segment",    "VARCHAR", "Сегмент клиента",
+                                         ["retail", "b2b", "vip"]),
+            }
+        ),
+    }
+
+    # --- SQL из логов ---
+    sample_queries = [
+        """
+        SELECT c.region, COUNT(o.order_id) AS cnt, SUM(o.amount) AS total
+        FROM orders o
+        JOIN clients c ON o.client_id = c.client_id
+        WHERE o.status = 'paid'
+          AND o.created_at >= '2024-01-01'
+        GROUP BY c.region
+        ORDER BY total DESC
+        """,
+        """
+        SELECT c.segment, AVG(o.amount) AS avg_order
+        FROM orders o
+        INNER JOIN clients c ON o.client_id = c.client_id
+        WHERE o.status != 'cancelled'
+        GROUP BY c.segment
+        HAVING AVG(o.amount) > 1000
+        """,
+        """
+        SELECT order_id, client_id, amount,
+               SUM(amount) OVER (PARTITION BY client_id ORDER BY created_at) AS running_total
+        FROM orders
+        WHERE status = 'paid'
+        """,
+    ]
+
+    import os
+    rules = generate_all_rules(
+        sql_queries=sample_queries,
+        schema=schema,
+        api_key=os.environ["ANTHROPIC_API_KEY"],
+        model="claude-opus-4-5",
+        min_cluster_size=1,       # для теста разрешаем одиночные кластеры
+        output_path="sql_rules.json",
+    )
+
+    # Печатаем результат
+    for domain, domain_rules in rules.items():
+        print(f"\n=== {domain} ===")
+        for r in domain_rules:
+            print(f"  [{r.get('rule_id')}] [{r.get('category')}] {r.get('rule')}")
