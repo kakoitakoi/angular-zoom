@@ -2242,3 +2242,69 @@ def analyze_joins(sql: str):
 analyze_joins(sql)
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+import sqlglot
+from sqlglot import exp
+
+sql = """
+SELECT *
+FROM dwh.fact_sales   AS fs
+JOIN dwh.dim_product  AS dp ON fs.product_id = dp.id
+JOIN dwh.dim_customer AS dc ON get_json_string(dp.json, "customer_id") = dc.id
+"""
+
+tree = sqlglot.parse_one(sql, dialect="starrocks")
+
+def extract_columns_from_expr(node) -> list[exp.Column]:
+    """Рекурсивно достаём все exp.Column из выражения (включая внутри функций)."""
+    return list(node.find_all(exp.Column))
+
+def analyze_joins(tree):
+    links = []
+
+    for join in tree.find_all(exp.Join):
+        on_clause = join.args.get("on")
+        if not on_clause:
+            continue
+
+        for eq in on_clause.find_all(exp.EQ):
+            left_cols  = extract_columns_from_expr(eq.left)
+            right_cols = extract_columns_from_expr(eq.right)
+
+            # Определяем "сырое" представление каждой стороны
+            left_repr  = eq.left.sql()   # читаемо: get_json_string(dp.json, 'customer_id')
+            right_repr = eq.right.sql()  # dc.id
+
+            # Уникальные алиасы таблиц, задействованных в каждой стороне
+            left_tables  = list(dict.fromkeys(c.table for c in left_cols  if c.table))
+            right_tables = list(dict.fromkeys(c.table for c in right_cols if c.table))
+
+            links.append({
+                "left_expr":   left_repr,
+                "left_tables": left_tables,
+                "right_expr":  right_repr,
+                "right_tables": right_tables,
+                # Пара для графа связей (все комбинации)
+                "pairs": [(lt, rt) for lt in left_tables for rt in right_tables],
+            })
+
+    return links
+
+for link in analyze_joins(tree):
+    print(f"Выражение: {link['left_expr']}  =  {link['right_expr']}")
+    print(f"Таблицы:   {link['left_tables']} <-> {link['right_tables']}")
+    print(f"Связи:     {link['pairs']}")
+    print()
+
+
