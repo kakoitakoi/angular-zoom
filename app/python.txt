@@ -2200,3 +2200,45 @@ def extract_joins(sql: str):
         results.append(result)
 
     return results
+
+
+
+
+
+
+
+
+def analyze_joins(sql: str):
+    tree = sqlglot.parse_one(sql)
+
+    # 1. Собираем все алиасы
+    sources = [tree.find(exp.From).this] + [j.this for j in tree.find_all(exp.Join)]
+    aliases = {}
+    for src in sources:
+        alias = src.alias or src.name
+        full  = f"{src.args.get('db', '')}.{src.name}".lstrip(".")
+        aliases[alias] = full
+
+    # 2. Собираем связи
+    links = []
+    for join in tree.find_all(exp.Join):
+        on_clause = join.args.get("on")
+        if not on_clause:
+            continue
+        for eq in on_clause.find_all(exp.EQ):
+            links.append((
+                f"{eq.left.table}.{eq.left.name}",
+                f"{eq.right.table}.{eq.right.name}",
+            ))
+
+    print("=== Таблицы ===")
+    for alias, full in aliases.items():
+        print(f"  {alias:5} -> {full}")
+
+    print("\n=== Связи ===")
+    for l, r in links:
+        print(f"  {l}  =  {r}")
+
+analyze_joins(sql)
+
+
