@@ -2036,3 +2036,167 @@ if __name__ == "__main__":
         print(f"\n=== {domain} ===")
         for r in domain_rules:
             print(f"  [{r.get('rule_id')}] [{r.get('category')}] {r.get('rule')}")
+
+
+
+
+from sqlglot import parse_one, exp
+
+
+# -------------------------------
+# helpers
+# -------------------------------
+
+def extract_tables(tree):
+    """
+    alias -> {table, db, type}
+    """
+    tables = {}
+
+    # --- CTE ---
+    with_expr = tree.find(exp.With)
+    if with_expr:
+        for cte in with_expr.expressions:
+            alias = cte.alias
+            tables[alias] = {
+                "table": alias,
+                "db": None,
+                "type": "CTE"
+            }
+
+    # --- TABLES + SUBQUERY ---
+    for node in tree.walk():
+        if isinstance(node, exp.Table):
+            alias = node.alias_or_name
+            tables[alias] = {
+                "table": node.name,
+                "db": node.db,
+                "type": "TABLE"
+            }
+
+        elif isinstance(node, exp.Subquery):
+            alias = node.alias
+            if alias:
+                tables[alias] = {
+                    "table": None,
+                    "db": None,
+                    "type": "SUBQUERY"
+                }
+
+    return tables
+
+
+def is_column(node):
+    return isinstance(node, exp.Column)
+
+
+def extract_column(node):
+    return node.table, node.name
+
+
+def extract_conditions(expr):
+    """
+    рекурсивно достаём только COLUMN = COLUMN
+    """
+    result = []
+
+    if expr is None:
+        return result
+
+    if isinstance(expr, exp.EQ):
+        l, r = expr.left, expr.right
+
+        if is_column(l) and is_column(r):
+            result.append((extract_column(l), extract_column(r)))
+
+    elif isinstance(expr, (exp.And, exp.Or)):
+        result += extract_conditions(expr.left)
+        result += extract_conditions(expr.right)
+
+    else:
+        for arg in expr.args.values():
+            if isinstance(arg, exp.Expression):
+                result += extract_conditions(arg)
+            elif isinstance(arg, list):
+                for item in arg:
+                    if isinstance(item, exp.Expression):
+                        result += extract_conditions(item)
+
+    return result
+
+
+# -------------------------------
+# MAIN
+# -------------------------------
+
+def extract_joins(sql: str):
+    tree = parse_one(sql, read="mysql")
+
+    alias_map = extract_tables(tree)
+    results = []
+
+    for join in tree.find_all(exp.Join):
+        on_expr = join.args.get("on")
+
+        conditions = extract_conditions(on_expr)
+
+        if not conditions:
+            continue
+
+        # определяем алиасы таблиц из условий
+        aliases = set()
+        for (l, r) in conditions:
+            aliases.add(l[0])
+            aliases.add(r[0])
+
+        if len(aliases) != 2:
+            # пропускаем сложные случаи (3+ таблицы)
+            continue
+
+        a1, a2 = list(aliases)
+
+        t1 = alias_map.get(a1, {})
+        t2 = alias_map.get(a2, {})
+
+        # --- формируем связи ---
+        links = []
+        for i, (l, r) in enumerate(conditions, start=1):
+            if l[0] == a1:
+                left_col = l[1]
+                right_col = r[1]
+            else:
+                left_col = r[1]
+                right_col = l[1]
+
+            links.append({
+                f"связь{i}": {
+                    "поле1": left_col,
+                    "поле2": right_col,
+                    "предикат": "ON"
+                }
+            })
+
+        # --- isOnlyTables ---
+        is_only_tables = (
+            t1.get("type") == "TABLE" and
+            t2.get("type") == "TABLE"
+        )
+
+        result = {
+            "таблица1": t1.get("table"),
+            "алиас1": a1,
+            "таблица2": t2.get("table"),
+            "алиас2": a2,
+            "кол-во связей": len(links),
+            "join_side": join.side,
+            "join_kind": join.kind,
+            "isOnlyTables": is_only_tables
+        }
+
+        # добавляем связи внутрь
+        for link in links:
+            result.update(link)
+
+        results.append(result)
+
+    return results
