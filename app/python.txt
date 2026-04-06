@@ -2969,3 +2969,53 @@ if is_exact_match(comment, keyword):                # ← было: keyword.lowe
 
 
 
+# ── Comments ─────────────────────────────────────────────
+comment_hits = []
+comments = rendered.get("comment", {}).get("comments", [])
+for c in comments:
+    body_html = c.get("renderedBody", "")
+    
+    # Сначала проверяем точное совпадение во всём тексте комментария
+    full_text = BeautifulSoup(body_html, "html.parser").get_text(
+        separator="\n", strip=True
+    )
+    
+    if not is_exact_match(full_text, keyword):   # ← отсекаем like-совпадения
+        continue
+    
+    # Если прошли фильтр — собираем подсвеченные фрагменты
+    hits = extract_context_from_html(body_html, keyword)
+    if hits:
+        comment_hits.append({
+            "author":    c.get("author", {}).get("displayName"),
+            "created":   c.get("created", "")[:10],
+            "hits":      hits,
+            "full_text": full_text,
+        })
+
+if comment_hits:
+    result["areas"]["comments"] = comment_hits
+
+
+# ── Description ──────────────────────────────────────────
+desc_html = rendered.get("description", "")
+desc_full = BeautifulSoup(desc_html, "html.parser").get_text(separator=" ", strip=True)
+
+if is_exact_match(desc_full, keyword):           # ← pre-check на весь текст
+    desc_hits = extract_context_from_html(desc_html, keyword)
+    if desc_hits:
+        result["areas"]["description"] = desc_hits
+
+# ── Environment ──────────────────────────────────────────
+env_html = rendered.get("environment", "")
+env_full = BeautifulSoup(env_html, "html.parser").get_text(separator=" ", strip=True)
+
+if is_exact_match(env_full, keyword):            # ← pre-check на весь текст
+    env_hits = extract_context_from_html(env_html, keyword)
+    if env_hits:
+        result["areas"]["environment"] = env_hits
+
+
+
+
+
