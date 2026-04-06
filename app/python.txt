@@ -2870,3 +2870,46 @@ if __name__ == "__main__":
     print_results(results, keyword)
 
 
+
+
+
+
+
+
+# ── Comments ─────────────────────────────────────────────
+comment_hits = []
+comments = rendered.get("comment", {}).get("comments", [])
+for c in comments:
+    body_html = c.get("renderedBody", "")
+    hits = extract_context_from_html(body_html, keyword)
+    if hits:
+        # Извлекаем весь текст комментария целиком
+        full_text = BeautifulSoup(body_html, "html.parser").get_text(
+            separator="\n", strip=True
+        )
+        comment_hits.append({
+            "author":    c.get("author", {}).get("displayName"),
+            "created":   c.get("created", "")[:10],
+            "hits":      hits,
+            "full_text": full_text,   # ← добавили
+        })
+if comment_hits:
+    result["areas"]["comments"] = comment_hits
+
+
+
+
+elif area == "comments":
+    for c in data:
+        print(f"    [{c['created']}] {c['author']}:")
+        # Подсвечиваем keyword в полном тексте
+        full = c["full_text"].replace(keyword, f"[{keyword.upper()}]")
+        # Отступ для каждой строки
+        for line in full.splitlines():
+            if line.strip():
+                print(f"      {line}")
+        print()
+
+
+
+
