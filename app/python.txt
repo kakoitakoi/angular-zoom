@@ -3019,3 +3019,61 @@ if is_exact_match(env_full, keyword):            # ← pre-check на весь �
 
 
 
+
+
+
+
+Doris http upload
+
+import json
+import requests
+
+DORIS_HOST = "http://your-doris-host:8030"
+DB = "your_db"
+TABLE = "your_table"
+USER = "user"
+PASSWORD = "password"
+
+def stream_load(batch):
+    url = f"{DORIS_HOST}/api/{DB}/{TABLE}/_stream_load"
+
+    headers = {
+        "label": f"batch_{int(__import__('time').time() * 1000)}",
+        "format": "json",
+        "strip_outer_array": "true"
+    }
+
+    data = json.dumps(batch)
+
+    response = requests.put(
+        url,
+        headers=headers,
+        data=data,
+        auth=(USER, PASSWORD)
+    )
+
+    print(response.text)
+
+
+from kafka import KafkaConsumer
+
+consumer = KafkaConsumer(
+    'your_topic',
+    bootstrap_servers=['localhost:9092'],
+    value_deserializer=lambda x: json.loads(x.decode('utf-8'))
+)
+
+batch = []
+BATCH_SIZE = 10000
+
+for msg in consumer:
+    batch.append(msg.value)
+
+    if len(batch) >= BATCH_SIZE:
+        stream_load(batch)
+        batch.clear()
+
+
+
+
+
