@@ -2308,3 +2308,80 @@ for link in analyze_joins(tree):
     print()
 
 
+
+
+
+
+
+
+
+
+
+
+import sqlglot
+from sqlglot import exp
+
+sql = """
+SELECT *
+FROM dwh.fact_sales   AS fs
+JOIN dwh.dim_product  AS dp ON fs.product_id = dp.id
+JOIN dwh.dim_customer AS dc ON get_json_string(dp.json, "customer_id") = dc.id
+"""
+
+tree = sqlglot.parse_one(sql, dialect="starrocks")
+
+def build_alias_map(tree) -> dict[str, str]:
+    sources = [tree.find(exp.From).this] + [j.this for j in tree.find_all(exp.Join)]
+    result = {}
+    for src in sources:
+        alias = src.alias or src.name
+        db    = src.args.get("db") or ""
+        full  = f"{db}.{src.name}" if db else src.name
+        result[alias] = full
+    return result
+
+def resolve_expr(node, alias_map: dict) -> str:
+    """Заменяет алиасы таблиц на полные имена во всём выражении."""
+    node = node.copy()
+    for col in node.find_all(exp.Column):
+        if col.table and col.table in alias_map:
+            col.set("table", exp.Identifier(this=alias_map[col.table], quoted=False))
+    return node.sql()
+
+def analyze_joins(tree):
+    alias_map = build_alias_map(tree)
+    links = []
+
+    for join in tree.find_all(exp.Join):
+        on_clause = join.args.get("on")
+        if not on_clause:
+            continue
+
+        for eq in on_clause.find_all(exp.EQ):
+            left_cols  = list(eq.left.find_all(exp.Column))
+            right_cols = list(eq.right.find_all(exp.Column))
+
+            left_tables  = list(dict.fromkeys(
+                alias_map.get(c.table, c.table) for c in left_cols  if c.table
+            ))
+            right_tables = list(dict.fromkeys(
+                alias_map.get(c.table, c.table) for c in right_cols if c.table
+            ))
+
+            links.append({
+                "left_expr":   resolve_expr(eq.left,  alias_map),
+                "right_expr":  resolve_expr(eq.right, alias_map),
+                "left_tables":  left_tables,
+                "right_tables": right_tables,
+                "pairs":        [(lt, rt) for lt in left_tables for rt in right_tables],
+            })
+
+    return links
+
+for link in analyze_joins(tree):
+    print(f"Выражение: {link['left_expr']}  =  {link['right_expr']}")
+    print(f"Таблицы:   {link['left_tables']} <-> {link['right_tables']}")
+    print(f"Связи:     {link['pairs']}")
+    print()
+
+
