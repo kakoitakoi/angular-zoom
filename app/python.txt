@@ -2913,3 +2913,59 @@ elif area == "comments":
 
 
 
+
+
+
+
+
+import re
+
+def is_exact_match(text: str, keyword: str) -> bool:
+    """
+    Проверяет что keyword встречается как отдельное слово/идентификатор,
+    а не как часть другого слова.
+    Граница: пробел, пунктуация, начало/конец строки.
+    """
+    # \b не работает для snake_case идентификаторов с _ на границе,
+    # поэтому используем явные разделители
+    pattern = r'(?<![a-zA-Z0-9_])' + re.escape(keyword) + r'(?![a-zA-Z0-9_])'
+    return bool(re.search(pattern, text, re.IGNORECASE))
+
+def extract_context_from_html(html: str, keyword: str) -> list[str]:
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    matches = []
+
+    for el in soup.find_all(["p", "li", "td", "th", "h1", "h2", "h3", "pre"]):
+        text = el.get_text(separator=" ", strip=True)
+        if is_exact_match(text, keyword):       # ← было: keyword.lower() in text.lower()
+            highlighted = re.sub(
+                r'(?<![a-zA-Z0-9_])' + re.escape(keyword) + r'(?![a-zA-Z0-9_])',
+                f"[{keyword.upper()}]",
+                text,
+                flags=re.IGNORECASE,
+            )
+            tag = el.name.upper()
+            matches.append(f"[{tag}] {highlighted}")
+
+    return matches
+
+
+# В analyze_issue:
+
+# Summary
+if is_exact_match(result["summary"], keyword):      # ← было: keyword.lower() in ...
+    result["areas"]["summary"] = result["summary"]
+
+# Labels
+label_hits = [l for l in fields.get("labels", []) if is_exact_match(l, keyword)]
+
+# В search_in_worklogs:
+if is_exact_match(comment, keyword):                # ← было: keyword.lower() in ...
+
+
+
+
+
+
