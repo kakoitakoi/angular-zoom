@@ -2597,3 +2597,276 @@ if __name__ == "__main__":
             print(f"[{key}] {summary}")
             print_results(results, keyword)
 
+
+
+
+
+
+
+
+
+Jira v2 api
+
+import requests
+from requests.auth import HTTPBasicAuth
+from bs4 import BeautifulSoup
+
+JIRA_URL = "https://your-domain.atlassian.net"
+EMAIL    = "you@example.com"
+TOKEN    = "your_api_token"
+
+auth    = HTTPBasicAuth(EMAIL, TOKEN)
+headers = {"Accept": "application/json", "Content-Type": "application/json"}
+
+
+# ═══════════════════════════════════════════════════════════
+# 1. ПОИСК ЗАДАЧ (summary + description)
+# ═══════════════════════════════════════════════════════════
+
+def search_issues(keyword: str, max_results: int = 50) -> list[dict]:
+    """
+    text~ ищет по summary, description, comments, environment
+    и всем текстовым custom fields одновременно.
+    """
+    url = f"{JIRA_URL}/rest/api/2/search"
+    issues = []
+    start_at = 0
+
+    while True:
+        payload = {
+            "jql": f'text ~ "{keyword}" ORDER BY updated DESC',
+            "startAt": start_at,
+            "maxResults": max_results,
+            "fields": [
+                "summary", "description", "status", "assignee",
+                "reporter", "project", "issuetype", "comment",
+                "attachment", "labels", "environment",
+            ],
+            "expand": ["renderedFields"],
+        }
+
+        resp = requests.post(url, headers=headers, auth=auth, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        batch = data.get("issues", [])
+        issues.extend(batch)
+
+        # Пагинация
+        start_at += len(batch)
+        if start_at >= data.get("total", 0) or not batch:
+            break
+
+    return issues
+
+
+# ═══════════════════════════════════════════════════════════
+# 2. ПОИСК В ВОРКLOGАХ
+#    (text~ не покрывает worklogs — нужен отдельный запрос)
+# ═══════════════════════════════════════════════════════════
+
+def search_in_worklogs(issue_key: str, keyword: str) -> list[dict]:
+    url = f"{JIRA_URL}/rest/api/2/issue/{issue_key}/worklog"
+    resp = requests.get(url, headers=headers, auth=auth)
+    resp.raise_for_status()
+
+    matches = []
+    for wl in resp.json().get("worklogs", []):
+        comment = wl.get("comment", "")
+        if keyword.lower() in comment.lower():
+            matches.append({
+                "author":     wl.get("author", {}).get("displayName"),
+                "started":    wl.get("started", "")[:10],
+                "time_spent": wl.get("timeSpent"),
+                "comment":    comment,
+            })
+    return matches
+
+
+# ═══════════════════════════════════════════════════════════
+# 3. ПОИСК В ATTACHMENTS (по имени файла)
+#    Содержимое файлов API не индексирует — только имена
+# ═══════════════════════════════════════════════════════════
+
+def search_in_attachments(issue: dict, keyword: str) -> list[dict]:
+    attachments = issue.get("fields", {}).get("attachment", [])
+    return [
+        {
+            "filename": a["filename"],
+            "mime_type": a["mimeType"],
+            "url": a["content"],
+            "author": a.get("author", {}).get("displayName"),
+        }
+        for a in attachments
+        if keyword.lower() in a["filename"].lower()
+    ]
+
+
+# ═══════════════════════════════════════════════════════════
+# 4. ИЗВЛЕЧЕНИЕ ВХОЖДЕНИЙ ИЗ HTML-ПОЛЕЙ
+#    (description, environment, comment — приходят как HTML)
+# ═══════════════════════════════════════════════════════════
+
+def extract_context_from_html(html: str, keyword: str) -> list[str]:
+    """Возвращает список абзацев/ячеек содержащих keyword."""
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    matches = []
+
+    for el in soup.find_all(["p", "li", "td", "th", "h1", "h2", "h3", "pre"]):
+        text = el.get_text(separator=" ", strip=True)
+        if keyword.lower() in text.lower():
+            highlighted = text.replace(keyword, f"[{keyword.upper()}]")
+            tag = el.name.upper()
+            matches.append(f"[{tag}] {highlighted}")
+
+    return matches
+
+
+# ═══════════════════════════════════════════════════════════
+# 5. СБОРКА ПОЛНОГО РЕЗУЛЬТАТА ПО ЗАДАЧЕ
+# ═══════════════════════════════════════════════════════════
+
+def analyze_issue(issue: dict, keyword: str, include_worklogs: bool = True) -> dict | None:
+    key     = issue["key"]
+    fields  = issue["fields"]
+    rendered = issue.get("renderedFields", {})
+
+    result = {
+        "key":       key,
+        "summary":   fields.get("summary", ""),
+        "project":   fields.get("project", {}).get("name"),
+        "status":    fields.get("status", {}).get("name"),
+        "assignee":  (fields.get("assignee") or {}).get("displayName", "—"),
+        "reporter":  (fields.get("reporter") or {}).get("displayName", "—"),
+        "areas":     {},
+    }
+
+    # ── Summary ──────────────────────────────────────────
+    if keyword.lower() in result["summary"].lower():
+        result["areas"]["summary"] = result["summary"]
+
+    # ── Description ──────────────────────────────────────
+    desc_html = rendered.get("description", "")
+    desc_hits = extract_context_from_html(desc_html, keyword)
+    if desc_hits:
+        result["areas"]["description"] = desc_hits
+
+    # ── Environment ──────────────────────────────────────
+    env_html = rendered.get("environment", "")
+    env_hits = extract_context_from_html(env_html, keyword)
+    if env_hits:
+        result["areas"]["environment"] = env_hits
+
+    # ── Labels ───────────────────────────────────────────
+    label_hits = [l for l in fields.get("labels", []) if keyword.lower() in l.lower()]
+    if label_hits:
+        result["areas"]["labels"] = label_hits
+
+    # ── Comments ─────────────────────────────────────────
+    comment_hits = []
+    comments = rendered.get("comment", {}).get("comments", [])
+    for c in comments:
+        hits = extract_context_from_html(c.get("renderedBody", ""), keyword)
+        if hits:
+            comment_hits.append({
+                "author":  c.get("author", {}).get("displayName"),
+                "created": c.get("created", "")[:10],
+                "hits":    hits,
+            })
+    if comment_hits:
+        result["areas"]["comments"] = comment_hits
+
+    # ── Attachments ──────────────────────────────────────
+    att_hits = search_in_attachments(issue, keyword)
+    if att_hits:
+        result["areas"]["attachments"] = att_hits
+
+    # ── Worklogs ─────────────────────────────────────────
+    if include_worklogs:
+        wl_hits = search_in_worklogs(key, keyword)
+        if wl_hits:
+            result["areas"]["worklogs"] = wl_hits
+
+    # Если нет ни одного совпадения — пропускаем
+    if not result["areas"]:
+        return None
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════
+# 6. ВЫВОД РЕЗУЛЬТАТОВ
+# ═══════════════════════════════════════════════════════════
+
+AREA_LABELS = {
+    "summary":     "Summary",
+    "description": "Description",
+    "environment": "Environment",
+    "labels":      "Labels",
+    "comments":    "Comments",
+    "attachments": "Attachments",
+    "worklogs":    "Worklogs",
+}
+
+def print_results(results: list[dict], keyword: str):
+    if not results:
+        print(f'Ничего не найдено по запросу "{keyword}"')
+        return
+
+    print(f'\nРезультаты поиска "{keyword}": {len(results)} задач(и)\n')
+
+    for r in results:
+        print(f"{'='*65}")
+        print(f"  {r['key']}  |  {r['summary']}")
+        print(f"  Проект: {r['project']}  |  Статус: {r['status']}")
+        print(f"  Исполнитель: {r['assignee']}  |  Репортер: {r['reporter']}")
+        print(f"  Области: {', '.join(AREA_LABELS[a] for a in r['areas'])}")
+        print()
+
+        for area, data in r["areas"].items():
+            label = AREA_LABELS[area]
+            print(f"  ▌ {label}")
+
+            if area == "summary":
+                print(f"    {data}")
+
+            elif area in ("description", "environment"):
+                for hit in data:
+                    print(f"    {hit}")
+
+            elif area == "labels":
+                print(f"    {', '.join(data)}")
+
+            elif area == "comments":
+                for c in data:
+                    print(f"    [{c['created']}] {c['author']}:")
+                    for hit in c["hits"]:
+                        print(f"      {hit}")
+
+            elif area == "attachments":
+                for a in data:
+                    print(f"    {a['filename']} ({a['mime_type']}) — {a['author']}")
+
+            elif area == "worklogs":
+                for w in data:
+                    print(f"    [{w['started']}] {w['author']} ({w['time_spent']}): {w['comment'][:120]}")
+
+            print()
+
+        print()
+
+
+# ═══════════════════════════════════════════════════════════
+# ТОЧКА ВХОДА
+# ═══════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    keyword = "batch_size"
+
+    print(f'Поиск "{keyword}" во всех областях Jira...')
+    issues  = search_issues(keyword)
+    results = [r for i in issues if (r := analyze_issue(i, keyword)) is not None]
+    print_results(results, keyword)
+
+
