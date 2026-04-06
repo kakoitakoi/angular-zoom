@@ -2385,3 +2385,108 @@ for link in analyze_joins(tree):
     print()
 
 
+
+
+
+
+
+
+import sqlglot
+from sqlglot import exp
+
+sql = """
+WITH cte_sales AS (
+    SELECT * FROM dwh.fact_sales
+)
+SELECT *
+FROM cte_sales AS fs
+JOIN dwh.dim_product  AS dp ON fs.product_id = dp.id
+JOIN dwh.dim_customer AS dc ON get_json_string(dp.json, "customer_id") = dc.id
+JOIN (SELECT id FROM dwh.dim_region) AS dr ON dc.region_id = dr.id
+"""
+
+tree = sqlglot.parse_one(sql, dialect="starrocks")
+
+def build_alias_map(tree) -> dict[str, str]:
+    # Имена CTE — исключаем
+    cte_names = {
+        cte.alias for cte in tree.find_all(exp.CTE)
+    }
+
+    sources = [tree.find(exp.From).this] + [j.this for j in tree.find_all(exp.Join)]
+    result = {}
+
+    for src in sources:
+        alias = src.alias or src.name
+
+        # Пропускаем подзапросы (Subquery внутри FROM/JOIN)
+        if isinstance(src, exp.Subquery):
+            continue
+
+        # Пропускаем если имя таблицы совпадает с CTE
+        if src.name in cte_names:
+            continue
+
+        db   = src.args.get("db") or ""
+        full = f"{db}.{src.name}" if db else src.name
+        result[alias] = full
+
+    return result
+
+def resolve_expr(node, alias_map: dict) -> str:
+    node = node.copy()
+    for col in node.find_all(exp.Column):
+        if col.table and col.table in alias_map:
+            col.set("table", exp.Identifier(this=alias_map[col.table], quoted=False))
+    return node.sql()
+
+def analyze_joins(tree):
+    alias_map = build_alias_map(tree)
+    links = []
+
+    for join in tree.find_all(exp.Join):
+        on_clause = join.args.get("on")
+        if not on_clause:
+            continue
+
+        for eq in on_clause.find_all(exp.EQ):
+            left_cols  = list(eq.left.find_all(exp.Column))
+            right_cols = list(eq.right.find_all(exp.Column))
+
+            # Фильтруем алиасы, которых нет в alias_map (CTE / Subquery)
+            left_tables = list(dict.fromkeys(
+                alias_map[c.table]
+                for c in left_cols
+                if c.table and c.table in alias_map
+            ))
+            right_tables = list(dict.fromkeys(
+                alias_map[c.table]
+                for c in right_cols
+                if c.table and c.table in alias_map
+            ))
+
+            # Пропускаем связь если обе стороны не разрешились в реальные таблицы
+            if not left_tables and not right_tables:
+                continue
+
+            links.append({
+                "left_expr":   resolve_expr(eq.left,  alias_map),
+                "right_expr":  resolve_expr(eq.right, alias_map),
+                "left_tables":  left_tables  or ["<cte_or_subquery>"],
+                "right_tables": right_tables or ["<cte_or_subquery>"],
+                "pairs":        [(lt, rt) for lt in (left_tables  or ["<cte_or_subquery>"])
+                                          for rt in (right_tables or ["<cte_or_subquery>"])],
+            })
+
+    return links
+
+for link in analyze_joins(tree):
+    print(f"Выражение: {link['left_expr']}  =  {link['right_expr']}")
+    print(f"Таблицы:   {link['left_tables']} <-> {link['right_tables']}")
+    print(f"Связи:     {link['pairs']}")
+    print()
+
+CTE-фильтр — собираем все имена через tree.find_all(exp.CTE) и исключаем таблицы, чьё src.name попало в этот список.
+Subquery-фильтр — isinstance(src, exp.Subquery) отсекает инлайн-подзапросы в FROM/JOIN.
+В analyze_joins — дополнительная проверка c.table in alias_map при формировании left_tables/right_tables: алиасы CTE и Subquery просто не попадают в результат, заменяясь на <cte_or_subquery> для наглядности (можно заменить на None или пропускать совсем).​​​​​​​​​​​​​​​​
+
