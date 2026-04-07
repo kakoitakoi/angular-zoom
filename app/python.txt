@@ -3743,3 +3743,369 @@ if __name__ == "__main__":
 
 
 
+
+
+
+parse sr selects
+
+import pymysql
+import sqlglot
+from sqlglot import exp
+from collections import Counter
+from typing import Iterator
+import logging
+import multiprocessing as mp
+import json
+import math
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+# ─── Config ──────────────────────────────────────────────────────────────────
+
+STARROCKS_CONFIG = {
+    "host": "your_starrocks_host",
+    "port": 9030,
+    "user": "your_user",
+    "password": "your_password",
+    "database": "your_database",
+    "charset": "utf8mb4",
+    "connect_timeout": 30,
+}
+
+DORIS_CONFIG = {
+    "host": "your_doris_host",
+    "port": 9030,
+    "user": "your_user",
+    "password": "your_password",
+    "database": "your_database",
+    "charset": "utf8mb4",
+    "connect_timeout": 30,
+}
+
+SOURCE_TABLE = "_audit_log.starrocks_audit_tbl__"
+TARGET_TABLE = "query_quality_stats"
+
+PAGE_SIZE   = 5_000
+WRITE_BATCH = 2_000
+LOG_EVERY   = 50_000
+N_WORKERS   = max(1, mp.cpu_count() - 1)
+
+# DDL целевой таблицы в Doris:
+#
+# CREATE TABLE query_quality_stats (
+#     query_id        VARCHAR(64),
+#     query_time      DATETIME,
+#     user            VARCHAR(128),
+#     db              VARCHAR(128),
+#     sql_clean       TEXT          REPLACE,      -- без комментариев
+#     tables          TEXT          REPLACE,      -- JSON-список ["db.tbl", ...]
+#     has_cte         BOOLEAN       REPLACE,
+#     has_group_by    BOOLEAN       REPLACE,
+#     has_limit       BOOLEAN       REPLACE,
+#     has_window      BOOLEAN       REPLACE,
+#     scan_bytes      BIGINT        REPLACE,
+#     scan_rows       BIGINT        REPLACE,
+#     return_rows     BIGINT        REPLACE,
+#     cpu_cost_ns     BIGINT        REPLACE,
+#     mem_cost_bytes  BIGINT        REPLACE,
+#     score           INT           REPLACE
+#  ) ENGINE=OLAP
+#  UNIQUE KEY(query_id)
+#  DISTRIBUTED BY HASH(query_id) BUCKETS 8
+#  PROPERTIES ("replication_num" = "1");
+
+# ─── Fetch ───────────────────────────────────────────────────────────────────
+
+def get_total(config: dict) -> int:
+    conn = pymysql.connect(**config)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT COUNT(*)
+                FROM {SOURCE_TABLE}
+                WHERE stmt LIKE 'SELECT%'
+                  AND state = 'EOF'
+                  AND stmt IS NOT NULL
+            """)
+            return cur.fetchone()[0]
+    finally:
+        conn.close()
+
+
+def fetch_page(config: dict, offset: int, limit: int) -> list:
+    conn = pymysql.connect(**config)
+    try:
+        with conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute(f"""
+                SELECT
+                    queryId,
+                    timestamp,
+                    user,
+                    db,
+                    stmt,
+                    scanBytes,
+                    scanRows,
+                    returnRows,
+                    cpuCostNs,
+                    memCostBytes
+                FROM {SOURCE_TABLE}
+                WHERE stmt LIKE 'SELECT%'
+                  AND state = 'EOF'
+                  AND stmt IS NOT NULL
+                ORDER BY queryId
+                LIMIT %s OFFSET %s
+            """, (limit, offset))
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def iter_pages(config: dict, total: int, page_size: int) -> Iterator[list]:
+    for offset in range(0, total, page_size):
+        rows = fetch_page(config, offset, page_size)
+        if not rows:
+            break
+        yield rows
+
+# ─── Score ───────────────────────────────────────────────────────────────────
+# Логика оценки:
+#   Хороший эталонный запрос — тот который:
+#     - читает много данных (высокий scanRows/scanBytes) → сложный, показательный
+#     - возвращает мало строк (низкий returnRows/scanRows) → есть фильтрация/агрегация
+#     - эффективен по CPU и памяти относительно объёма скана
+#
+#   Штрафуем за:
+#     - огромный mem_cost (неэффективное использование памяти)
+#     - returnRows ≈ scanRows (нет фильтрации — скорее всего SELECT *)
+#     - нулевой скан (пустой/тривиальный запрос)
+
+def log_scale(value: float, base: float = 1_000_000) -> float:
+    """Нормализует большие числа в [0, 1] через логарифм."""
+    if value <= 0:
+        return 0.0
+    return min(1.0, math.log1p(value) / math.log1p(base))
+
+
+def compute_score(
+    scan_bytes: int,
+    scan_rows: int,
+    return_rows: int,
+    cpu_cost_ns: int,
+    mem_cost_bytes: int,
+) -> int:
+    """
+    Возвращает score [0, 100].
+
+    Компоненты (веса):
+      40% — complexity:   насколько много данных читает запрос (log-шкала по scanRows)
+      30% — selectivity:  насколько хорошо фильтрует (1 - returnRows/scanRows)
+      20% — cpu_eff:      CPU на строку скана (меньше — лучше, штраф за дорогие запросы)
+      10% — mem_eff:      память на строку скана (меньше — лучше)
+    """
+    if scan_rows == 0:
+        return 0  # тривиальный запрос — не эталон
+
+    # 1. Complexity — хотим запросы с реальным сканом (эталоны должны быть нетривиальны)
+    complexity = log_scale(scan_rows, base=10_000_000)  # 10M строк → score ~1.0
+
+    # 2. Selectivity — хороший запрос возвращает << чем читает
+    selectivity = 1.0 - min(1.0, return_rows / scan_rows)
+
+    # 3. CPU efficiency — нормируем cpu_cost на scanRow, штрафуем дорогие
+    cpu_per_row = cpu_cost_ns / scan_rows  # ns на строку
+    # считаем что 1000 ns/row — граница нормы; выше — штраф
+    cpu_eff = 1.0 - log_scale(cpu_per_row, base=100_000)
+
+    # 4. Memory efficiency
+    mem_per_row = mem_cost_bytes / scan_rows
+    mem_eff = 1.0 - log_scale(mem_per_row, base=10_000)
+
+    raw = (
+        0.40 * complexity  +
+        0.30 * selectivity +
+        0.20 * cpu_eff     +
+        0.10 * mem_eff
+    )
+
+    return max(0, min(100, round(raw * 100)))
+
+# ─── SQL parsing ─────────────────────────────────────────────────────────────
+
+def remove_comments(sql: str) -> str:
+    """Убирает -- и /* */ комментарии через sqlglot tokenizer."""
+    try:
+        tokens = sqlglot.tokens.Tokenizer().tokenize(sql)
+        clean_parts = []
+        prev_end = 0
+        for tok in tokens:
+            if tok.token_type in (
+                sqlglot.tokens.TokenType.COMMENT,
+                sqlglot.tokens.TokenType.BLOCK_COMMENT,
+            ):
+                continue
+            clean_parts.append(tok.text)
+        return " ".join(clean_parts)
+    except Exception:
+        return sql
+
+
+def parse_sql(sql: str) -> dict:
+    """
+    Возвращает:
+      tables     : list[str]  — только реальные таблицы db.name (не CTE, не подзапрос-алиас)
+      has_cte    : bool
+      has_group_by: bool
+      has_limit  : bool
+      has_window : bool
+    """
+    result = {
+        "tables":       [],
+        "has_cte":      False,
+        "has_group_by": False,
+        "has_limit":    False,
+        "has_window":   False,
+    }
+    try:
+        stmts = sqlglot.parse(sql, dialect="starrocks", error_level=sqlglot.ErrorLevel.IGNORE)
+    except Exception:
+        return result
+
+    for stmt in stmts:
+        if stmt is None:
+            continue
+
+        # ── CTE ──────────────────────────────────────────────────────────────
+        cte_names = set()
+        for cte in stmt.find_all(exp.CTE):
+            result["has_cte"] = True
+            cte_names.add(cte.alias)  # имя CTE — не считаем реальной таблицей
+
+        # ── GROUP BY ─────────────────────────────────────────────────────────
+        if stmt.find(exp.Group):
+            result["has_group_by"] = True
+
+        # ── LIMIT ────────────────────────────────────────────────────────────
+        if stmt.find(exp.Limit):
+            result["has_limit"] = True
+
+        # ── Window functions ─────────────────────────────────────────────────
+        if stmt.find(exp.Window):
+            result["has_window"] = True
+
+        # ── Tables (только реальные) ─────────────────────────────────────────
+        for table in stmt.find_all(exp.Table):
+            # пропускаем объявление CTE
+            if isinstance(table.parent, exp.CTE):
+                continue
+            name = table.name
+            if not name:
+                continue
+            # пропускаем ссылки на CTE по имени
+            if name in cte_names:
+                continue
+            db_node = table.args.get("db")
+            full    = f"{db_node.name}.{name}" if db_node else name
+            result["tables"].append(full)
+
+    # дедупликация с сохранением порядка
+    seen = set()
+    result["tables"] = [t for t in result["tables"] if not (t in seen or seen.add(t))]
+    return result
+
+
+# ─── Worker ──────────────────────────────────────────────────────────────────
+
+def process_batch(rows: list) -> list[dict]:
+    """Обрабатывает батч строк из audit-таблицы, возвращает список готовых записей."""
+    results = []
+    for row in rows:
+        sql_raw = row.get("stmt") or ""
+
+        sql_clean   = remove_comments(sql_raw).strip()
+        parsed      = parse_sql(sql_clean)
+
+        scan_bytes     = int(row.get("scanBytes")     or 0)
+        scan_rows      = int(row.get("scanRows")      or 0)
+        return_rows    = int(row.get("returnRows")    or 0)
+        cpu_cost_ns    = int(row.get("cpuCostNs")     or 0)
+        mem_cost_bytes = int(row.get("memCostBytes")  or 0)
+
+        score = compute_score(scan_bytes, scan_rows, return_rows, cpu_cost_ns, mem_cost_bytes)
+
+        results.append({
+            "query_id":       row.get("queryId", ""),
+            "query_time":     str(row.get("timestamp", "")),
+            "user":           row.get("user", ""),
+            "db":             row.get("db", ""),
+            "sql_clean":      sql_clean[:65_000],   # TEXT лимит Doris
+            "tables":         json.dumps(parsed["tables"], ensure_ascii=False),
+            "has_cte":        int(parsed["has_cte"]),
+            "has_group_by":   int(parsed["has_group_by"]),
+            "has_limit":      int(parsed["has_limit"]),
+            "has_window":     int(parsed["has_window"]),
+            "scan_bytes":     scan_bytes,
+            "scan_rows":      scan_rows,
+            "return_rows":    return_rows,
+            "cpu_cost_ns":    cpu_cost_ns,
+            "mem_cost_bytes": mem_cost_bytes,
+            "score":          score,
+        })
+    return results
+
+# ─── Write ───────────────────────────────────────────────────────────────────
+
+def flush_to_doris(conn: pymysql.Connection, records: list[dict], batch_size: int):
+    if not records:
+        return
+
+    columns = [
+        "query_id", "query_time", "user", "db", "sql_clean",
+        "tables", "has_cte", "has_group_by", "has_limit", "has_window",
+        "scan_bytes", "scan_rows", "return_rows", "cpu_cost_ns", "mem_cost_bytes",
+        "score",
+    ]
+    col_str = ", ".join(columns)
+
+    with conn.cursor() as cur:
+        for i in range(0, len(records), batch_size):
+            batch        = records[i : i + batch_size]
+            placeholders = ", ".join([f"({', '.join(['%s'] * len(columns))})"] * len(batch))
+            flat_values  = [row[c] for row in batch for c in columns]
+            cur.execute(f"INSERT INTO {TARGET_TABLE} ({col_str}) VALUES {placeholders}", flat_values)
+
+    conn.commit()
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+def main():
+    log.info("Считаю строки в audit-таблице StarRocks...")
+    total = get_total(STARROCKS_CONFIG)
+    log.info(f"Всего SELECT запросов: {total:,} | воркеров: {N_WORKERS}")
+
+    processed  = 0
+    write_conn = pymysql.connect(**DORIS_CONFIG)
+
+    try:
+        with mp.Pool(processes=N_WORKERS) as pool:
+            for batch_records in pool.imap_unordered(
+                process_batch,
+                iter_pages(STARROCKS_CONFIG, total, PAGE_SIZE),
+                chunksize=1,
+            ):
+                flush_to_doris(write_conn, batch_records, WRITE_BATCH)
+                processed += len(batch_records)
+
+                if processed % LOG_EVERY == 0:
+                    log.info(f"Обработано и записано: {processed:,} / {total:,}")
+    finally:
+        write_conn.close()
+
+    log.info(f"Готово. Всего записано: {processed:,}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
