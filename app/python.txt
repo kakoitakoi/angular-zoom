@@ -3077,3 +3077,99 @@ for msg in consumer:
 
 
 
+
+
+import sqlglot
+from sqlglot import exp
+from collections import Counter
+from typing import List
+
+def extract_tables(sql: str, dialect: str = "starrocks") -> List[str]:
+    """Извлекает все таблицы из SQL запроса в формате db.table"""
+    try:
+        statements = sqlglot.parse(sql, dialect=dialect)
+    except Exception:
+        return []
+
+    tables = []
+    for statement in statements:
+        if statement is None:
+            continue
+        for table in statement.find_all(exp.Table):
+            # Пропускаем CTE-алиасы (сами определения WITH x AS (...))
+            if isinstance(table.parent, exp.CTE):
+                continue
+
+            db = table.args.get("db")
+            name = table.name
+
+            if not name:
+                continue
+
+            if db:
+                tables.append(f"{db.name}.{name}")
+            else:
+                tables.append(name)
+
+    return tables
+
+
+def count_tables(queries: List[str], dialect: str = "starrocks") -> Counter:
+    """Считает сколько раз каждая таблица встречается во всех запросах"""
+    counter = Counter()
+    for sql in queries:
+        tables = extract_tables(sql, dialect=dialect)
+        counter.update(tables)
+    return counter
+
+
+# ─── Demo ────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    queries = [
+        # JOIN + subquery
+        """
+        SELECT a.id, b.name
+        FROM db1.orders a
+        JOIN db1.customers b ON a.customer_id = b.id
+        WHERE a.id IN (SELECT id FROM db2.blacklist)
+        """,
+        # CTE + nested CTE
+        """
+        WITH
+          recent AS (
+            SELECT * FROM db1.orders WHERE dt >= '2024-01-01'
+          ),
+          enriched AS (
+            SELECT r.*, p.title
+            FROM recent r
+            JOIN db2.products p ON r.product_id = p.id
+          )
+        SELECT * FROM enriched
+        """,
+        # Без схемы
+        """
+        SELECT * FROM orders o
+        JOIN customers c ON o.customer_id = c.id
+        """,
+        # Повтор таблицы из первого запроса
+        """
+        SELECT * FROM db1.orders WHERE status = 'new'
+        """,
+    ]
+
+    print("=" * 55)
+    print(f"{'Таблица':<35} {'Кол-во':>8}")
+    print("=" * 55)
+
+    counts = count_tables(queries)
+    for table, cnt in counts.most_common():
+        print(f"{table:<35} {cnt:>8}")
+
+    print("=" * 55)
+    print(f"Уникальных таблиц: {len(counts)}")
+
+
+
+
+
+
