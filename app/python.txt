@@ -3286,3 +3286,153 @@ if __name__ == "__main__":
 
 
 
+import pymysql
+import sqlglot
+from sqlglot import exp
+from collections import Counter
+from typing import Iterator
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+# ─── Config ──────────────────────────────────────────────────────────────────
+
+DORIS_CONFIG = {
+    "host": "your_doris_host",
+    "port": 9030,
+    "user": "your_user",
+    "password": "your_password",
+    "database": "your_database",
+    "charset": "utf8mb4",
+    "connect_timeout": 30,
+}
+
+FETCH_SQL = """
+    SELECT query_md5, query_text
+    FROM your_table
+    WHERE query_text IS NOT NULL
+      AND LENGTH(query_text) > 10
+    ORDER BY query_md5
+"""
+
+# DDL для целевой таблицы:
+# CREATE TABLE table_usage_stats (
+#     db     VARCHAR(256),
+#     name   VARCHAR(256),
+#     cnt    BIGINT       REPLACE DEFAULT "0",
+# ) ENGINE=OLAP
+# AGGREGATE KEY(db, name)
+# DISTRIBUTED BY HASH(name) BUCKETS 4
+# PROPERTIES ("replication_num" = "1");
+
+TARGET_TABLE = "table_usage_stats"
+
+FETCH_BATCH  = 2_000
+WRITE_BATCH  = 5_000    # строк за один INSERT
+LOG_EVERY    = 50_000
+
+# ─── Streaming fetch ─────────────────────────────────────────────────────────
+
+def iter_queries(config: dict, sql: str, batch_size: int) -> Iterator[tuple[str, str]]:
+    conn = pymysql.connect(**config)
+    try:
+        with conn.cursor(pymysql.cursors.SSCursor) as cur:
+            log.info("Выполняю запрос к Doris...")
+            cur.execute(sql)
+            log.info("Запрос принят, начинаю стриминг")
+            while True:
+                rows = cur.fetchmany(batch_size)
+                if not rows:
+                    break
+                yield from rows
+    finally:
+        conn.close()
+
+# ─── Table extraction ────────────────────────────────────────────────────────
+
+def extract_tables(sql: str, dialect: str = "starrocks") -> list[tuple[str, str]]:
+    """Возвращает список (db, name). db='' если схема не указана."""
+    try:
+        statements = sqlglot.parse(sql, dialect=dialect, error_level=sqlglot.ErrorLevel.IGNORE)
+    except Exception:
+        return []
+
+    tables = []
+    for stmt in statements:
+        if stmt is None:
+            continue
+        for table in stmt.find_all(exp.Table):
+            if isinstance(table.parent, exp.CTE):
+                continue
+            db_node = table.args.get("db")
+            name    = table.name
+            if not name:
+                continue
+            db = db_node.name if db_node else ""
+            tables.append((db, name))
+    return tables
+
+# ─── Write to Doris ──────────────────────────────────────────────────────────
+
+def flush_to_doris(conn: pymysql.Connection, counter: Counter, batch_size: int):
+    """Сбрасывает Counter в Doris батчами через INSERT ... ON DUPLICATE KEY UPDATE."""
+    rows    = [(db, name, cnt) for (db, name), cnt in counter.items()]
+    total   = len(rows)
+    written = 0
+
+    with conn.cursor() as cur:
+        for i in range(0, total, batch_size):
+            batch = rows[i : i + batch_size]
+            placeholders = ", ".join(["(%s, %s, %s)"] * len(batch))
+            flat_values  = [v for row in batch for v in row]
+
+            sql = f"""
+                INSERT INTO {TARGET_TABLE} (db, name, cnt)
+                VALUES {placeholders}
+                ON DUPLICATE KEY UPDATE cnt = cnt + VALUES(cnt)
+            """
+            cur.execute(sql, flat_values)
+            written += len(batch)
+
+    conn.commit()
+    log.info(f"Записано в Doris: {written:,} / {total:,} уникальных таблиц")
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+def main():
+    counter   = Counter()
+    processed = 0
+    errors    = 0
+
+    for query_md5, query_text in iter_queries(DORIS_CONFIG, FETCH_SQL, FETCH_BATCH):
+        processed += 1
+
+        tables = extract_tables(query_text)
+        if tables:
+            counter.update(tables)
+        else:
+            errors += 1
+
+        if processed % LOG_EVERY == 0:
+            log.info(f"Обработано: {processed:,} | уникальных таблиц: {len(counter):,} | ошибок парсинга: {errors:,}")
+
+    log.info(f"Итого: {processed:,} запросов | {len(counter):,} уникальных таблиц | {errors:,} ошибок")
+
+    # ── Запись результата ──
+    write_conn = pymysql.connect(**DORIS_CONFIG)
+    try:
+        flush_to_doris(write_conn, counter, WRITE_BATCH)
+    finally:
+        write_conn.close()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
