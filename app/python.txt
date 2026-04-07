@@ -3579,3 +3579,167 @@ if __name__ == "__main__":
 
 
 
+
+
+
+
+
+
+import pymysql
+import sqlglot
+from sqlglot import exp
+from collections import Counter
+from typing import Iterator
+import logging
+import multiprocessing as mp
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+DORIS_CONFIG = {
+    "host": "your_doris_host",
+    "port": 9030,
+    "user": "your_user",
+    "password": "your_password",
+    "database": "your_database",
+    "charset": "utf8mb4",
+    "connect_timeout": 30,
+}
+
+SOURCE_TABLE = "your_table"
+TARGET_TABLE = "table_usage_stats"
+
+PAGE_SIZE    = 10_000   # строк за один SELECT
+PARSE_BATCH  = 5_000
+WRITE_BATCH  = 5_000
+LOG_EVERY    = 100_000
+N_WORKERS    = max(1, mp.cpu_count() - 1)
+
+# ─── Пагинация через LIMIT/OFFSET ────────────────────────────────────────────
+# Используем LIMIT + OFFSET — просто и надёжно.
+# Для таблиц >10M строк лучше перейти на диапазон по ключу (см. комментарий ниже).
+
+def get_total(config: dict) -> int:
+    conn = pymysql.connect(**config)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT COUNT(*) FROM {SOURCE_TABLE}
+                WHERE query_text IS NOT NULL
+                  AND LENGTH(query_text) > 10
+            """)
+            return cur.fetchone()[0]
+    finally:
+        conn.close()
+
+
+def fetch_page(config: dict, offset: int, limit: int) -> list:
+    """Один короткий SELECT — не держит соединение дольше нескольких секунд."""
+    conn = pymysql.connect(**config)
+    try:
+        with conn.cursor(pymysql.cursors.Cursor) as cur:
+            cur.execute(f"""
+                SELECT query_md5, query_text
+                FROM {SOURCE_TABLE}
+                WHERE query_text IS NOT NULL
+                  AND LENGTH(query_text) > 10
+                ORDER BY query_md5
+                LIMIT %s OFFSET %s
+            """, (limit, offset))
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def iter_pages(config: dict, total: int, page_size: int) -> Iterator[list]:
+    """Генератор страниц — каждая страница = отдельный короткий запрос."""
+    for offset in range(0, total, page_size):
+        rows = fetch_page(config, offset, page_size)
+        if not rows:
+            break
+        yield rows
+
+# ─── Parse ───────────────────────────────────────────────────────────────────
+
+def parse_batch(rows: list) -> Counter:
+    counter = Counter()
+    for _, query_text in rows:
+        try:
+            stmts = sqlglot.parse(
+                query_text,
+                dialect="starrocks",
+                error_level=sqlglot.ErrorLevel.IGNORE
+            )
+        except Exception:
+            continue
+        for stmt in stmts:
+            if stmt is None:
+                continue
+            for table in stmt.find_all(exp.Table):
+                if isinstance(table.parent, exp.CTE):
+                    continue
+                db_node = table.args.get("db")
+                name    = table.name
+                if not name:
+                    continue
+                db = db_node.name if db_node else ""
+                counter[(db, name)] += 1
+    return counter
+
+# ─── Write ───────────────────────────────────────────────────────────────────
+
+def flush_to_doris(conn: pymysql.Connection, counter: Counter, batch_size: int):
+    rows    = [(db, name, cnt) for (db, name), cnt in counter.items()]
+    total   = len(rows)
+    written = 0
+
+    with conn.cursor() as cur:
+        for i in range(0, total, batch_size):
+            batch        = rows[i : i + batch_size]
+            placeholders = ", ".join(["(%s, %s, %s)"] * len(batch))
+            flat_values  = [v for row in batch for v in row]
+            cur.execute(
+                f"INSERT INTO {TARGET_TABLE} (db, name, cnt) VALUES {placeholders}",
+                flat_values
+            )
+            written += len(batch)
+
+    conn.commit()
+    log.info(f"Записано в Doris: {written:,} строк")
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+def main():
+    log.info("Считаю общее количество строк...")
+    total = get_total(DORIS_CONFIG)
+    log.info(f"Всего строк: {total:,} | страниц: {total // PAGE_SIZE + 1:,} | воркеров: {N_WORKERS}")
+
+    global_counter = Counter()
+    processed      = 0
+
+    with mp.Pool(processes=N_WORKERS) as pool:
+        for partial_counter in pool.imap_unordered(
+            parse_batch,
+            iter_pages(DORIS_CONFIG, total, PAGE_SIZE),
+            chunksize=1
+        ):
+            global_counter += partial_counter
+            processed      += PAGE_SIZE
+
+            if processed % LOG_EVERY == 0:
+                log.info(f"Обработано: ~{processed:,}/{total:,} | уникальных таблиц: {len(global_counter):,}")
+
+    log.info(f"Парсинг завершён | уникальных таблиц: {len(global_counter):,}")
+
+    write_conn = pymysql.connect(**DORIS_CONFIG)
+    try:
+        flush_to_doris(write_conn, global_counter, WRITE_BATCH)
+    finally:
+        write_conn.close()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
