@@ -204,3 +204,307 @@ Notes for SQL:
 - Use aggregations (SUM, GROUP BY)  
 - Join clients, accounts, and transactions for business queries
 
+
+
+
+
+
+
+
+
+Промпты для генерации метаданных и RAG-чанков
+1. Генерация метаданных таблицы
+
+You are a senior data engineer documenting a corporate Data Warehouse for a super-app 
+(banking, marketplace, payments, money transfers, government services).
+The DWH runs on StarRocks. Documentation will be used in a Text2SQL RAG system.
+
+## INPUT DATA
+
+### Table basic info
+Name: {table_name}
+Schema/Domain: {schema_name}
+Row count (approx): {row_count}
+Partitioning: {partition_info}
+Distribution key: {distribution_key}
+Primary/Unique keys: {keys}
+
+### Raw descriptions (from catalog, Jira, Confluence)
+{raw_descriptions}
+
+### Column list
+{column_list_with_types}
+
+### Usage statistics (from query logs)
+- Unique SELECT queries involving this table: {select_count}
+- Most frequent JOIN partners: {join_partners_with_counts}
+- Most frequent filter columns: {filter_columns_with_freq}
+- Peak usage periods: {usage_patterns}
+
+### Sample SQL queries using this table
+{sample_queries}
+
+## YOUR TASK
+
+Generate structured table metadata in JSON. Be precise and factual.
+If information is missing or uncertain — set confidence: "low" for that field.
+Do NOT invent business logic not supported by the input data.
+
+## OUTPUT FORMAT
+
+Return ONLY valid JSON, no markdown, no explanation:
+
+{
+  "table_name": "...",
+  "schema": "...",
+  "domain": "...",  // banking | marketplace | payments | transfers | govservices | shared | unknown
+  "display_name": "...",  // human-readable name in Russian
+  "purpose": "...",  // 2-3 sentences: what this table stores, what business process it serves
+  "entity_type": "...",  // fact | dimension | bridge | snapshot | log | reference | aggregate
+  "granularity": "...",  // one row represents: e.g. "one payment transaction"
+  "data_freshness": "...",  // realtime | near-realtime | daily | weekly | historical-only
+  "partitioning": {
+    "column": "...",
+    "strategy": "...",
+    "note": "..."  // e.g. "always filter by this column to enable partition pruning"
+  },
+  "distribution": {
+    "key": "...",
+    "note": "..."
+  },
+  "primary_key": [...],
+  "business_keys": [...],  // natural keys used in JOINs by analysts
+  "key_joins": [
+    {
+      "partner_table": "...",
+      "join_key_local": "...",
+      "join_key_remote": "...",
+      "join_frequency": "high|medium|low",
+      "join_type": "N:1|1:N|N:M",
+      "semantic": "..."  // e.g. "links payment to the originating order"
+    }
+  ],
+  "common_filters": [
+    {
+      "column": "...",
+      "pattern": "range|eq|in_list|like|is_null",
+      "frequency": 0.0,
+      "note": "..."
+    }
+  ],
+  "do_not_do": [...],  // anti-patterns: what NOT to do with this table
+  "sql_hints": [...],  // StarRocks-specific hints: e.g. partition pruning, colocate join
+  "synonyms_ru": [...],  // Russian synonyms users might use to refer to this table
+  "synonyms_en": [...],
+  "confidence": "high|medium|low",
+  "confidence_notes": "..."  // explain what is uncertain
+}
+
+
+
+Генерация метаданных колонки
+
+You are a senior data engineer documenting columns of a corporate DWH table for a 
+Text2SQL RAG system. The DWH is for a super-app: banking, marketplace, payments, 
+money transfers, government services. Platform: StarRocks.
+
+## CONTEXT: TABLE
+Table name: {table_name}
+Domain: {domain}
+Table purpose: {table_purpose}
+Table granularity: {table_granularity}
+
+## INPUT DATA FOR THIS COLUMN
+
+Column name: {column_name}
+Data type: {data_type}
+Nullable: {is_nullable}
+Position in table: {ordinal_position}
+
+Raw description from catalog: {raw_description}
+
+Usage statistics from query logs:
+- Used in SELECT: {select_freq}
+- Used in WHERE: {where_freq}
+- Used in JOIN ON: {join_freq}
+- Used in GROUP BY: {groupby_freq}
+- Used in ORDER BY: {orderby_freq}
+- Used in aggregations (SUM/COUNT/AVG/MAX/MIN): {agg_freq}
+
+Sample values (real, from table): {sample_values}
+Distinct value count (approx): {distinct_count}
+Null ratio: {null_ratio}
+
+Related columns in same table (often used together): {co_occurring_columns}
+
+## YOUR TASK
+
+Generate structured column metadata in JSON.
+Infer business meaning from: column name, sample values, usage patterns, table context.
+For enum/status columns — decode ALL known values if possible.
+If a value meaning is uncertain — mark it with "?".
+Do NOT invent meanings not supported by evidence.
+
+## OUTPUT FORMAT
+
+Return ONLY valid JSON, no markdown, no explanation:
+
+{
+  "column_name": "...",
+  "table_name": "...",
+  "display_name": "...",  // human-readable name in Russian
+  "data_type": "...",
+  "business_meaning": "...",  // what this column represents in business terms (1-2 sentences)
+  "role": "primary_key|foreign_key|business_key|measure|dimension|status|timestamp|flag|technical|unknown",
+  "is_filterable": true,  // commonly used in WHERE?
+  "is_groupable": true,   // commonly used in GROUP BY?
+  "is_measurable": false, // makes sense to SUM/AVG/COUNT?
+  "is_nullable_meaningful": false,  // does NULL have business meaning (vs just missing data)?
+  "nullable_meaning": "...",  // if true: what does NULL mean here?
+  "enum_values": [         // fill if distinct_count < 50 or column is clearly an enum
+    {
+      "value": "...",
+      "meaning": "...",
+      "confidence": "high|medium|low"
+    }
+  ],
+  "value_range": "...",    // for numeric/date columns: expected range or constraints
+  "format_note": "...",    // e.g. "Unix timestamp in ms", "ISO 8601", "kopecks not rubles"
+  "join_targets": [        // if used in JOINs
+    {
+      "target_table": "...",
+      "target_column": "...",
+      "semantic": "..."
+    }
+  ],
+  "common_usage_patterns": [  // how this column is typically used in SQL
+    "...",
+    "..."
+  ],
+  "warnings": [...],  // e.g. "do not compare across domains", "unit is kopecks", "timezone is UTC+3"
+  "synonyms_ru": [...],
+  "synonyms_en": [...],
+  "confidence": "high|medium|low",
+  "confidence_notes": "..."
+}
+
+
+
+3. Генерация RAG-чанков
+Здесь нужна серия промптов — по типу чанка.
+3.1 Table Passport Chunk
+
+You are preparing retrieval chunks for a Text2SQL RAG system.
+Target LLM: Kimi-2.5. Embedding model: BGE-M3 (multilingual, dense+sparse).
+DWH platform: StarRocks. Language mix: Russian queries → SQL.
+
+## TABLE METADATA (source of truth)
+{table_metadata_json}
+
+## YOUR TASK
+
+Generate a TABLE PASSPORT chunk — a compact, information-dense text block that will be 
+retrieved when a user asks about this table or the business entity it represents.
+
+Rules:
+- Write in RUSSIAN (BGE-M3 retrieval will be in Russian)
+- Target length: 150-250 tokens
+- Include: what the table is, what entity/granularity, domain, key columns overview,
+  partitioning hint, main JOIN partners, Russian synonyms
+- Do NOT include full column list (separate chunks for that)
+- Format: plain text with minimal structure — optimized for embedding, not human reading
+- Start with a semantic prefix: "Таблица [name]: "
+- Include synonyms naturally in text, not as a list
+
+## OUTPUT
+
+Return ONLY the chunk text, no JSON wrapper, no markdown:
+
+
+3.3 Join & Filter Patterns Chunk
+
+You are preparing retrieval chunks for a Text2SQL RAG system.
+Target LLM: Kimi-2.5. Embedding model: BGE-M3.
+DWH platform: StarRocks.
+
+## TABLE METADATA
+Table: {table_name}
+Domain: {domain}
+
+## JOIN PATTERNS
+{key_joins_json}
+
+## FILTER PATTERNS  
+{common_filters_json}
+
+## SQL HINTS
+{sql_hints}
+{do_not_do}
+
+## YOUR TASK
+
+Generate a JOIN & FILTER PATTERNS chunk. This chunk will be retrieved when the user's 
+query implies connecting tables or filtering data.
+
+Rules:
+- Write in RUSSIAN
+- Target length: 200-300 tokens
+- Describe each JOIN: which tables, which keys, what it means in business terms
+- Describe filter patterns: typical WHERE conditions with examples
+- Include StarRocks-specific hints: partition pruning, colocate joins, index hints
+- Include anti-patterns from do_not_do
+- Start with prefix: "Паттерны соединений и фильтрации таблицы [table_name]: "
+- Write as flowing text, not a list — better for dense retrieval
+
+## OUTPUT
+
+Return ONLY the chunk text, no JSON wrapper, no markdown:
+
+
+3.4 SQL Examples Chunk
+
+You are preparing retrieval chunks for a Text2SQL RAG system.
+Target LLM: Kimi-2.5. Embedding model: BGE-M3.
+DWH platform: StarRocks (SQL dialect close to MySQL/Hive, supports materialized views).
+
+## TABLE CONTEXT
+Table: {table_name}
+Domain: {domain}
+Purpose: {table_purpose}
+
+## REFERENCE SQL QUERIES (from production logs, validated)
+{reference_queries}
+
+## TABLE METADATA SUMMARY
+{table_metadata_summary}
+
+## YOUR TASK
+
+Generate an SQL EXAMPLES chunk. This chunk will be retrieved as few-shot context 
+when the user asks a question similar to these examples.
+
+Rules:
+- Write header and annotations in RUSSIAN
+- Target length: 250-400 tokens
+- For each query: add a one-line Russian comment explaining WHAT business question it answers
+- Normalize queries: uppercase keywords, consistent formatting, add table aliases
+- Remove personal data, replace specific IDs with meaningful placeholders
+- If a query uses partition filter — mark it with comment: -- partition pruning
+- Group queries by pattern type: aggregation | filtering | join | window | subquery
+- Start with prefix: "Примеры SQL запросов для таблицы [table_name]: "
+
+## OUTPUT FORMAT
+
+Return ONLY the chunk text. Use this structure:
+[prefix line]
+
+-- [business question in Russian]
+[SQL query]
+
+-- [business question in Russian]  
+[SQL query]
+...
+
+
+
+
