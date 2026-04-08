@@ -4109,3 +4109,161 @@ if __name__ == "__main__":
 
 
 
+
+
+
+
+
+import asyncio
+import aiohttp
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Any
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+
+# ─── Конфигурация ────────────────────────────────────────────────────────────
+
+@dataclass
+class LLMConfig:
+    url: str
+    api_key: str
+    max_concurrent: int = 20      # параллельных запросов к LLM
+    max_retries: int = 3
+    retry_delays: list = field(default_factory=lambda: [5, 15, 30])  # сек
+    timeout_sec: int = 120
+    retry_on_status: set = field(default_factory=lambda: {429, 500, 502, 503, 504})
+
+
+# ─── Результат обработки одной записи ────────────────────────────────────────
+
+@dataclass
+class RecordResult:
+    record_id: Any
+    success: bool
+    data: dict | None = None
+    error: str | None = None
+    attempts: int = 0
+
+
+# ─── Вызов LLM с retry ───────────────────────────────────────────────────────
+
+async def call_llm_with_retry(
+    session: aiohttp.ClientSession,
+    record: dict,
+    config: LLMConfig,
+) -> RecordResult:
+    record_id = record.get("id")
+    last_error = None
+
+    for attempt in range(1, config.max_retries + 1):
+        try:
+            payload = build_payload(record)  # твоя функция сборки промпта
+
+            async with session.post(
+                config.url,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=config.timeout_sec),
+            ) as resp:
+
+                # HTTP-ошибки с retry
+                if resp.status in config.retry_on_status:
+                    last_error = f"HTTP {resp.status}"
+                    logger.warning(f"[{record_id}] attempt {attempt}: {last_error}")
+                    await _maybe_wait(attempt, config)
+                    continue
+
+                # Другие HTTP-ошибки — не ретраим
+                if resp.status != 200:
+                    return RecordResult(
+                        record_id=record_id,
+                        success=False,
+                        error=f"HTTP {resp.status} (no retry)",
+                        attempts=attempt,
+                    )
+
+                raw = await resp.json()
+
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            last_error = str(e)
+            logger.warning(f"[{record_id}] attempt {attempt}: network error: {e}")
+            await _maybe_wait(attempt, config)
+            continue
+
+        # Парсим ответ — изолируем ошибки структуры
+        try:
+            parsed = parse_llm_response(raw)  # твоя функция парсинга
+            logger.info(f"[{record_id}] OK after {attempt} attempt(s)")
+            return RecordResult(
+                record_id=record_id,
+                success=True,
+                data=parsed,
+                attempts=attempt,
+            )
+        except (KeyError, ValueError, json.JSONDecodeError) as e:
+            last_error = f"parse error: {e}"
+            logger.warning(f"[{record_id}] attempt {attempt}: {last_error}, raw={str(raw)[:200]}")
+            await _maybe_wait(attempt, config)
+            continue
+
+    return RecordResult(
+        record_id=record_id,
+        success=False,
+        error=last_error,
+        attempts=config.max_retries,
+    )
+
+
+async def _maybe_wait(attempt: int, config: LLMConfig):
+    if attempt <= len(config.retry_delays):
+        delay = config.retry_delays[attempt - 1]
+        logger.info(f"  waiting {delay}s before retry...")
+        await asyncio.sleep(delay)
+
+
+# ─── Оркестратор с семафором ──────────────────────────────────────────────────
+
+async def process_records(
+    records: list[dict],
+    config: LLMConfig,
+) -> list[RecordResult]:
+    semaphore = asyncio.Semaphore(config.max_concurrent)
+    results: list[RecordResult] = []
+    failed: list[RecordResult] = []
+
+    async def bounded_call(record: dict) -> RecordResult:
+        async with semaphore:
+            return await call_llm_with_retry(session, record, config)
+
+    connector = aiohttp.TCPConnector(limit=config.max_concurrent + 5)
+    async with aiohttp.ClientSession(
+        headers={"Authorization": f"Bearer {config.api_key}"},
+        connector=connector,
+    ) as session:
+        tasks = [bounded_call(r) for r in records]
+
+        # tqdm-прогресс (опционально: pip install tqdm)
+        from tqdm.asyncio import tqdm
+        for coro in tqdm.as_completed(tasks, total=len(tasks)):
+            result = await coro
+            results.append(result)
+            if not result.success:
+                failed.append(result)
+
+    # Итог
+    logger.info(f"Done: {len(results) - len(failed)}/{len(results)} OK, "
+                f"{len(failed)} failed")
+    for f in failed:
+        logger.error(f"FAILED id={f.record_id}: {f.error} ({f.attempts} attempts)")
+
+    return results
+
+
+# ─── Точка входа ─────────────────────────────────────────────────────────────
+
+def run_pipeline(records: list[dict], config: LLMConfig) -> list[RecordResult]:
+    return asyncio.run(process_records(records, config))
+
