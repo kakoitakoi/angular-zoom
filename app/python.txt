@@ -5412,3 +5412,539 @@ if __name__ == "__main__":
 
 
 
+
+
+
+
+import json
+import logging
+import pymysql
+import re
+import requests
+import time
+from dataclasses import dataclass, field
+from typing import Any
+from datetime import datetime
+from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("llm_pipeline")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# КОНФИГ
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class DorisConfig:
+    host: str = "localhost"
+    port: int = 9030
+    user: str = "root"
+    password: str = ""
+    database: str = "dwh"
+    charset: str = "utf8mb4"
+
+
+@dataclass
+class LLMConfig:
+    url: str = "https://api.moonshot.cn/v1/chat/completions"
+    api_key: str = "sk-..."
+    model: str = "moonshot-v1-8k"
+    max_workers: int = 10          # потоков — аналог max_concurrent
+    max_retries: int = 3
+    retry_delays: list = field(default_factory=lambda: [5, 15, 30])
+    timeout_sec: int = 120
+    retry_on_status: frozenset = field(
+        default_factory=lambda: frozenset({429, 500, 502, 503, 504})
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# МОДЕЛИ ДАННЫХ
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class QueryRecord:
+    query_md5: str
+    sql_text: str
+    db_name: str
+    user_name: str
+    query_count: int
+
+
+@dataclass
+class LLMResult:
+    domain: str
+    intent: str
+    complexity: str
+    main_tables: list[str]
+    comment: str
+
+
+@dataclass
+class RecordResult:
+    query_md5: str
+    success: bool
+    llm_result: LLMResult | None = None
+    error: str | None = None
+    attempts: int = 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# THREAD-LOCAL SESSION
+# Каждый поток получает свой requests.Session — это важно:
+# Session не потокобезопасен при совместном использовании
+# ══════════════════════════════════════════════════════════════════════════════
+
+import threading
+_thread_local = threading.local()
+
+def get_session(config: LLMConfig) -> requests.Session:
+    """Возвращает Session для текущего потока, создаёт если нет."""
+    if not hasattr(_thread_local, "session"):
+        session = requests.Session()
+        session.headers.update({
+            "Authorization": f"Bearer {config.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        })
+        # Retry на уровне urllib3 — для connection-ошибок до HTTP-ответа
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        retry_policy = Retry(
+            total=0,               # retry логику ведём сами — здесь отключаем
+            connect=3,             # но переподключение при обрыве — разрешаем
+            read=0,
+            backoff_factor=1,
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry_policy,
+            pool_connections=1,    # на поток — одно соединение
+            pool_maxsize=1,
+        )
+        session.mount("https://", adapter)
+        session.mount("http://",  adapter)
+        _thread_local.session = session
+
+    return _thread_local.session
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DORIS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@contextmanager
+def doris_connection(cfg: DorisConfig):
+    conn = pymysql.connect(
+        host=cfg.host,
+        port=cfg.port,
+        user=cfg.user,
+        password=cfg.password,
+        database=cfg.database,
+        charset=cfg.charset,
+        connect_timeout=10,
+        autocommit=False,
+    )
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def fetch_pending_records(cfg: DorisConfig, batch_size: int = 500) -> list[QueryRecord]:
+    sql = """
+        SELECT
+            query_md5,
+            sql_text,
+            db_name,
+            user_name,
+            query_count
+        FROM dwh.query_log_enriched
+        WHERE llm_processed_at IS NULL
+          AND sql_text IS NOT NULL
+          AND LENGTH(sql_text) > 10
+        ORDER BY query_count DESC
+        LIMIT %(batch_size)s
+    """
+    with doris_connection(cfg) as conn:
+        with conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute(sql, {"batch_size": batch_size})
+            rows = cur.fetchall()
+
+    logger.info(f"Fetched {len(rows)} pending records from Doris")
+    return [
+        QueryRecord(
+            query_md5=r["query_md5"],
+            sql_text=r["sql_text"],
+            db_name=r["db_name"] or "",
+            user_name=r["user_name"] or "",
+            query_count=r["query_count"] or 0,
+        )
+        for r in rows
+    ]
+
+
+def write_results(cfg: DorisConfig, results: list[RecordResult]) -> None:
+    successful = [r for r in results if r.success]
+    failed     = [r for r in results if not r.success]
+    if successful:
+        _upsert_successful(cfg, successful)
+    if failed:
+        _upsert_failed(cfg, failed)
+    logger.info(f"Written to Doris: {len(successful)} OK, {len(failed)} failed")
+
+
+def _upsert_successful(cfg: DorisConfig, results: list[RecordResult]) -> None:
+    sql = """
+        UPDATE dwh.query_log_enriched
+        SET
+            llm_domain       = %(domain)s,
+            llm_intent       = %(intent)s,
+            llm_complexity   = %(complexity)s,
+            llm_main_tables  = %(main_tables)s,
+            llm_comment      = %(comment)s,
+            llm_processed_at = %(processed_at)s,
+            llm_error        = NULL
+        WHERE query_md5 = %(query_md5)s
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    params = [
+        {
+            "domain":       r.llm_result.domain,
+            "intent":       r.llm_result.intent,
+            "complexity":   r.llm_result.complexity,
+            "main_tables":  json.dumps(r.llm_result.main_tables, ensure_ascii=False),
+            "comment":      r.llm_result.comment,
+            "processed_at": now,
+            "query_md5":    r.query_md5,
+        }
+        for r in results
+    ]
+    with doris_connection(cfg) as conn:
+        with conn.cursor() as cur:
+            cur.executemany(sql, params)
+
+
+def _upsert_failed(cfg: DorisConfig, results: list[RecordResult]) -> None:
+    sql = """
+        UPDATE dwh.query_log_enriched
+        SET
+            llm_error        = %(error)s,
+            llm_processed_at = %(processed_at)s
+        WHERE query_md5 = %(query_md5)s
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    params = [
+        {
+            "error":        (r.error or "unknown")[:1000],
+            "processed_at": now,
+            "query_md5":    r.query_md5,
+        }
+        for r in results
+    ]
+    with doris_connection(cfg) as conn:
+        with conn.cursor() as cur:
+            cur.executemany(sql, params)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ПРОМПТ И ПАРСИНГ
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_payload(record: QueryRecord, model: str) -> dict:
+    system_prompt = """Ты — аналитик SQL-запросов корпоративного DWH на базе StarRocks.
+Тебе дают SQL-запрос. Верни ТОЛЬКО валидный JSON без пояснений и markdown-блоков.
+
+Формат ответа:
+{
+  "domain": "<finance | hr | sales | logistics | analytics | other>",
+  "intent": "<краткое намерение запроса на русском, 5–15 слов>",
+  "complexity": "<low | medium | high>",
+  "main_tables": ["<таблица1>", "<таблица2>"],
+  "comment": "<необязательный комментарий>"
+}
+
+Правила сложности:
+- low: простой SELECT, 1–2 таблицы, без оконных функций
+- medium: JOIN 2–4 таблиц, агрегации, подзапросы
+- high: 5+ таблиц, оконные функции, CTE, UNION"""
+
+    user_prompt = (
+        f"База: {record.db_name}\n"
+        f"Пользователь: {record.user_name}\n"
+        f"Частота выполнения: {record.query_count}\n\n"
+        f"SQL:\n{record.sql_text[:3000]}"
+    )
+
+    return {
+        "model": model,
+        "max_tokens": 512,
+        "temperature": 0.1,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ],
+    }
+
+
+def parse_llm_response(raw: dict) -> LLMResult:
+    content = raw["choices"][0]["message"]["content"].strip()
+
+    json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
+    json_str = json_match.group(1) if json_match else content
+
+    data = json.loads(json_str)
+
+    valid_domains    = {"finance", "hr", "sales", "logistics", "analytics", "other"}
+    valid_complexity = {"low", "medium", "high"}
+
+    domain = str(data.get("domain", "other")).lower()
+    if domain not in valid_domains:
+        domain = "other"
+
+    complexity = str(data.get("complexity", "medium")).lower()
+    if complexity not in valid_complexity:
+        complexity = "medium"
+
+    intent = str(data.get("intent", "")).strip()
+    if not intent:
+        raise ValueError("LLM returned empty intent")
+
+    main_tables = data.get("main_tables", [])
+    if not isinstance(main_tables, list):
+        main_tables = []
+
+    return LLMResult(
+        domain=domain,
+        intent=intent,
+        complexity=complexity,
+        main_tables=[str(t) for t in main_tables[:20]],
+        comment=str(data.get("comment", ""))[:500],
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LLM-ВЫЗОВ С RETRY  (requests, вызывается из потока)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def call_llm_with_retry(record: QueryRecord, config: LLMConfig) -> RecordResult:
+    """Синхронная функция — запускается в отдельном потоке."""
+    session = get_session(config)
+    last_error: str | None = None
+
+    for attempt in range(1, config.max_retries + 1):
+        try:
+            payload = build_payload(record, config.model)
+            resp = session.post(
+                config.url,
+                json=payload,
+                timeout=config.timeout_sec,
+            )
+
+            if resp.status_code in config.retry_on_status:
+                last_error = f"HTTP {resp.status_code}"
+                logger.warning(
+                    f"[{record.query_md5[:8]}] attempt {attempt}: {last_error}"
+                )
+                _backoff(attempt, config)
+                continue
+
+            if resp.status_code != 200:
+                return RecordResult(
+                    query_md5=record.query_md5,
+                    success=False,
+                    error=f"HTTP {resp.status_code}: {resp.text[:200]}",
+                    attempts=attempt,
+                )
+
+            raw = resp.json()
+
+        except requests.Timeout:
+            last_error = f"timeout after {config.timeout_sec}s"
+            logger.warning(f"[{record.query_md5[:8]}] attempt {attempt}: {last_error}")
+            _backoff(attempt, config)
+            continue
+
+        except requests.ConnectionError as e:
+            # Покрывает ServerDisconnected, ConnectError и пр.
+            last_error = f"connection error: {e}"
+            logger.warning(f"[{record.query_md5[:8]}] attempt {attempt}: {last_error}")
+            # Пересоздаём сессию — старое соединение могло протухнуть
+            _reset_session()
+            _backoff(attempt, config)
+            continue
+
+        except requests.RequestException as e:
+            last_error = f"request error: {e}"
+            logger.warning(f"[{record.query_md5[:8]}] attempt {attempt}: {last_error}")
+            _backoff(attempt, config)
+            continue
+
+        # Парсинг
+        try:
+            llm_result = parse_llm_response(raw)
+            logger.debug(
+                f"[{record.query_md5[:8]}] OK attempt={attempt} "
+                f"domain={llm_result.domain} complexity={llm_result.complexity}"
+            )
+            return RecordResult(
+                query_md5=record.query_md5,
+                success=True,
+                llm_result=llm_result,
+                attempts=attempt,
+            )
+
+        except (KeyError, ValueError, json.JSONDecodeError) as e:
+            last_error = f"parse error: {e}"
+            logger.warning(f"[{record.query_md5[:8]}] attempt {attempt}: {last_error}")
+            _backoff(attempt, config)
+            continue
+
+    return RecordResult(
+        query_md5=record.query_md5,
+        success=False,
+        error=last_error,
+        attempts=config.max_retries,
+    )
+
+
+def _backoff(attempt: int, config: LLMConfig) -> None:
+    delay = (
+        config.retry_delays[attempt - 1]
+        if attempt <= len(config.retry_delays)
+        else 30
+    )
+    logger.info(f"  backoff {delay}s...")
+    time.sleep(delay)
+
+
+def _reset_session() -> None:
+    """Удаляем сессию потока — при следующем вызове get_session создаст новую."""
+    if hasattr(_thread_local, "session"):
+        try:
+            _thread_local.session.close()
+        except Exception:
+            pass
+        del _thread_local.session
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ОРКЕСТРАТОР
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_enrichment_pipeline(
+    doris_cfg: DorisConfig,
+    llm_cfg: LLMConfig,
+    batch_size: int = 500,
+    write_every: int = 50,
+) -> dict:
+    start = datetime.now()
+
+    records = fetch_pending_records(doris_cfg, batch_size)
+    if not records:
+        logger.info("No pending records. Exiting.")
+        return {"processed": 0, "success": 0, "failed": 0}
+
+    all_results: list[RecordResult] = []
+    buffer: list[RecordResult] = []
+    # Lock нужен т.к. flush в Doris вызывается из главного потока,
+    # но счётчики меняются по мере прихода future-результатов
+    flush_lock = Lock()
+
+    with ThreadPoolExecutor(max_workers=llm_cfg.max_workers) as executor:
+        futures = {
+            executor.submit(call_llm_with_retry, record, llm_cfg): record
+            for record in records
+        }
+        total = len(futures)
+        done  = 0
+
+        for future in as_completed(futures):
+            record = futures[future]
+            try:
+                result = future.result()
+            except Exception as e:
+                # Страховка: необработанное исключение из потока
+                logger.error(f"[{record.query_md5[:8]}] unhandled exception: {e}")
+                result = RecordResult(
+                    query_md5=record.query_md5,
+                    success=False,
+                    error=f"unhandled: {e}",
+                    attempts=0,
+                )
+
+            with flush_lock:
+                buffer.append(result)
+                all_results.append(result)
+                done += 1
+
+                if len(buffer) >= write_every:
+                    logger.info(f"Flushing {len(buffer)} results to Doris...")
+                    write_results(doris_cfg, buffer)
+                    buffer.clear()
+
+                if done % 10 == 0 or done == total:
+                    ok = sum(1 for r in all_results if r.success)
+                    logger.info(
+                        f"Progress: {done}/{total} | OK: {ok} | FAIL: {done - ok}"
+                    )
+
+    # Финальный flush
+    if buffer:
+        logger.info(f"Final flush: {len(buffer)} results to Doris...")
+        write_results(doris_cfg, buffer)
+
+    elapsed = (datetime.now() - start).total_seconds()
+    success = sum(1 for r in all_results if r.success)
+    failed  = len(all_results) - success
+
+    stats = {
+        "processed":   len(all_results),
+        "success":     success,
+        "failed":      failed,
+        "elapsed_sec": round(elapsed, 1),
+        "rps":         round(len(all_results) / elapsed, 2) if elapsed > 0 else 0,
+    }
+    logger.info(f"Pipeline done: {stats}")
+    return stats
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ЗАПУСК
+# ══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    doris_cfg = DorisConfig(
+        host="doris-fe-host",
+        port=9030,
+        user="dwh_user",
+        password="secret",
+        database="dwh",
+    )
+    llm_cfg = LLMConfig(
+        url="https://api.moonshot.cn/v1/chat/completions",
+        api_key="sk-...",
+        model="moonshot-v1-8k",
+        max_workers=10,
+    )
+
+    stats = run_enrichment_pipeline(
+        doris_cfg=doris_cfg,
+        llm_cfg=llm_cfg,
+        batch_size=500,
+        write_every=50,
+    )
+    print(f"\nРезультат: {stats}")
+
+
+
+
