@@ -174,3 +174,33 @@ INPUT DATA
 OUTPUT
 -----------------------
 Return ONLY valid SQL INSERT statements.
+
+
+
+
+
+CFT (Core Banking System) schema represents a financial transactional system built around clients, accounts, and transactions.
+
+Core entities:
+- Clients → own accounts  
+- Accounts → store financial activity  
+- Transactions (postings) → represent all money movements (debit/credit)  
+- Documents → business operations generating transactions  
+- Products → define financial logic (loans, deposits, cards)
+
+Key principles:
+- Transactions are the single source of truth  
+- Balances are derived as SUM of transactions  
+- Debit decreases balance, credit increases balance  
+- Transactions are immutable (append-only)
+
+Relationships:
+- client → account (1:N)  
+- account → transaction (1:N)  
+- document → transaction (1:N)
+
+Notes for SQL:
+- Always calculate metrics from transactions, not balances  
+- Use aggregations (SUM, GROUP BY)  
+- Join clients, accounts, and transactions for business queries
+
