@@ -5966,3 +5966,37 @@ result = "\n".join(
 
 
 
+
+распарс '''json
+
+def extract_json(text: str) -> str:
+    start = text.find('{')
+    end = text.rfind('}')
+    if start != -1 and end != -1:
+        return text[start:end+1]
+    raise ValueError("JSON not found")
+
+def parse_llm_json(text: str):
+    text = clean_llm_json(text)
+    
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # fallback — пробуем вытащить JSON из текста
+        extracted = extract_json(text)
+        return json.loads(extracted)
+
+
+
+боллее устойчивый распарс???
+
+import ast
+
+def parse_loose_json(text: str):
+    text = clean_llm_json(text)
+    
+    try:
+        return json.loads(text)
+    except:
+        return ast.literal_eval(text)
+
