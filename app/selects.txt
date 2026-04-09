@@ -165,3 +165,48 @@ ORDER BY quality_score DESC
 LIMIT 30;
 
 
+
+WITH normalized AS (
+    SELECT
+        *,
+        MD5(
+            -- 1. lowercase
+            REGEXP_REPLACE(
+            -- 2. строковые литералы → ?
+            REGEXP_REPLACE(
+            -- 3. числа → ?
+            REGEXP_REPLACE(
+            -- 4. IN (...) → IN (?)  
+            REGEXP_REPLACE(
+            -- 5. лишние пробелы
+            REGEXP_REPLACE(
+            -- 6. даты
+            REGEXP_REPLACE(
+                LOWER(TRIM(sql_clean)),
+                '\\b\\d{4}-\\d{2}-\\d{2}(\\s\\d{2}:\\d{2}:\\d{2})?\\b', '?'
+            ), '\\s+', ' '
+            ), 'in\\s*\\([^)]+\\)', 'in (?)'
+            ), '\\b\\d+\\.?\\d*\\b', '?'
+            ), "'[^']*'", '?'
+            ), '"[^"]*"', '?'
+            )
+        ) AS sql_fingerprint,
+
+        -- Длина SQL как грубая мера сложности (для мягкой группировки)
+        LENGTH(sql_clean) AS sql_len,
+
+        -- Первые 200 символов нормализованного SQL — для визуальной проверки
+        LEFT(
+            REGEXP_REPLACE(
+            REGEXP_REPLACE(
+                LOWER(TRIM(sql_clean)),
+                "'[^']*'", '?'
+            ), '\\b\\d+\\.?\\d*\\b', '?'
+            ),
+            200
+        ) AS sql_preview
+    FROM quality
+),
+
+
+
