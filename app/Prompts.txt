@@ -508,3 +508,441 @@ Return ONLY the chunk text. Use this structure:
 
 
 
+Связи (Joins Metadata)
+
+You are a senior data engineer analyzing JOIN relationships in a corporate DWH 
+for a super-app (banking, marketplace, payments, transfers, government services).
+Platform: StarRocks. This metadata will be used in a Text2SQL RAG system.
+
+## INPUT DATA
+
+### Primary table
+Name: {primary_table}
+Domain: {primary_domain}
+Purpose: {primary_purpose}
+Granularity: {primary_granularity}
+Distribution key: {primary_dist_key}
+
+### Partner table
+Name: {partner_table}
+Domain: {partner_domain}
+Purpose: {partner_purpose}
+Granularity: {partner_granularity}
+Distribution key: {partner_dist_key}
+
+### Observed JOIN evidence (from query logs)
+Total JOIN occurrences: {join_count}
+Unique query fingerprints with this JOIN: {unique_queries}
+
+Join conditions observed:
+{join_conditions_list}
+// e.g.:
+// "p.order_id = o.id"  — 1823 times
+// "p.order_id = o.id AND p.merchant_id = o.merchant_id"  — 341 times
+// "p.ref_id = o.external_ref"  — 12 times (possibly legacy)
+
+Query contexts (what was being calculated around this JOIN):
+{surrounding_aggregations_and_filters}
+
+### Raw schema hints
+Foreign key declarations (if any): {fk_declarations}
+Index info: {index_info}
+
+## YOUR TASK
+
+Analyze ALL observed join conditions and generate structured join relationship metadata.
+If multiple join conditions exist — document each as a separate join variant.
+Identify the PRIMARY (canonical) variant and mark others as ALTERNATIVE or LEGACY.
+Infer cardinality, semantic meaning, and StarRocks execution hints.
+
+## OUTPUT FORMAT
+
+Return ONLY valid JSON, no markdown, no explanation:
+
+{
+  "relationship_id": "{primary_table}__{partner_table}",
+  "primary_table": "...",
+  "partner_table": "...",
+  "cross_domain": true,   // true if tables are from different domains
+  "domain_note": "...",   // explain cross-domain context if relevant
+
+  "join_variants": [
+    {
+      "variant_id": "primary",   // primary | alternative | legacy
+      "status": "canonical",     // canonical | situational | legacy | suspicious
+      "condition": "...",        // exact SQL condition, normalized
+      "cardinality": "N:1",      // 1:1 | 1:N | N:1 | N:M
+      "join_direction": "...",   // e.g. "payments references orders"
+      "semantic": "...",         // business meaning of this join in Russian
+      "frequency": {
+        "total_occurrences": 0,
+        "unique_query_patterns": 0,
+        "relative_share": 0.0    // share among all variants for this pair
+      },
+      "colocate_possible": true, // true if both tables distributed on join key
+      "preferred_join_type": "INNER|LEFT|RIGHT|FULL",
+      "preferred_join_note": "...",
+      "example_use_case": "..."  // one sentence: when would you use this join
+    }
+  ],
+
+  "primary_variant_id": "primary",
+
+  "anti_patterns": [
+    {
+      "pattern": "...",          // SQL anti-pattern description
+      "why_wrong": "...",
+      "correct_alternative": "..."
+    }
+  ],
+
+  "sql_template": "...",  // canonical JOIN snippet ready to use
+  // e.g.: "payments p\nINNER JOIN orders o ON p.order_id = o.id"
+
+  "performance_notes": [
+    "..."  // e.g. "colocate join possible — both tables distributed on order_id"
+  ],
+
+  "warnings": [...],
+  // e.g. "partner table has daily partition — add date filter to avoid full scan"
+
+  "confidence": "high|medium|low",
+  "confidence_notes": "..."
+}
+
+
+
+Примеры SQL (SQL Examples Metadata)
+
+You are a senior data engineer curating reference SQL examples for a Text2SQL RAG 
+system. DWH: StarRocks, super-app domain (banking, marketplace, payments, transfers, 
+government services). 
+These examples will be used as few-shot context for Kimi-2.5 when generating SQL.
+
+## INPUT DATA
+
+### Table context
+Primary table: {primary_table}
+Domain: {domain}
+Purpose: {table_purpose}
+Key columns summary: {key_columns_summary}
+Known joins: {known_joins_summary}
+
+### Raw SQL query from production logs
+{raw_sql_query}
+
+Query metadata:
+- Execution count (same fingerprint): {exec_count}
+- Avg duration ms: {avg_duration_ms}
+- Result row count (approx): {result_rows}
+- Executed by role/service: {executor_role}   // e.g. analyst, etl_service, report_api
+
+## YOUR TASK
+
+Analyze the raw SQL query and generate a structured SQL example record.
+Tasks:
+1. Understand WHAT business question this query answers
+2. Normalize and clean the SQL (formatting, aliases, remove hardcoded IDs)
+3. Classify the query by type and complexity
+4. Extract key SQL patterns used
+5. Assess quality and suitability as a reference example
+6. Generate a natural language question in Russian that this query would answer
+
+Sanitization rules:
+- Replace specific numeric IDs with descriptive placeholders: 
+  WHERE merchant_id = 4821  →  WHERE merchant_id = :target_merchant_id
+- Replace hardcoded date literals with named params:
+  WHERE dt >= '2024-01-01'  →  WHERE dt >= :start_date
+- Keep structural logic intact — do not simplify the query
+- Uppercase SQL keywords, consistent 4-space indentation
+
+## OUTPUT FORMAT
+
+Return ONLY valid JSON, no markdown, no explanation:
+
+{
+  "example_id": "{table_name}__ex_{hash}",
+  "primary_table": "...",
+  "domain": "...",
+
+  "nl_question_ru": "...",  
+  // Natural language question this query answers, in Russian
+  // e.g. "Сколько успешных платежей совершил каждый мерчант за последний месяц?"
+
+  "nl_question_variants": [...],  
+  // 2-3 alternative phrasings of the same question in Russian
+  // (increases retrieval recall via BGE-M3)
+
+  "sql_normalized": "...",  // clean, normalized SQL with placeholders
+
+  "sql_explanation_ru": "...",
+  // Step-by-step explanation in Russian: what each major clause does
+  // Format: "1. FROM ... — берём транзакции. 2. JOIN ... — присоединяем..."
+
+  "query_type": "...",  
+  // aggregation | filtering | join | window | subquery | cte | 
+  // union | insert_select | with_clause
+
+  "complexity": "simple|medium|complex|expert",
+
+  "patterns_used": [...],
+  // SQL patterns present: e.g. "window_function", "correlated_subquery",
+  // "conditional_aggregation", "partition_pruning", "colocate_join",
+  // "approximate_count_distinct", "having_filter"
+
+  "tables_involved": [...],
+
+  "key_columns_used": [
+    {
+      "table": "...",
+      "column": "...",
+      "role_in_query": "filter|join_key|measure|dimension|output"
+    }
+  ],
+
+  "business_scenario": "...",  // which business scenario this serves (link to scenario id)
+  
+  "performance_profile": {
+    "uses_partition_filter": true,
+    "uses_colocate_join": false,
+    "has_full_table_scan_risk": false,
+    "duration_class": "fast|medium|slow",  // based on avg_duration_ms
+    "notes": "..."
+  },
+
+  "quality_score": 0.0,  // 0.0 to 1.0 — suitability as reference example
+  "quality_notes": "...",
+  // Explain score: e.g. "good partition filter, clear business meaning, 
+  // but uses hardcoded status values without explanation"
+
+  "use_as_fewshot": true,  // should this be included in RAG few-shot pool?
+  "tags": [...]
+}
+
+
+Правила SQL (SQL Rules Metadata)
+
+You are a senior data engineer extracting SQL generation rules for a Text2SQL system.
+DWH: StarRocks 3.x, super-app (banking, marketplace, payments, transfers, govservices).
+These rules will guide Kimi-2.5 to generate correct, performant SQL.
+Rules are derived from production query patterns and domain expertise.
+
+## INPUT DATA
+
+### Domain / Table context  
+Domain: {domain}
+Tables in scope: {tables_list}
+Key business entities: {business_entities}
+
+### Evidence for rule extraction
+Pattern observed in logs: {pattern_description}
+Frequency / support: {frequency}
+Counter-examples (violations and their consequences): {violations}
+
+### Existing known rules (to avoid duplication):
+{existing_rules_summary}
+
+## YOUR TASK
+
+Extract and formalize SQL generation rules from the observed pattern.
+One call = one logical rule (or a tight cluster of related sub-rules).
+Rules must be:
+- Actionable: LLM can directly apply them when generating SQL
+- Specific: reference actual table/column names where applicable  
+- Justified: explain WHY the rule exists (performance, correctness, business logic)
+
+## OUTPUT FORMAT
+
+Return ONLY valid JSON, no markdown, no explanation:
+
+{
+  "rule_id": "{domain}__{short_name}",  
+  // e.g. "payments__always_filter_by_date"
+
+  "domain": "...",  // domain this rule applies to, or "global" for all domains
+  "scope": "global|domain|table|column|join",
+  "applies_to_tables": [...],   // specific tables, or [] if global
+  "applies_to_columns": [...],  // specific columns, or []
+
+  "rule_type": "...",
+  // performance | correctness | business_logic | naming | join_pattern |
+  // filter_required | aggregation | forbidden | preferred_pattern
+
+  "priority": "critical|high|medium|low",
+  // critical = always apply, violation breaks query
+  // high = apply unless there's explicit reason not to
+  // medium = apply as default, can be overridden
+  // low = stylistic preference
+
+  "title_ru": "...",  // short rule name in Russian (used in LLM prompt header)
+  
+  "description_ru": "...",
+  // Full rule description in Russian for LLM system prompt injection
+  // Must be self-contained: LLM reads only this field, not the full record
+  // Format: imperative ("Всегда добавляй...", "Никогда не используй...", "При запросе X используй Y")
+
+  "rationale_ru": "...",
+  // Why this rule exists — for human review and LLM explanation if asked
+
+  "positive_example": {
+    "nl_question": "...",
+    "sql": "...",
+    "annotation": "..."  // what makes this correct
+  },
+
+  "negative_example": {
+    "nl_question": "...",
+    "sql": "...",           // the WRONG way
+    "what_goes_wrong": "..." // consequence: wrong result / timeout / full scan
+  },
+
+  "trigger_keywords_ru": [...],
+  // Russian words in user question that should activate this rule
+  // e.g. ["платёж", "оплата", "транзакция", "перевод"]
+  
+  "trigger_conditions": [...],
+  // Structural triggers: e.g. "query involves table payments", 
+  // "user asks for totals by time period"
+
+  "conflicts_with_rules": [...],  // rule_ids that conflict (mutual exclusion)
+  "depends_on_rules": [...],      // rule_ids that must be applied first
+
+  "confidence": "high|medium|low",
+  "validated": false,   // true = manually reviewed by engineer
+  "source": "log_analysis|expert_knowledge|incident|documentation"
+}
+
+
+Бизнес-сценарии (Business Scenarios Metadata)
+
+You are a business analyst and data engineer documenting analytical use cases 
+for a Text2SQL RAG system. 
+DWH: StarRocks, super-app (banking, marketplace, payments, transfers, govservices).
+Business scenarios describe WHAT analysts want to know — they serve as the 
+semantic bridge between user questions and the SQL execution layer.
+
+## INPUT DATA
+
+### Domain context
+Domain: {domain}
+Key tables: {key_tables_with_purposes}
+Key business metrics known: {known_metrics}
+
+### Evidence for scenario extraction (choose what's available)
+
+Option A — from query log cluster:
+Cluster of similar queries: {query_cluster}
+Cluster label / topic: {cluster_label}
+Frequency: {cluster_frequency}
+
+Option B — from Jira/Confluence:
+Source text: {source_text}
+Source type: dashboard_spec | requirements | incident | data_contract | wiki
+
+Option C — from domain expert input:
+Expert description: {expert_description}
+
+## YOUR TASK
+
+Generate a structured business scenario record that captures:
+1. The business question(s) this scenario addresses
+2. The data entities and metrics involved
+3. The SQL pattern template(s) that implement it
+4. Retrieval signals so RAG can match user questions to this scenario
+
+A scenario is NOT a single query — it's a family of related analytical questions 
+that use the same tables, metrics, and patterns.
+
+## OUTPUT FORMAT
+
+Return ONLY valid JSON, no markdown, no explanation:
+
+{
+  "scenario_id": "{domain}__{short_name}",
+  "domain": "...",
+  "subdomain": "...",  // e.g. "merchant_analytics", "fraud_detection", "p2p_transfers"
+
+  "title_ru": "...",  // scenario name in Russian, concise
+  "description_ru": "...",
+  // 3-5 sentences: what business question this answers, who needs it, 
+  // what decisions it informs
+
+  "user_roles": [...],
+  // who typically asks these questions:
+  // analyst | product_manager | risk_officer | finance | operations | 
+  // compliance | executive | external_api
+
+  "question_examples_ru": [...],
+  // 5-8 example questions in Russian that belong to this scenario
+  // Vary phrasing: formal, colloquial, abbreviations, synonyms
+  // These feed directly into BGE-M3 retrieval
+  // e.g.:
+  // "Сколько платежей прошло вчера?"
+  // "Покажи количество успешных транзакций за последние 7 дней"
+  // "Динамика оплат по дням за прошлый месяц"
+  // "Объём платежей по часам сегодня"
+
+  "primary_tables": [...],    // tables always involved
+  "optional_tables": [...],   // tables sometimes joined for enrichment
+
+  "key_metrics": [
+    {
+      "metric_name": "...",         // e.g. "payment_success_rate"
+      "display_name_ru": "...",
+      "sql_expression": "...",      // e.g. "COUNT(CASE WHEN status='COMPLETED' THEN 1 END) / COUNT(*)"
+      "description_ru": "...",
+      "unit": "...",                // percent | count | rubles | kopecks | days | etc
+      "aggregation_level": "..."    // transaction | merchant | user | daily | monthly
+    }
+  ],
+
+  "key_dimensions": [...],
+  // typical GROUP BY dimensions for this scenario
+  // e.g. ["merchant_id", "payment_method", "status", "dt"]
+
+  "time_patterns": {
+    "requires_date_filter": true,
+    "typical_granularity": "day|week|month|hour",
+    "partition_column": "...",
+    "note": "..."
+  },
+
+  "sql_pattern_template": "...",
+  // Parameterized SQL skeleton for this scenario
+  // Use {placeholders} for variable parts
+  // This is the structural backbone Kimi-2.5 should follow
+  /*
+  SELECT
+      {time_dimension},
+      {groupby_dimensions},
+      {metrics}
+  FROM {primary_table}
+  {joins}
+  WHERE {partition_column} BETWEEN {start_date} AND {end_date}
+    AND {additional_filters}
+  GROUP BY {time_dimension}, {groupby_dimensions}
+  ORDER BY {time_dimension}
+  */
+
+  "linked_rules": [...],    // rule_ids that apply to this scenario
+  "linked_examples": [...], // example_ids that implement this scenario
+
+  "complexity": "simple|medium|complex",
+  "typical_result_shape": "...",
+  // e.g. "time series", "ranked list", "single aggregate", "cross-tab"
+
+  "keywords_ru": [...],
+  // broad retrieval keywords for sparse search (BGE-M3 sparse component)
+  // mix of: business terms, metric names, table names, synonyms, action verbs
+  // e.g. ["платёж", "оплата", "транзакция", "успешный", "объём", "количество",
+  //        "динамика", "график", "payments", "p2p"]
+
+  "confidence": "high|medium|low",
+  "source": "log_cluster|jira|confluence|expert|combination"
+}
+
+
+
+
+
+
