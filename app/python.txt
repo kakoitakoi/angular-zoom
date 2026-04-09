@@ -5948,3 +5948,21 @@ if __name__ == "__main__":
 
 
 
+
+result = "\n".join(
+    f"Строка {i+1}:\n" + "\n".join(map(str, row))
+    for i, row in enumerate(data)
+)
+
+print(result)
+
+columns = ["field1", "field2"]
+
+result = "\n".join(
+    f"Строка {i+1}:\n" +
+    "\n".join(f"{col}: {val}" for col, val in zip(columns, row))
+    for i, row in enumerate(data)
+)
+
+
+
