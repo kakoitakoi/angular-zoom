@@ -58,3 +58,110 @@ ORDER BY
     t.table_name,
     c.ordinal_position;
 
+
+WITH allowed AS (
+    -- Список разрешённых таблиц в формате SCHEMA.TABLE
+    SELECT 'S004LSHOP.GOODS_AUTOFIL_METADATA' AS tbl UNION ALL
+    SELECT 'S004LSHOP.ORDERS'                       UNION ALL
+    SELECT 'S004LSHOP.ORDERS_MASTER'
+    -- ... добавляй свои
+),
+
+-- Проверка: все таблицы запроса входят в allowed
+table_check AS (
+    SELECT
+        t.query_id,
+        COUNT(DISTINCT v.name)                                         AS total_cnt,
+        COUNT(DISTINCT CASE WHEN a.tbl IS NOT NULL THEN v.name END)    AS allowed_cnt
+    FROM ODS.TMP_SHOP_STARBUCKS_AUDIT_TBL_SELECT t
+    CROSS JOIN LATERAL (
+        SELECT value AS name
+        FROM JSON_TABLE(
+            t.tables, '$[*]'
+            COLUMNS (value VARCHAR(255) PATH '$')
+        )
+    ) v
+    LEFT JOIN allowed a ON v.name = a.tbl
+    WHERE t.tables IS NOT NULL AND t.tables != '[]'
+    GROUP BY t.query_id
+),
+
+valid_queries AS (
+    SELECT query_id
+    FROM table_check
+    WHERE total_cnt = allowed_cnt AND total_cnt > 0
+),
+
+quality AS (
+    SELECT
+        t.query_id,
+        t.query_time,
+        t.sql_clean,
+        t.tables,
+        t.has_cte,
+        t.has_group_by,
+        t.has_limit,
+        t.has_window,
+        t.scan_bytes,
+        t.scan_rows,
+        t.return_rows,
+        t.cpu_cost_ns,
+        t.score,
+        -- Сигнатура структурного разнообразия
+        CONCAT_WS('_',
+            CAST(t.has_cte      AS VARCHAR),
+            CAST(t.has_group_by AS VARCHAR),
+            CAST(t.has_window   AS VARCHAR),
+            CAST(t.has_limit    AS VARCHAR),
+            CAST(JSON_LENGTH(t.tables) AS VARCHAR),
+            CAST(t.cols_cnt     AS VARCHAR)  -- уникальная деталь из твоей таблицы
+        ) AS signature,
+        -- Quality score
+        t.score
+        + 0.5 * t.has_cte
+        + 0.3 * t.has_group_by
+        + 0.4 * t.has_window
+        + 0.1 * t.has_limit
+        - LOG(1 + t.scan_bytes) / 40.0
+        + 0.2 * (t.return_rows > 0)
+        AS quality_score
+    FROM ODS.TMP_SHOP_STARBUCKS_AUDIT_TBL_SELECT t
+    JOIN valid_queries v ON t.query_id = v.query_id
+    WHERE t.sql_clean IS NOT NULL
+      AND t.sql_clean != ''
+      AND t.return_rows > 0
+      AND t.cpu_cost_ns < 3e10
+),
+
+ranked AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY signature
+            ORDER BY quality_score DESC
+        ) AS rn_sig,
+        ROW_NUMBER() OVER (
+            ORDER BY quality_score DESC
+        ) AS rn_global
+    FROM quality
+)
+
+SELECT
+    query_id,
+    query_time,
+    sql_clean,
+    tables,
+    signature,
+    has_cte, has_group_by, has_window, has_limit,
+    cols_cnt,
+    scan_bytes, return_rows,
+    ROUND(quality_score, 3) AS quality_score,
+    rn_sig,
+    rn_global
+FROM ranked
+WHERE rn_sig <= 2      -- до 2 эталонов на структурную сигнатуру
+   OR rn_global <= 5   -- + безусловный глобальный топ-5
+ORDER BY quality_score DESC
+LIMIT 30;
+
+
