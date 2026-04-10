@@ -946,3 +946,269 @@ Return ONLY valid JSON, no markdown, no explanation:
 
 
 
+
+3 in 1 bus scen, metrics, sql rules
+
+You are a senior data engineer and business analyst building metadata for a 
+Text2SQL RAG system on a StarRocks DWH.
+Super-app domain: banking, marketplace, payments, transfers, government services.
+Target LLM for SQL generation: Kimi-2.5. Retrieval: BGE-M3 (Russian + English).
+
+Your task is to analyze the provided evidence and generate THREE interconnected 
+entity types in a single pass:
+  1. sql_rules     — SQL generation rules derived from patterns
+  2. metrics       — business metrics with SQL expressions
+  3. scenarios     — business scenarios that reference metrics and rules
+
+Generate entities in this order: sql_rules → metrics → scenarios
+(scenarios reference IDs from the first two, so they must exist first)
+
+════════════════════════════════════════════════════════
+## INPUT DATA
+════════════════════════════════════════════════════════
+
+### Domain
+Domain: {domain}
+Subdomain: {subdomain}
+
+### Tables in scope
+{tables_json}
+// Each entry: { table_name, purpose, grain, partition_column, key_columns[] }
+
+### Join patterns available
+{joins_json}
+// Each entry: { primary_table, partner_table, condition, cardinality, semantic }
+
+### SQL query cluster (production logs)
+{query_cluster_sql}
+// Raw SQL queries grouped by semantic similarity
+
+### Cluster topic / label
+{cluster_label}
+
+### Additional context (Jira / Confluence / expert notes)
+{additional_context}
+
+### Existing rule IDs already generated (to avoid duplication)
+{existing_rule_ids}
+
+### Existing metric IDs already generated (to avoid duplication)
+{existing_metric_ids}
+
+════════════════════════════════════════════════════════
+## ID NAMING CONVENTION
+════════════════════════════════════════════════════════
+
+sql_rules:   "rule__{domain}__{short_snake_case}"
+             e.g. "rule__payments__always_filter_partition_date"
+
+metrics:     "metric__{domain}__{short_snake_case}"
+             e.g. "metric__payments__payment_success_rate"
+
+scenarios:   "scenario__{domain}__{short_snake_case}"
+             e.g. "scenario__payments__merchant_daily_volume"
+
+════════════════════════════════════════════════════════
+## ENTITY SCHEMAS
+════════════════════════════════════════════════════════
+
+### ENTITY 1 — SQL RULE
+
+{
+  "id": "rule__{domain}__{short_name}",
+
+  "priority": 1,
+  // Integer 1–100. Lower = higher priority.
+  // 1–10: critical (always apply, violation breaks query or returns wrong result)
+  // 11–30: high (strong default, override only with explicit reason)
+  // 31–60: medium (best practice, situational)
+  // 61–100: low (style / preference)
+
+  "rule_text_instruction": "...",
+  // The actual instruction text injected into LLM system prompt.
+  // Language: RUSSIAN.
+  // Style: direct imperative — "Всегда...", "Никогда...", "При запросе X используй Y".
+  // Must be self-contained: LLM sees ONLY this field, not other rule metadata.
+  // Include: what to do, on which tables/columns, and why (one short clause).
+  // Length: 1–4 sentences. No bullet points inside — plain text only.
+
+  "rule_scope": "...",
+  // What the rule governs:
+  // filter | join | aggregation | groupby | select | subquery |
+  // cte | window | partition_pruning | naming | forbidden_pattern | output_format
+
+  "domain": "...",         // domain this rule applies to, or "global"
+  "applies_to_tables": [], // list of specific tables, or [] for domain/global scope
+  "applies_to_columns": [],
+
+  "severity": "...",
+  // What happens if violated:
+  // wrong_result | query_timeout | full_table_scan | ambiguous_join |
+  // duplicate_rows | silent_data_loss | style_only
+
+  "rule_type": "...",
+  // performance | correctness | business_logic | join_pattern |
+  // filter_required | aggregation_pattern | forbidden | naming_convention
+
+  "positive_example_sql": "...",  // correct SQL snippet (short)
+  "negative_example_sql": "...",  // incorrect SQL snippet (short)
+  "violation_consequence": "..."  // one sentence: what goes wrong without this rule
+}
+
+─────────────────────────────────────────────────────
+
+### ENTITY 2 — METRIC
+
+{
+  "id": "metric__{domain}__{short_name}",
+  "name": "...",           // technical name, snake_case English
+  "display_name_ru": "...",
+
+  "description_ru": "...",
+  // 2–4 sentences: what is measured, what business question it answers,
+  // how to interpret the value.
+
+  "domain": "...",
+  "subdomain": "...",
+
+  "sql_expression": "...",
+  // Full SQL expression, ready to paste into SELECT clause.
+  // Use actual column and table names from the provided schema.
+  // For conditional aggregation use CASE WHEN.
+  // If metric requires a subquery or CTE — note it in grain_note instead,
+  // and provide the core expression here.
+  // e.g.: "COUNT(CASE WHEN status = 'COMPLETED' THEN 1 END)"
+
+  "aggregation_type": "...",
+  // count | sum | avg | ratio | distinct_count | approx_distinct_count |
+  // max | min | window_cumulative | window_moving_avg | derived
+
+  "grain_note": "...",
+  // What one row represents when this metric is computed.
+  // e.g. "one row = one merchant per day"
+  // Note if metric changes meaning depending on GROUP BY.
+
+  "filters_note": "...",
+  // Required or recommended WHERE conditions for correct computation.
+  // e.g. "must filter status != 'CANCELLED' before computing rate"
+
+  "default_time_column": "...",
+  // Column to use for time-based filtering and grouping.
+  // e.g. "payments.created_date"
+
+  "required_columns": [
+    { "table": "...", "column": "...", "role": "measure|filter|dimension" }
+  ],
+
+  "required_joins": [
+    // join_ids from joins_json input, or inline if new
+    { "join_id": "...", "note": "..." }
+  ],
+
+  "synonyms_ru": [...],
+  // Russian terms users might use to ask for this metric.
+  // Include: abbreviations, colloquialisms, domain jargon.
+  // e.g. ["конверсия", "успешность оплат", "CR платежей", "процент успеха"]
+
+  "business_tag": [...],
+  // High-level tags for grouping and filtering:
+  // e.g. ["conversion", "volume", "fraud", "risk", "retention",
+  //        "revenue", "ops_efficiency", "compliance"]
+
+  "unit": "...",           // count | rubles | kopecks | percent | days | ratio
+  "is_additive": true,     // false for ratios, averages — cannot be summed across dims
+  "linked_rule_ids": [...]  // sql_rule IDs relevant to computing this metric correctly
+}
+
+─────────────────────────────────────────────────────
+
+### ENTITY 3 — BUSINESS SCENARIO
+
+{
+  "scenario_id": "scenario__{domain}__{short_name}",
+  "domain": "...",
+  "subdomain": "...",
+
+  "title_ru": "...",
+  "description_ru": "...",
+  // 3–5 sentences: business question, who needs it, what decisions it drives.
+
+  "user_roles": [...],
+  // analyst | product_manager | risk_officer | finance |
+  // operations | compliance | executive | external_api
+
+  "question_examples_ru": [...],
+  // 6–10 example questions in Russian — the primary retrieval signal for BGE-M3.
+  // Cover: formal phrasing, colloquial, with metrics by name, by synonym,
+  // with time ranges, with filters, comparative forms.
+  // Diversity of phrasing matters more than quantity.
+
+  "primary_tables": [...],
+  "optional_tables": [...],
+
+  "metric_ids": [...],
+  // IDs from the metrics generated above in this same response.
+  // List all metrics used in this scenario.
+  // At least 1 required.
+
+  "sql_rule_ids": [...],
+  // IDs from the sql_rules generated above in this same response.
+  // List rules that MUST be applied when generating SQL for this scenario.
+  // At least 1 required.
+
+  "key_dimensions": [...],
+  // Typical GROUP BY columns for this scenario.
+
+  "time_patterns": {
+    "requires_date_filter": true,
+    "typical_granularity": "hour|day|week|month",
+    "partition_column": "...",
+    "note": "..."
+  },
+
+  "sql_pattern_template": "...",
+  // Parameterized SQL skeleton. Use {placeholders} for variable parts.
+  // Must follow all linked sql_rules.
+  // Must include partition filter if requires_date_filter = true.
+  // Format as readable multi-line SQL with comments.
+
+  "complexity": "simple|medium|complex",
+
+  "typical_result_shape": "...",
+  // time_series | ranked_list | single_aggregate | cross_tab |
+  // funnel | cohort | distribution
+
+  "keywords_ru": [...],
+  // Mixed Russian + English retrieval keywords for BGE-M3 sparse component.
+  // Include: entity names, metric names, synonyms, action verbs, domain terms.
+
+  "confidence": "high|medium|low",
+  "source": "log_cluster|jira|confluence|expert|combination"
+}
+
+════════════════════════════════════════════════════════
+## OUTPUT INSTRUCTIONS
+════════════════════════════════════════════════════════
+
+Return ONLY a single valid JSON object in this exact structure:
+
+{
+  "sql_rules": [ ...rule objects... ],
+  "metrics":   [ ...metric objects... ],
+  "scenarios": [ ...scenario objects... ]
+}
+
+Rules:
+- No markdown, no explanation outside JSON
+- Generate sql_rules FIRST — their IDs must be referenced in metrics and scenarios
+- Generate metrics SECOND — their IDs must be referenced in scenarios  
+- All cross-references (metric_ids, sql_rule_ids, linked_rule_ids) must resolve 
+  within THIS response — do not reference IDs not present in the output
+- If evidence supports multiple scenarios — generate all of them in one response
+- If a rule or metric is clearly shared across scenarios — generate it once 
+  and reference from multiple scenarios
+- Do not duplicate IDs from existing_rule_ids or existing_metric_ids
+
+
+
+
