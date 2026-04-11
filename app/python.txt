@@ -6000,3 +6000,188 @@ def parse_loose_json(text: str):
     except:
         return ast.literal_eval(text)
 
+
+
+
+
+
+
+SqlGlot подсчет колонок
+
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from typing import Optional
+import sqlglot
+from sqlglot import exp
+from sqlglot.optimizer import qualify, scope
+
+
+# ---------------------------------------------------------------------------
+# Dataclass для результата
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ColumnStat:
+    table: Optional[str]
+    column: str
+    total: int = 0
+    in_select: int = 0
+    in_where: int = 0
+    in_join: int = 0
+    in_group_by: int = 0
+    in_order_by: int = 0
+    in_having: int = 0
+    in_cte: int = 0
+    in_subquery: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Определяем "контекст" колонки — в каком клозе она находится
+# ---------------------------------------------------------------------------
+
+def get_column_context(col_node: exp.Column) -> str:
+    """
+    Поднимается по дереву предков и определяет,
+    в каком клозе находится колонка.
+    """
+    for ancestor in col_node.walk_up():
+        if isinstance(ancestor, (exp.Column, exp.Table)):
+            continue
+        if isinstance(ancestor, exp.Select):
+            return "select"
+        if isinstance(ancestor, exp.Where):
+            return "where"
+        if isinstance(ancestor, (exp.Join,)):
+            return "join"
+        if isinstance(ancestor, exp.Group):
+            return "group_by"
+        if isinstance(ancestor, exp.Order):
+            return "order_by"
+        if isinstance(ancestor, exp.Having):
+            return "having"
+        # CTE-тело
+        if isinstance(ancestor, exp.CTE):
+            return "cte"
+        # Subquery (Subquery — это SELECT внутри выражения)
+        if isinstance(ancestor, exp.Subquery):
+            return "subquery"
+    return "other"
+
+
+# ---------------------------------------------------------------------------
+# Резолв алиасов таблиц через sqlglot qualify
+# ---------------------------------------------------------------------------
+
+def try_qualify(statement: exp.Expression, dialect: str) -> exp.Expression:
+    """
+    Пытается резолвить алиасы (o -> orders).
+    Без schema резолвит не всё, но убирает большинство алиасов.
+    """
+    try:
+        return qualify.qualify(
+            statement,
+            dialect=dialect,
+            qualify_columns=True,
+            qualify_tables=True,
+            expand_alias_refs=True,
+            infer_schema=True,
+        )
+    except Exception:
+        return statement
+
+
+# ---------------------------------------------------------------------------
+# Основная функция
+# ---------------------------------------------------------------------------
+
+def analyze_column_usage(
+    queries: list[str],
+    dialect: str = "starrocks",
+    use_qualify: bool = True,
+) -> dict[tuple, ColumnStat]:
+    """
+    Парсит все запросы и собирает статистику по каждой колонке.
+
+    Возвращает dict: {(table_or_None, column_name): ColumnStat}
+    """
+    stats: dict[tuple, ColumnStat] = {}
+    errors = []
+
+    for i, sql in enumerate(queries):
+        if not sql or not sql.strip():
+            continue
+        try:
+            statements = sqlglot.parse(sql.strip(), dialect=dialect)
+        except Exception as e:
+            errors.append((i, str(e)))
+            continue
+
+        for stmt in statements:
+            if stmt is None:
+                continue
+
+            if use_qualify:
+                stmt = try_qualify(stmt, dialect)
+
+            # find_all рекурсивно обходит ВСЁ дерево:
+            # CTE, подзапросы, джойны, CASE WHEN, HAVING и тд.
+            for col in stmt.find_all(exp.Column):
+                col_name = col.name.lower().strip()
+                if not col_name or col_name == "*":
+                    continue
+
+                # Таблица/алиас (после qualify — уже резолвленное имя)
+                table_name = (col.table or "").lower().strip() or None
+
+                key = (table_name, col_name)
+                if key not in stats:
+                    stats[key] = ColumnStat(table=table_name, column=col_name)
+
+                stat = stats[key]
+                stat.total += 1
+
+                ctx = get_column_context(col)
+                if ctx == "select":    stat.in_select += 1
+                elif ctx == "where":   stat.in_where += 1
+                elif ctx == "join":    stat.in_join += 1
+                elif ctx == "group_by": stat.in_group_by += 1
+                elif ctx == "order_by": stat.in_order_by += 1
+                elif ctx == "having":  stat.in_having += 1
+                elif ctx == "cte":     stat.in_cte += 1
+                elif ctx == "subquery": stat.in_subquery += 1
+
+    if errors:
+        print(f"[WARN] Не удалось распарсить {len(errors)} запросов")
+
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Отчёт
+# ---------------------------------------------------------------------------
+
+def print_report(stats: dict[tuple, ColumnStat], top_n: int = 50):
+    sorted_stats = sorted(stats.values(), key=lambda s: s.total, reverse=True)
+
+    print(f"\n{'='*100}")
+    print(f"  Уникальных колонок : {len(stats)}")
+    print(f"  Суммарных обращений: {sum(s.total for s in sorted_stats)}")
+    print(f"{'='*100}")
+
+    header = (
+        f"{'Таблица':<25} {'Колонка':<25} "
+        f"{'Всего':>6} {'SELECT':>6} {'WHERE':>6} "
+        f"{'JOIN':>6} {'GROUP':>6} {'ORDER':>6} "
+        f"{'HAVING':>6} {'CTE':>6} {'SUBQ':>6}"
+    )
+    print(header)
+    print("-" * 100)
+
+    for s in sorted_stats[:top_n]:
+        print(
+            f"{(s.table or '—'):<25} {s.column:<25} "
+            f"{s.total:>6} {s.in_select:>6} {s.in_where:>6} "
+            f"{s.in_join:>6} {s.in_group_by:>6} {s.in_order_by:>6} "
+            f"{s.in_having:>6} {s.in_cte:>6} {s.in_subquery:>6}"
+        )
+
