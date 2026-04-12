@@ -228,3 +228,23 @@ cast(
 ) as related_rules
 
 
+, CASE 
+    WHEN json_extract(obj, '$.linked_rule_ids') IS NULL 
+      OR json_extract(obj, '$.linked_rule_ids') = 'null'
+      OR LEFT(TRIM(json_extract(obj, '$.linked_rule_ids')), 1) != '['
+    THEN NULL
+    ELSE array_join(
+           cast(json_extract(obj, '$.linked_rule_ids') as array<varchar>),
+         ',')
+  END as related_rules
+
+
+SELECT json_extract(obj, '$.linked_rule_ids')
+FROM ODS.llm_raw___metrics_rules_scenarios___new d
+LATERAL VIEW explode_json_array_json(json_extract(`data`, '$.scenarios')) t as obj
+WHERE LEFT(TRIM(json_extract(obj, '$.linked_rule_ids')), 1) != '['
+  AND json_extract(obj, '$.linked_rule_ids') IS NOT NULL
+LIMIT 20;
+
+
+
