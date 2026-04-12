@@ -210,3 +210,21 @@ WITH normalized AS (
 
 
 
+
+SELECT 
+  json_extract(obj, '$.linked_rule_ids'),
+  typeof(json_extract(obj, '$.linked_rule_ids'))
+FROM ODS.llm_raw___metrics_rules_scenarios___new d
+LATERAL VIEW explode_json_array_json(json_extract(`data`, '$.scenarios')) t as obj
+LIMIT 10;
+
+cast(
+  array_join(
+    cast(
+      nullif(json_extract(obj, '$.linked_rule_ids'), 'null') 
+      as array<varchar>
+    ), ','
+  ) as varchar
+) as related_rules
+
+
