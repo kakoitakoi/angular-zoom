@@ -6185,3 +6185,32 @@ def print_report(stats: dict[tuple, ColumnStat], top_n: int = 50):
             f"{s.in_having:>6} {s.in_cte:>6} {s.in_subquery:>6}"
         )
 
+
+
+
+
+validate sql on SR
+
+import pymysql
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+CONN_PARAMS = dict(host="sr-host", port=9030, user="user", password="pass", database="db")
+
+def validate_explain(sql: str) -> tuple[str, bool, str]:
+    try:
+        with pymysql.connect(**CONN_PARAMS) as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"EXPLAIN {sql}")
+                cur.fetchall()
+        return sql, True, ""
+    except pymysql.Error as e:
+        return sql, False, str(e)
+
+queries = ["SELECT ...", "SELECT ..."]  # твой список
+
+with ThreadPoolExecutor(max_workers=8) as pool:
+    futures = {pool.submit(validate_explain, q): q for q in queries}
+    for future in as_completed(futures):
+        sql, ok, err = future.result()
+        print("OK" if ok else f"FAIL: {err}")
+        print(sql[:80])
