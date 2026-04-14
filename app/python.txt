@@ -6214,3 +6214,238 @@ with ThreadPoolExecutor(max_workers=8) as pool:
         sql, ok, err = future.result()
         print("OK" if ok else f"FAIL: {err}")
         print(sql[:80])
+
+
+
+
+
+sql explain service
+
+# explain_service.py
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import pymysql
+import sqlglot
+import sqlglot.expressions as exp
+import re
+import os
+from typing import Optional
+
+app = FastAPI(title="StarRocks EXPLAIN Service")
+
+# --- Config (env variables) ---
+SR_HOST     = os.getenv("SR_HOST", "localhost")
+SR_PORT     = int(os.getenv("SR_PORT", "9030"))
+SR_USER     = os.getenv("SR_USER", "root")
+SR_PASSWORD = os.getenv("SR_PASSWORD", "")
+SR_DATABASE = os.getenv("SR_DATABASE", "default_catalog")
+
+
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+class SQLRequest(BaseModel):
+    sql: str
+    database: Optional[str] = None
+
+
+class ExplainResponse(BaseModel):
+    status: str                         # "OK" | "ERROR"
+    explain_plan: Optional[str] = None
+    error_message: Optional[str] = None
+    injected_sql: Optional[str] = None  # для отладки — что именно отправили
+
+
+# ---------------------------------------------------------------------------
+# EXPLAIN injection
+# ---------------------------------------------------------------------------
+
+def _strip_leading_comments(sql: str) -> tuple[str, str]:
+    """
+    Отделяет ведущий блок комментариев/пробелов от тела запроса.
+    Возвращает (leading, body).
+    """
+    pattern = re.compile(
+        r'^(?P<lead>(?:\s|--[^\n]*\n?|/\*.*?\*/)*)',
+        re.DOTALL,
+    )
+    m = pattern.match(sql)
+    lead = m.group("lead") if m else ""
+    body = sql[len(lead):]
+    return lead, body
+
+
+def _already_has_explain(body: str) -> bool:
+    return re.match(r'EXPLAIN\b', body, re.IGNORECASE) is not None
+
+
+def inject_explain_sqlglot(sql: str) -> tuple[str, str | None]:
+    """
+    Использует sqlglot для определения структуры запроса.
+
+    Стратегия:
+      - Парсим AST через sqlglot (диалект starrocks/mysql).
+      - Если корневой узел — With или Select/Insert/Update/Delete →
+        EXPLAIN ставится ДО всей конструкции, включая WITH.
+      - StarRocks синтаксис: EXPLAIN <query>
+        где <query> может начинаться с WITH.
+      - Если sqlglot не смог распарсить — fallback на regex.
+
+    Возвращает (explain_sql, warning_or_none).
+    """
+    lead, body = _strip_leading_comments(sql)
+
+    if _already_has_explain(body):
+        return sql, None
+
+    warning = None
+
+    # --- попытка разобрать через sqlglot ---
+    try:
+        statements = sqlglot.parse(body, dialect="mysql", error_level=sqlglot.ErrorLevel.RAISE)
+    except sqlglot.errors.ParseError:
+        statements = None
+
+    if statements:
+        stmt = statements[0]  # берём первый statement
+
+        # sqlglot корректно распознаёт:
+        #   exp.With      → WITH cte AS (...) SELECT ...
+        #   exp.Select    → SELECT ...
+        #   exp.Insert    → INSERT INTO ...
+        #   exp.Update    → UPDATE ...
+        #   exp.Delete    → DELETE FROM ...
+        #   exp.Union     → SELECT ... UNION SELECT ...
+        supported = (exp.With, exp.Select, exp.Insert, exp.Update, exp.Delete, exp.Union)
+
+        if isinstance(stmt, supported):
+            # EXPLAIN идёт перед ВСЕМ statement-ом (включая WITH)
+            # Просто prepend к body — это и есть правильный StarRocks синтаксис
+            return lead + "EXPLAIN " + body, None
+        else:
+            warning = f"sqlglot: unexpected top-level node type {type(stmt).__name__}, falling back to regex"
+    else:
+        warning = "sqlglot: parse failed, falling back to regex"
+
+    # --- fallback: regex ---
+    # Ищем первое DML-слово (WITH / SELECT / INSERT / UPDATE / DELETE)
+    # и ставим EXPLAIN перед ним
+    dml_re = re.compile(r'\b(WITH|SELECT|INSERT|UPDATE|DELETE)\b', re.IGNORECASE)
+    m = dml_re.search(body)
+    if m:
+        pos = m.start()
+        injected = lead + body[:pos] + "EXPLAIN " + body[pos:]
+        return injected, warning
+
+    # Если ничего не нашли — отправляем как есть (StarRocks вернёт ошибку сам)
+    return sql, (warning or "Could not determine injection point")
+
+
+# ---------------------------------------------------------------------------
+# DB execution
+# ---------------------------------------------------------------------------
+
+def run_explain(sql_with_explain: str, database: str) -> tuple[str, Optional[str]]:
+    """Возвращает (status, plan_or_error)."""
+    conn = None
+    try:
+        conn = pymysql.connect(
+            host=SR_HOST,
+            port=SR_PORT,
+            user=SR_USER,
+            password=SR_PASSWORD,
+            database=database,
+            connect_timeout=10,
+            read_timeout=60,
+            charset="utf8mb4",
+        )
+        with conn.cursor() as cur:
+            cur.execute(sql_with_explain)
+            rows = cur.fetchall()
+            plan = "\n".join(str(row[0]) for row in rows if row)
+        return "OK", plan
+
+    except pymysql.err.ProgrammingError as e:
+        return "ERROR", str(e)
+    except pymysql.err.OperationalError as e:
+        return "ERROR", f"Connection error: {e}"
+    except Exception as e:
+        return "ERROR", f"Unexpected error: {e}"
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/explain", response_model=ExplainResponse)
+def explain_sql(request: SQLRequest):
+    """
+    Принимает SQL-запрос, оборачивает его в EXPLAIN и выполняет в StarRocks.
+    Возвращает план выполнения (OK) или описание ошибки (ERROR).
+
+    Правильный синтаксис StarRocks 3.5:
+        EXPLAIN [LOGICAL|VERBOSE|COSTS] <query>
+    где <query> — весь запрос, включая опциональный WITH-блок.
+    То есть: EXPLAIN WITH cte AS (...) SELECT ... — корректно.
+    """
+    raw_sql = request.sql.strip()
+    if not raw_sql:
+        raise HTTPException(status_code=400, detail="sql field is empty")
+
+    injected, warning = inject_explain_sqlglot(raw_sql)
+    db = request.database or SR_DATABASE
+
+    status, result = run_explain(injected, db)
+
+    return ExplainResponse(
+        status=status,
+        explain_plan=result if status == "OK" else None,
+        error_message=(result if status == "ERROR" else None) or warning,
+        injected_sql=injected,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Healthcheck
+# ---------------------------------------------------------------------------
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Тест inject_explain_sqlglot без сервера
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    test_cases = [
+        # 1. Простой SELECT
+        "SELECT 1",
+        # 2. CTE + SELECT
+        "WITH base AS (SELECT id FROM t) SELECT * FROM base",
+        # 3. Множественные CTE
+        "WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a JOIN b ON TRUE",
+        # 4. Уже есть EXPLAIN
+        "EXPLAIN SELECT 1",
+        # 5. Ведущий комментарий
+        "-- report\nWITH cte AS (SELECT id FROM t) SELECT * FROM cte WHERE id > 0",
+        # 6. INSERT с CTE
+        "WITH src AS (SELECT * FROM s) INSERT INTO dst SELECT * FROM src",
+        # 7. Блочный комментарий
+        "/* main query */ SELECT * FROM t",
+    ]
+
+    for sql in test_cases:
+        result, warn = inject_explain_sqlglot(sql)
+        print(f"INPUT : {sql[:60]!r}")
+        print(f"OUTPUT: {result[:80]!r}")
+        if warn:
+            print(f"WARN  : {warn}")
+        print()
+
