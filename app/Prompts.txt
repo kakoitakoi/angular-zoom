@@ -1212,3 +1212,25 @@ Rules:
 
 
 
+QUERY_UNDERSTANDING_PROMPT = """
+Проанализируй запрос и верни JSON:
+{
+  "entities": ["клиент", "заказ"],        # бизнес-сущности
+  "metrics": ["выручка", "количество"],   # метрики
+  "time_hints": ["последний месяц"],      # временные маркеры
+  "intent": "aggregation",               # aggregation|lookup|trend|comparison
+  "domain_hints": ["payments", "orders"] # явные подсказки домена
+}
+Запрос: {user_query}
+"""
+
+# Результат:
+query_meta = {
+    "entities": ["клиент", "транзакция"],
+    "metrics": ["GMV", "сумма"],
+    "intent": "aggregation",
+    "domain_hints": ["payments"]
+}
+
+
+
