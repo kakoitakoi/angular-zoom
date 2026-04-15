@@ -1,0 +1,79 @@
+@Route("")
+public class ChatView extends VerticalLayout {
+
+    private final VerticalLayout messages = new VerticalLayout();
+    private final TextField input = new TextField();
+    private final Button send = new Button("Send");
+
+    private final WebClient webClient = WebClient.create("http://localhost:8081");
+
+    public ChatView() {
+        setSizeFull();
+
+        messages.setWidthFull();
+        messages.setSpacing(true);
+
+        input.setWidthFull();
+        send.addClickListener(e -> sendMessage());
+
+        HorizontalLayout inputLayout = new HorizontalLayout(input, send);
+        inputLayout.setWidthFull();
+        inputLayout.expand(input);
+
+        add(messages, inputLayout);
+        expand(messages);
+    }
+
+    private void sendMessage() {
+        String text = input.getValue();
+        if (text == null || text.isEmpty()) return;
+
+        input.clear();
+
+        addMessage("You: " + text);
+
+        Div loading = new Div();
+        loading.setText("⏳ Обрабатывается...");
+        messages.add(loading);
+
+        webClient.post()
+                .uri("/chat")
+                .bodyValue(text)
+                .retrieve()
+                .bodyToMono(String.class)
+                .subscribe(response -> {
+                    getUI().ifPresent(ui -> ui.access(() -> {
+                        messages.remove(loading);
+
+                        Div botMsg = new Div();
+                        messages.add(botMsg);
+
+                        startTypingAnimation(botMsg, "Bot: " + response);
+                    }));
+                });
+    }
+
+    private void addMessage(String text) {
+        Div msg = new Div();
+        msg.setText(text);
+        messages.add(msg);
+    }
+
+    private void startTypingAnimation(Div target, String fullText) {
+        new Thread(() -> {
+            StringBuilder current = new StringBuilder();
+
+            for (char c : fullText.toCharArray()) {
+                current.append(c);
+
+                try {
+                    Thread.sleep(20); // скорость печати
+                } catch (InterruptedException ignored) {}
+
+                getUI().ifPresent(ui -> ui.access(() -> {
+                    target.setText(current.toString());
+                }));
+            }
+        }).start();
+    }
+}
