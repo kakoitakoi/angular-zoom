@@ -77,3 +77,45 @@ public class ChatView extends VerticalLayout {
         }).start();
     }
 }
+
+
+
+
+
+private void sendMessage() {
+    String text = input.getValue();
+    if (text == null || text.isEmpty()) return;
+
+    input.clear();
+    addMessage("You: " + text);
+
+    Div loading = new Div();
+    loading.setText("⏳ Обрабатывается...");
+    messages.add(loading);
+
+    new Thread(() -> {
+        try {
+            String response = webClient.post()
+                    .uri("/chat")
+                    .bodyValue(text)
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .block(); // ✅ ключевое отличие
+
+            getUI().ifPresent(ui -> ui.access(() -> {
+                messages.remove(loading);
+
+                Div botMsg = new Div();
+                messages.add(botMsg);
+
+                startTypingAnimation(botMsg, "Bot: " + response);
+            }));
+
+        } catch (Exception e) {
+            getUI().ifPresent(ui -> ui.access(() -> {
+                messages.remove(loading);
+                addMessage("Ошибка: " + e.getMessage());
+            }));
+        }
+    }).start();
+}
