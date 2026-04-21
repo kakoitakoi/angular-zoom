@@ -143,3 +143,51 @@ frontend/chartjs-init.js
 import Chart from 'https://cdn.jsdelivr.net/npm/chart.js';
 
 window.Chart = Chart;
+
+
+
+
+package com.example.views;
+
+import com.vaadin.flow.component.Tag;
+import com.vaadin.flow.component.dependency.JsModule;
+import com.vaadin.flow.component.orderedlayout.VerticalLayout;
+import com.vaadin.flow.router.Route;
+import com.vaadin.flow.component.Component;
+
+@Route("")
+@JsModule("./chartjs-init.js")
+public class ChartJsView extends VerticalLayout {
+
+    public ChartJsView() {
+        setSizeFull();
+
+        Component canvas = new Component() {
+            {
+                getElement().setTag("canvas");
+                getElement().setAttribute("width", "800");
+                getElement().setAttribute("height", "400");
+            }
+        };
+
+        add(canvas);
+
+        canvas.getElement().executeJs("""
+            const ctx = this.getContext('2d');
+
+            new window.Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: ['Янв', 'Фев', 'Мар', 'Апр', 'Май'],
+                    datasets: [{
+                        label: 'Продажи',
+                        data: [12, 19, 3, 5, 2]
+                    }]
+                },
+                options: {
+                    responsive: false
+                }
+            });
+        """);
+    }
+}
