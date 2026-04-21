@@ -90,3 +90,56 @@ ApexCharts lineChart = ApexChartsBuilder.get()
         .build())
     .withColors("#008FFB", "#FF4560")
     .build();
+
+
+
+
+
+
+
+package com.example.views;
+
+import com.vaadin.flow.component.dependency.JsModule;
+import com.vaadin.flow.component.html.Canvas;
+import com.vaadin.flow.component.orderedlayout.VerticalLayout;
+import com.vaadin.flow.router.Route;
+
+@Route("")
+@JsModule("./chartjs-init.js")
+public class ChartJsView extends VerticalLayout {
+
+    public ChartJsView() {
+        setSizeFull();
+
+        Canvas canvas = new Canvas();
+        canvas.setWidth("800px");
+        canvas.setHeight("400px");
+
+        add(canvas);
+
+        canvas.getElement().executeJs("""
+            const ctx = this.getContext('2d');
+
+            new window.Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: ['Янв', 'Фев', 'Мар', 'Апр', 'Май'],
+                    datasets: [{
+                        label: 'Продажи',
+                        data: [12, 19, 3, 5, 2],
+                        borderWidth: 1
+                    }]
+                },
+                options: {
+                    responsive: false
+                }
+            });
+        """);
+    }
+}
+
+frontend/chartjs-init.js
+
+import Chart from 'https://cdn.jsdelivr.net/npm/chart.js';
+
+window.Chart = Chart;
