@@ -1,0 +1,92 @@
+<repositories>
+    <!-- Vaadin Add-ons репозиторий — обязателен для этого аддона -->
+    <repository>
+        <id>vaadin-addons</id>
+        <url>https://maven.vaadin.com/vaadin-addons</url>
+    </repository>
+</repositories>
+
+<dependencies>
+    <!-- Ваша обычная vaadin зависимость -->
+    <dependency>
+        <groupId>com.vaadin</groupId>
+        <artifactId>vaadin</artifactId>
+    </dependency>
+
+    <!-- ApexCharts для Vaadin 25 -->
+    <dependency>
+        <groupId>com.github.appreciated</groupId>
+        <artifactId>apexcharts</artifactId>
+        <version>25.0.1</version>
+    </dependency>
+</dependencies>
+
+
+
+package com.example.views;
+
+import com.github.appreciated.apexcharts.ApexCharts;
+import com.github.appreciated.apexcharts.ApexChartsBuilder;
+import com.github.appreciated.apexcharts.config.builder.*;
+import com.github.appreciated.apexcharts.config.chart.builder.ZoomBuilder;
+import com.github.appreciated.apexcharts.config.chart.Type;
+import com.github.appreciated.apexcharts.helper.Series;
+import com.vaadin.flow.component.html.H2;
+import com.vaadin.flow.component.orderedlayout.VerticalLayout;
+import com.vaadin.flow.router.Route;
+
+@Route("")
+public class ChartView extends VerticalLayout {
+
+    public ChartView() {
+        setSizeFull();
+        setPadding(true);
+
+        add(new H2("ApexCharts — Bar Chart в Vaadin 25"));
+
+        ApexCharts barChart = ApexChartsBuilder.get()
+            .withChart(ChartBuilder.get()
+                .withType(Type.BAR)
+                .withZoom(ZoomBuilder.get()
+                    .withEnabled(false)
+                    .build())
+                .build())
+            .withSeries(new Series<>("Продажи",
+                44.0, 55.0, 57.0, 56.0, 61.0, 58.0, 63.0, 60.0, 66.0))
+            .withXaxis(XAxisBuilder.get()
+                .withCategories(
+                    "Янв", "Фев", "Мар", "Апр", "Май",
+                    "Июн", "Июл", "Авг", "Сен")
+                .build())
+            .withTitle(TitleSubtitleBuilder.get()
+                .withText("Продажи по месяцам")
+                .withAlign(com.github.appreciated.apexcharts.config.subtitle.Align.LEFT)
+                .build())
+            .withColors("#008FFB")
+            .build();
+
+        barChart.setWidth("800px");
+        barChart.setHeight("400px");
+
+        add(barChart);
+    }
+}
+
+
+
+ApexCharts lineChart = ApexChartsBuilder.get()
+    .withChart(ChartBuilder.get()
+        .withType(Type.LINE)
+        .build())
+    .withSeries(
+        new Series<>("Запросы", 10.0, 41.0, 35.0, 51.0, 49.0, 62.0, 69.0, 91.0, 148.0),
+        new Series<>("Ошибки",  2.0,  5.0,  3.0,  8.0,  4.0,  7.0,  6.0,  9.0,  12.0))
+    .withXaxis(XAxisBuilder.get()
+        .withCategories("Янв","Фев","Мар","Апр","Май","Июн","Июл","Авг","Сен")
+        .build())
+    .withTitle(TitleSubtitleBuilder.get()
+        .withText("Запросы и ошибки")
+        .withAlign(com.github.appreciated.apexcharts.config.subtitle.Align.LEFT)
+        .build())
+    .withColors("#008FFB", "#FF4560")
+    .build();
