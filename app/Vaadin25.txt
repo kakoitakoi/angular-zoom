@@ -191,3 +191,71 @@ public class ChartJsView extends VerticalLayout {
         """);
     }
 }
+
+
+
+
+
+frontend/chartjs-init.js
+
+
+
+import Chart from 'chart.js/auto';
+
+window.createChart = (canvas) => {
+    const ctx = canvas.getContext('2d');
+
+    // сохраняем инстанс (чтобы потом обновлять)
+    if (canvas._chart) {
+        canvas._chart.destroy();
+    }
+
+    canvas._chart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: ['Янв', 'Фев', 'Мар', 'Апр', 'Май'],
+            datasets: [{
+                label: 'Продажи',
+                data: [12, 19, 3, 5, 2]
+            }]
+        },
+        options: {
+            responsive: false
+        }
+    });
+};
+
+
+package com.example.views;
+
+import com.vaadin.flow.component.Tag;
+import com.vaadin.flow.component.dependency.JsModule;
+import com.vaadin.flow.component.orderedlayout.VerticalLayout;
+import com.vaadin.flow.router.Route;
+import com.vaadin.flow.component.Component;
+
+@Route("")
+@JsModule("./chartjs-init.js")
+public class MainView extends VerticalLayout {
+
+    public MainView() {
+        setSizeFull();
+
+        Component canvas = new Component() {
+            {
+                getElement().setTag("canvas");
+
+                // реальные размеры canvas
+                getElement().setAttribute("width", "800");
+                getElement().setAttribute("height", "400");
+
+                getElement().getStyle().set("display", "block");
+            }
+        };
+
+        add(canvas);
+
+        // вызов JS
+        canvas.getElement().executeJs("window.createChart(this)");
+    }
+}
