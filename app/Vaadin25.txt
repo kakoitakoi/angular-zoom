@@ -364,3 +364,34 @@ public class ChatView extends VerticalLayout {
         messageList.setItems(new ArrayList<>(messages));
     }
 }
+
+
+.loading-dots::after {
+  content: '';
+  display: inline-block;
+  width: 1em;
+  text-align: left;
+  animation: dots 1.5s steps(4, end) infinite;
+}
+
+@keyframes dots {
+  0%   { content: ''; }
+  25%  { content: '.'; }
+  50%  { content: '..'; }
+  75%  { content: '...'; }
+  100% { content: ''; }
+}
+
+
+.loading-pulse {
+  animation: pulse 1.2s infinite;
+}
+
+@keyframes pulse {
+  0%   { opacity: 0.4; }
+  50%  { opacity: 1; }
+  100% { opacity: 0.4; }
+}
+
+
+
