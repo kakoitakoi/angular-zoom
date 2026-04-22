@@ -259,3 +259,108 @@ public class MainView extends VerticalLayout {
         canvas.getElement().executeJs("window.createChart(this)");
     }
 }
+
+
+
+@Route("chat")
+@Push
+public class ChatView extends VerticalLayout {
+
+    private final MessageList messageList = new MessageList();
+    private final MessageInput messageInput = new MessageInput();
+    private final List<MessageListItem> messages = new CopyOnWriteArrayList<>();
+
+    public ChatView(ChatService chatService) {
+        setSizeFull();
+        setPadding(false);
+        setSpacing(false);
+
+        messageList.setSizeFull();
+        messageInput.setWidthFull();
+
+        add(messageList, messageInput);
+        expand(messageList);
+
+        // Инжектим CSS для спиннера один раз при инициализации
+        UI.getCurrent().getPage().executeJs(
+            "if (!document.getElementById('typing-style')) {" +
+            "  const style = document.createElement('style');" +
+            "  style.id = 'typing-style';" +
+            "  style.textContent = `" +
+            "    .typing-bubble {" +
+            "      display: flex; align-items: center; gap: 10px;" +
+            "      font-style: italic; opacity: 0.75;" +
+            "    }" +
+            "    .typing-spinner {" +
+            "      width: 16px; height: 16px;" +
+            "      border: 2px solid rgba(0,120,255,0.2);" +
+            "      border-top-color: #0078ff;" +
+            "      border-radius: 50%;" +
+            "      animation: spin 0.8s linear infinite;" +
+            "      flex-shrink: 0;" +
+            "    }" +
+            "    @keyframes spin {" +
+            "      to { transform: rotate(360deg); }" +
+            "    }" +
+            "  `;" +
+            "  document.head.appendChild(style);" +
+            "}"
+        );
+
+        messageInput.addSubmitListener(event -> {
+            String userText = event.getValue();
+            if (userText == null || userText.isBlank()) return;
+
+            // 1. Сообщение пользователя
+            addMessage(userText, "Вы", 1);
+
+            // 2. Typing indicator — пустой item как якорь
+            MessageListItem typingMsg = new MessageListItem("\u200B", Instant.now(), "Bot");
+            typingMsg.setUserColorIndex(2);
+            messages.add(typingMsg);
+            messageList.setItems(new ArrayList<>(messages));
+
+            // 3. Inject спиннера в последнее сообщение через JS
+            UI ui = UI.getCurrent();
+            ui.getPage().executeJs(
+                "setTimeout(() => {" +
+                "  const allMsgs = document.querySelectorAll('vaadin-message');" +
+                "  const last = allMsgs[allMsgs.length - 1];" +
+                "  if (!last) return;" +
+                "  const shadow = last.shadowRoot;" +
+                "  if (!shadow) return;" +
+                "  const content = shadow.querySelector('[part=\"message\"]') " +
+                "                  || shadow.querySelector('.message-content')" +
+                "                  || shadow.querySelector('div');" +
+                "  if (content) {" +
+                "    content.innerHTML = '<div class=\"typing-bubble\">" +
+                "      <div class=\"typing-spinner\"></div>" +
+                "      <span>Запрос обрабатывается...</span>" +
+                "    </div>';" +
+                "  }" +
+                "}, 50);"
+            );
+
+            messageInput.setEnabled(false);
+
+            // 4. Запрос к API в отдельном потоке
+            CompletableFuture.runAsync(() -> {
+                String response = chatService.ask(userText);
+
+                ui.access(() -> {
+                    // 5. Убираем typing indicator, добавляем ответ
+                    messages.remove(typingMsg);
+                    addMessage(response, "Bot", 2);
+                    messageInput.setEnabled(true);
+                });
+            });
+        });
+    }
+
+    private void addMessage(String text, String sender, int colorIndex) {
+        MessageListItem item = new MessageListItem(text, Instant.now(), sender);
+        item.setUserColorIndex(colorIndex);
+        messages.add(item);
+        messageList.setItems(new ArrayList<>(messages));
+    }
+}
