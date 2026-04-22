@@ -6449,3 +6449,140 @@ if __name__ == "__main__":
             print(f"WARN  : {warn}")
         print()
 
+
+
+
+
+
+
+
+import cx_Oracle
+import difflib
+import argparse
+from dataclasses import dataclass
+from typing import Optional
+
+# ─── Конфигурация подключения ─────────────────────────────────────────────────
+DB_USER     = "your_user"
+DB_PASSWORD = "your_password"
+DB_DSN      = "host:1521/service_name"
+
+# ─── Dataclass результата ─────────────────────────────────────────────────────
+@dataclass
+class TableMatch:
+    owner:      str
+    table_name: str
+    num_rows:   Optional[int]
+    search_type: str            # какой тип поиска сработал
+
+    def __str__(self):
+        rows = f"{self.num_rows:,}" if self.num_rows is not None else "N/A"
+        return (f"  {self.owner:<30} {self.table_name:<50} "
+                f"rows={rows:<12} [{self.search_type}]")
+
+
+# ─── ТИП 1: Точное совпадение по схеме и имени ───────────────────────────────
+def search_exact(cursor, owner: str, table_name: str) -> list[TableMatch]:
+    cursor.execute("""
+        SELECT owner, table_name, num_rows
+        FROM   dba_tables
+        WHERE  UPPER(owner)      = UPPER(:owner)
+          AND  UPPER(table_name) = UPPER(:table_name)
+    """, owner=owner, table_name=table_name)
+
+    return [
+        TableMatch(row[0], row[1], row[2], "1 — точное совпадение")
+        for row in cursor.fetchall()
+    ]
+
+
+# ─── ТИП 2: Точное совпадение по схеме, имя с префиксом stage$ ───────────────
+def search_exact_stage(cursor, owner: str, table_name: str) -> list[TableMatch]:
+    stage_name = f"STAGE${table_name.upper()}"
+
+    cursor.execute("""
+        SELECT owner, table_name, num_rows
+        FROM   dba_tables
+        WHERE  UPPER(owner)      = UPPER(:owner)
+          AND  UPPER(table_name) = :stage_name
+    """, owner=owner, stage_name=stage_name)
+
+    return [
+        TableMatch(row[0], row[1], row[2], "2 — точное совпадение + stage$")
+        for row in cursor.fetchall()
+    ]
+
+
+# ─── ТИП 3: LIKE по имени с префиксом stage$ (любая схема) ───────────────────
+def search_like_stage(cursor, table_name: str) -> list[TableMatch]:
+    pattern = f"%STAGE${table_name.upper()}%"
+
+    cursor.execute("""
+        SELECT owner, table_name, num_rows
+        FROM   dba_tables
+        WHERE  UPPER(table_name) LIKE :pattern
+        ORDER  BY owner, table_name
+    """, pattern=pattern)
+
+    return [
+        TableMatch(row[0], row[1], row[2], "3 — LIKE + stage$")
+        for row in cursor.fetchall()
+    ]
+
+
+# ─── Последовательный запуск ──────────────────────────────────────────────────
+def find_table(cursor, owner: str, table_name: str) -> list[TableMatch]:
+    steps = [
+        ("Тип 1 — точное совпадение",                  lambda: search_exact(cursor, owner, table_name)),
+        ("Тип 2 — точное совпадение + stage$",         lambda: search_exact_stage(cursor, owner, table_name)),
+        ("Тип 3 — LIKE по имени + stage$",             lambda: search_like_stage(cursor, table_name)),
+    ]
+
+    for label, search_fn in steps:
+        print(f"  → {label} ...", end=" ")
+        results = search_fn()
+        if results:
+            print(f"найдено {len(results)} шт.")
+            return results
+        print("не найдено, переходим дальше")
+
+    return []
+
+
+def print_results(results: list[TableMatch]):
+    if not results:
+        print("\n✗ Таблица не найдена ни одним из методов поиска.")
+        return
+    print(f"\n✓ Результат ({len(results)} шт.):")
+    print(f"  {'OWNER':<30} {'TABLE_NAME':<50} {'ROWS':<12} ТИП ПОИСКА")
+    print("  " + "-" * 110)
+    for m in results:
+        print(m)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Поиск таблицы в dba_tables — последовательный перебор типов"
+    )
+    parser.add_argument("owner",      help="Схема (owner)")
+    parser.add_argument("table_name", help="Предполагаемое имя таблицы")
+    args = parser.parse_args()
+
+    print(f"\nПодключаемся к {DB_DSN} ...")
+    connection = cx_Oracle.connect(DB_USER, DB_PASSWORD, DB_DSN)
+    cursor = connection.cursor()
+
+    try:
+        print(f"Ищем: owner={args.owner.upper()}, table={args.table_name.upper()}\n")
+        results = find_table(cursor, args.owner, args.table_name)
+        print_results(results)
+    finally:
+        cursor.close()
+        connection.close()
+        print("\nПодключение закрыто.")
+
+
+if __name__ == "__main__":
+    main()
+
+
