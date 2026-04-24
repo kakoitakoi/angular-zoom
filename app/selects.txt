@@ -247,4 +247,17 @@ WHERE LEFT(TRIM(json_extract(obj, '$.linked_rule_ids')), 1) != '['
 LIMIT 20;
 
 
+SELECT DISTINCT trim(val) AS unique_val
+FROM your_table
+LATERAL VIEW explode(
+    split(
+        regexp_replace(col, '[\\[\\]"\\s]', ''),
+        ','
+    )
+) t AS val
+WHERE trim(val) != ''
+ORDER BY 1;
+
+
+
 
