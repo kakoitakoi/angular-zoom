@@ -8151,3 +8151,769 @@ DUPLICATE KEY(structural_fp)
 DISTRIBUTED BY HASH(structural_fp) BUCKETS 4
 PROPERTIES ("replication_num" = "1");
 """
+
+
+
+
+
+
+
+
+
+
+
+
+"""
+SQL Query Identification Pipeline (Doris → Doris)
+===================================================
+Шаг 1 из пайплайна обработки SQL-логов StarRocks.
+Архитектура:
+┌─────────────────┐ LIMIT/OFFSET ┌──────────────────────┐
+│ sql_raw_logs │ ──── чанки ──────────▶ │ multiprocessing │
+│ (source) │ │ _process_batch() │
+└─────────────────┘ └──────────┬───────────┘
+│ структурный fp
+│ + все признаки
+▼
+┌──────────────────────┐
+│ буфер Stream Load │
+│ STREAM_LOAD_BATCH │
+└──────────┬───────────┘
+│
+┌─────────────┼──────────────┐
+▼ ▼ ▼
+sql_query_raw_fp sql_fingerprints sql_fp_errors
+(DUPLICATE KEY) (AGGREGATE KEY) (DUPLICATE KEY)
+все строки агрегация ошибки парсинга
+с fp в Doris
+Ключевые решения:
+- Агрегация (exec_count, raw_sql) вынесена в Doris через AGGREGATE KEY модель.
+Скрипт пишет каждую строку как есть — Doris сам суммирует счётчики при upsert.
+- OOM исключён: скрипт не держит весь датасет в памяти.
+Результаты воркеров буферизуются порциями STREAM_LOAD_BATCH и сразу сбрасываются.
+- total_exec_ms и avg_exec_ms удалены из пайплайна (требование #5).
+- semantic_key_and_meta возвращает все булевые признаки — они пишутся в таблицу (требование
+Таблицы Doris:
+sql_raw_logs — источник: сырые логи StarRocks
+sql_query_raw_fp — промежуточная: одна строка на каждый вызов из лога (с fp)
+sql_fingerprints — целевая: AGGREGATE KEY, агрегирует дубли по structural_fp
+sql_fp_errors — ошибки парсинга sqlglot
+Зависимости:
+pip install sqlglot pandas requests tqdm pymysql
+"""
+import json
+import re
+import hashlib
+import logging
+import multiprocessing as mp
+from dataclasses import dataclass, asdict, field
+from typing import Optional
+import pandas as pd
+import pymysql
+import pymysql.cursors
+import requests
+import sqlglot
+import sqlglot.expressions as exp
+from tqdm import tqdm
+# =============================================================================
+# КОНФИГУРАЦИЯ
+# =============================================================================
+DORIS_HOST = "doris-fe-host"
+DORIS_FE_PORT = 9030 # MySQL-протокол (FE Query Port)
+DORIS_HTTP_PORT = 8030 # HTTP-порт FE для Stream Load
+DORIS_USER = "root"
+DORIS_PASSWORD = ""
+DORIS_DB = "dwh_metadata"
+# -- Исходная таблица --
+SOURCE_TABLE = "sql_raw_logs"
+SOURCE_SQL_COL = "query_sql" # TEXT: текст SELECT-запроса
+SOURCE_MS_COL = "query_time_ms" # BIGINT: время выполнения (может быть NULL)
+# -- Целевые таблицы --
+# Промежуточная: одна строка на каждый исходный запрос, с рассчитанным fp
+SINK_RAW_FP = "sql_query_raw_fp"
+# Агрегированная: одна строка на уникальный structural_fp (AGGREGATE KEY в Doris)
+SINK_AGG = "sql_fingerprints"
+# Ошибки парсинга sqlglot
+SINK_ERRORS = "sql_fp_errors"
+# -- Параметры multiprocessing --
+DIALECT = "starrocks" BATCH_SIZE = 2_000 READ_CHUNK = 50_000 # диалект sqlglot для парсинга StarRocks SQL
+# строк на один воркер за один вызов
+# строк за один SELECT из source
+# None → mp.cpu_count(); можно явно задать, например 8
+NUM_WORKERS: Optional[int] = None
+# -- Stream Load --
+# Размер одного HTTP-запроса к Doris Stream Load (строк)
+# Слишком маленький → много транзакций; слишком большой → риск таймаута
+STREAM_LOAD_BATCH = 5_000
+STREAM_LOAD_TIMEOUT = 300 # секунд на один запрос Stream Load
+logging.basicConfig(
+level=logging.INFO,
+format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger(__name__)
+# =============================================================================
+# ДАТАКЛАССЫ
+# =============================================================================
+@dataclass
+class QueryFingerprint:
+"""
+Результат обработки одной строки из sql_raw_logs.
+Поля разделены на три группы:
+- Идентификаторы: structural_fp, semantic_key
+- Данные запроса: raw_sql, exec_count (всегда 1 на входе)
+- Признаки из semantic_key_and_meta: query_type, tables_used,
+has_agg, has_window, has_cte, has_subquery, join_count
+- Статус парсинга: parse_ok, error_msg
+- LLM-статус: llm_processed, llm_metadata_id
+"""
+# -- Идентификаторы --
+structural_fp : str # MD5 нормализованного AST (основной ключ)
+semantic_key : str # MD5(tables + признаки агрегации/окна/cte)
+# -- Данные запроса --
+raw_sql : str # оригинальный SQL без изменений
+exec_count : int = 1 # счётчик: всегда 1, агрегируется в Doris SUM
+# -- Признаки запроса (все пишутся в таблицу) --
+query_type : str = "UNKNOWN" # SIMPLE / AGG / WINDOW / JOIN_SIMPLE / JOIN_HEAVY /
+tables_used : str = "" # pipe-separated список таблиц: "t1|t2|t3"
+has_agg : bool = False # содержит агрегатные функции (SUM, COUNT, AVG, …)
+has_window : bool = False # содержит оконные функции (ROW_NUMBER, RANK, …)
+has_cte : bool = False # содержит WITH … AS (CTE)
+has_subquery : bool = False # содержит подзапросы (SELECT внутри SELECT)
+join_count : int = 0 # количество JOIN-ов
+# -- Статус парсинга --
+parse_ok : bool = True error_msg : str = "" # False → sqlglot не смог распарсить, использован reg
+# текст ошибки парсинга (первые 300 символов)
+# -- LLM-метаданные (заполняются на следующем шаге пайплайна) --
+llm_processed : bool = False
+llm_metadata_id : str = ""
+@dataclass
+class ParseError:
+"""
+Запись об ошибке парсинга — пишется в отдельную таблицу sql_fp_errors.
+Не смешивается с основным потоком, чтобы не засорять sql_fingerprints.
+"""
+structural_fp : str # fp через regex-fallback (ненадёжный, но хоть что-то)
+raw_sql : str # оригинальный SQL для ручного анализа
+error_msg : str # причина ошибки парсинга
+# =============================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# Все функции — top-level (не вложенные, не лямбды).
+# Требование multiprocessing: функции должны быть pickle-сериализуемы.
+# =============================================================================
+def _md5(s: str) -> str:
+"""MD5-хэш строки в hex. Используется как fingerprint и semantic_key."""
+return hashlib.md5(s.encode("utf-8")).hexdigest()
+def _strip_comments(sql: str) -> str:
+"""
+Удаляем все комментарии из SQL до любой дальнейшей обработки.
+Зачем отдельным шагом:
+- Комментарии могут содержать подсказки оптимизатора вида /*+ ... */
+которые sqlglot иногда не парсит корректно.
+- После удаления комментариев нормализация пробелов работает чище.
+Порядок важен: сначала многострочные (/*..*/), затем однострочные (--).
+"""
+# Многострочные комментарии: /* ... */ включая хинты /*+ ... */
+sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
+# Однострочные комментарии: -- до конца строки
+sql = re.sub(r"--[^\n]*", " ", sql)
+return sql
+def _collapse_whitespace(sql: str) -> str:
+"""
+Схлопываем все пробелы, табуляции и переносы строк в один пробел.
+Приводим к верхнему регистру для единообразия fingerprint.
+Зачем: два запроса идентичные по смыслу но с разным форматированием
+должны давать одинаковый fingerprint.
+"""
+return re.sub(r"\s+", " ", sql).strip().upper()
+def _regex_normalize(sql: str) -> str:
+"""
+Fallback-нормализация через regex — используется ТОЛЬКО когда sqlglot
+не смог распарсить SQL (parse_ok=False).
+Покрывает те же трансформации что и AST-нормализация, но грубее:
+- нет гарантии корректности для сложных вложенных конструкций
+- может давать коллизии для синтаксически разных запросов
+Порядок шагов важен (например, IN-схлопывание должно идти после замены литералов).
+"""
+# 1. Удаляем комментарии
+s = _strip_comments(sql)
+# 2. Строковые литералы → ?
+s = re.sub(r"'[^']*'", "?", s)
+# 3. Числовые литералы → ?
+s = re.sub(r"\b\d+(\.\d+)?\b", "?", s)
+# 4. IN (?, ?, ...) → IN (?) — любое количество плейсхолдеров
+s = re.sub(r"\bIN\s*\(\s*(?:\?\s*,\s*)*\?\s*\)", "IN (?)", s, flags=re.IGNORECASE)
+# 5. LIMIT ? [OFFSET ?] → удаляем
+s = re.sub(r"\bLIMIT\s+\?(?:\s+OFFSET\s+\?)?", "", s, flags=re.IGNORECASE)
+s = re.sub(r"\bOFFSET\s+\?", "", s, flags=re.IGNORECASE)
+# 6. ORDER BY (числовая позиция или плейсхолдер) → ORDER BY __ord__
+s = re.sub(r"\bORDER\s+BY\s+\?(?:\s+(?:ASC|DESC))?", "ORDER BY __ord__", s, flags=re.IGNO
+# 7. COUNT(?) / COUNT(1) → COUNT(*)
+s = re.sub(r"\bCOUNT\s*\(\s*(?:\?|1)\s*\)", "COUNT(*)", s, flags=re.IGNORECASE)
+# 8. Финальная нормализация пробелов
+return _collapse_whitespace(s)
+# =============================================================================
+# AST-ТРАНСФОРМАЦИИ ДЛЯ structural_fingerprint
+# Каждая функция — отдельная трансформация, применяется последовательно.
+# =============================================================================
+def _ast_normalize_in_lists(tree: exp.Expression) -> None:
+"""
+IN (1, 2, 3) → IN (?)
+IN ('a', 'b', 'c') → IN (?)
+Логика: длина IN-списка не является структурным признаком запроса.
+Запросы с разным количеством значений в IN — один паттерн.
+Исключение: IN (SELECT ...) — это подзапрос, его структура важна,
+не трогаем (node.args["query"] будет заполнен).
+"""
+for node in tree.find_all(exp.In):
+# query заполнен только для IN (SELECT ...), для IN (1,2,3) — None
+if not node.args.get("query"):
+node.set("expressions", [exp.Placeholder()])
+def _ast_normalize_limit_offset(tree: exp.Expression) -> None:
+"""
+Удаляем LIMIT и OFFSET из AST полностью.
+LIMIT 10 и LIMIT 100 — один структурный паттерн.
+LIMIT 10 OFFSET 20 — тоже один паттерн.
+Пагинация не является частью бизнес-логики запроса для Text2SQL.
+"""
+for node in list(tree.find_all(exp.Limit, exp.Offset)):
+node.pop()
+def _ast_normalize_order_by(tree: exp.Expression) -> None:
+"""
+ORDER BY 1 DESC → ORDER BY __ord__
+ORDER BY t.col → ORDER BY __ord__
+ORDER BY col ASC → ORDER BY __ord__
+Конкретное поле и направление сортировки — не структурный признак.
+Сохраняем лишь факт наличия ORDER BY в запросе.
+Заменяем все Ordered-узлы единым плейсхолдером __ord__.
+"""
+for order in tree.find_all(exp.Order):
+placeholder = exp.Column(
+this=exp.Identifier(this="__ord__", quoted=False)
+)
+order.set("expressions", [exp.Ordered(this=placeholder)])
+def _ast_normalize_count(tree: exp.Expression) -> None:
+"""
+COUNT(1) → COUNT(*)
+COUNT(id) → COUNT(*)
+COUNT(*) → COUNT(*) (уже нормализован)
+COUNT(1) и COUNT(*) семантически эквивалентны в большинстве контекстов.
+COUNT(col) отличается обработкой NULL, но для fingerprint это несущественно.
+"""
+for node in tree.find_all(exp.Count):
+arg = node.args.get("this")
+if arg and not isinstance(arg, exp.Star):
+node.set("this", exp.Star())
+def _ast_normalize_literals(tree: exp.Expression) -> None:
+"""
+Все оставшиеся литералы → ?
+Покрывает:
+- Скалярные условия: WHERE id = 5 → WHERE id = ?
+- BETWEEN: dt BETWEEN '2024-01-01' AND '2024-01-02' → dt BETWEEN ? AND ?
+(low и high в exp.Between — это Literal-узлы, заменяются автоматически)
+- LIKE: name LIKE 'foo%' → name LIKE ?
+- Строки в SELECT: SELECT 'const' → SELECT ?
+Важно: этот шаг идёт ПОСЛЕ _ast_normalize_in_lists, иначе IN-плейсхолдеры
+(уже Placeholder, не Literal) не будут затронуты повторно.
+"""
+for node in list(tree.walk()):
+if isinstance(node, exp.Literal):
+node.replace(exp.Placeholder())
+def _ast_normalize_column_qualifiers(tree: exp.Expression) -> None:
+"""
+t1.amount → amount
+u.user_id → user_id
+db.t.col → col
+После нормализации алиасов таблиц (→ __t__) квалификаторы становятся
+разными строками для одного паттерна: t1.col / u.col / users.col.
+Убираем table- и db-префиксы у всех Column-узлов.
+"""
+for node in tree.find_all(exp.Column):
+if node.args.get("table"):
+node.set("table", None)
+if node.args.get("db"):
+node.set("db", None)
+def _ast_normalize_table_aliases(tree: exp.Expression) -> None:
+"""
+FROM users u → FROM users __t__
+FROM orders AS ord → FROM orders __t__
+Имена алиасов — артефакт стиля разработчика, не структура запроса.
+Все TableAlias заменяем на __t__.
+"""
+for node in tree.find_all(exp.TableAlias):
+node.set("this", exp.Identifier(this="__t__", quoted=False))
+# =============================================================================
+# ОСНОВНЫЕ ФУНКЦИИ ИДЕНТИФИКАЦИИ
+# =============================================================================
+def structural_fingerprint(sql: str) -> tuple[str, bool, str]:
+"""
+Вычисляет структурный fingerprint SQL-запроса.
+Возвращает: (fingerprint_md5, parse_ok, error_msg)
+Fingerprint инвариантен к:
+- значениям литералов (WHERE id = 5 и WHERE id = 99 → одинаковый fp)
+- длине IN-списков (IN (1,2,3) и IN (1,2,3,4,5) → одинаковый fp)
+- значениям LIMIT/OFFSET (или их отсутствию)
+- конкретным полям и направлению ORDER BY
+- COUNT(1) vs COUNT(*) vs COUNT(col)
+- квалификаторам колонок (t1.col vs col)
+- именам алиасов таблиц (u vs usr vs users_alias)
+- комментариям и форматированию (пробелы, переносы)
+Порядок трансформаций критичен:
+1. Удаление комментариев 2. LIMIT/OFFSET 3. IN-списки 4. ORDER BY 5. COUNT 6. Литералы 7. Квалификаторы колонок 8. Алиасы таблиц — до парсинга, чтобы не мешали
+— удаляем до обработки литералов
+— схлопываем до обработки литералов
+— нормализуем до обработки литералов (числовые позиции)
+— до обработки литералов (COUNT(1) → COUNT(*))
+— всё оставшееся → ?
+— убираем table/db prefix
+— все → __t__
+Fallback: если sqlglot не смог распарсить — применяем _regex_normalize(),
+возвращаем parse_ok=False. Fingerprint менее надёжен, но не теряем запрос.
+"""
+try:
+# Шаг 0: удаляем комментарии и нормализуем пробелы ДО парсинга.
+# Это повышает шанс успешного парсинга и убирает шум из fingerprint.
+clean_sql = _collapse_whitespace(_strip_comments(sql))
+tree = sqlglot.parse_one(
+clean_sql,
+dialect=DIALECT,
+error_level=sqlglot.ErrorLevel.RAISE,
+)
+_ast_normalize_limit_offset(tree) # 2
+_ast_normalize_in_lists(tree) # 3
+_ast_normalize_order_by(tree) # 4
+_ast_normalize_count(tree) # 5
+_ast_normalize_literals(tree) # 6
+_ast_normalize_column_qualifiers(tree) # 7
+_ast_normalize_table_aliases(tree) # 8
+normalized = tree.sql(dialect=DIALECT)
+return _md5(normalized), True, ""
+except Exception as exc:
+# Fallback: парсер не справился (нестандартный синтаксис, StarRocks-специфика).
+# Используем regex-нормализацию — менее точно, но не теряем запрос.
+return _md5(_regex_normalize(sql)), False, str(exc)[:300]
+def semantic_key_and_meta(sql: str) -> dict:
+"""
+Извлекает семантические признаки запроса из AST.
+Возвращает dict с полями, которые пишутся в таблицу sql_fingerprints.
+semantic_key = MD5(sorted_tables | has_agg | has_window | has_cte)
+Используется для группировки "похожих по смыслу" запросов
+(одни таблицы + один тип агрегации → одна бизнес-область).
+query_type — приоритетная классификация:
+CTE > WINDOW > SUBQUERY > JOIN_HEAVY > AGG > JOIN_SIMPLE > SIMPLE
+Признаки:
+has_agg has_cte — есть хотя бы одна агрегатная функция (SUM, COUNT, AVG, MAX, MIN, ...)
+has_window — есть хотя бы одна оконная функция (ROW_NUMBER, RANK, LAG, ...)
+— есть WITH ... AS (...) конструкция
+has_subquery — есть подзапрос (SELECT внутри FROM/WHERE/SELECT)
+join_count — количество JOIN-ов (включая LEFT/RIGHT/INNER/CROSS)
+tables_used — отсортированный pipe-separated список таблиц
+Fallback при ошибке парсинга: пытаемся вытащить таблицы через regex,
+остальные признаки — False/0.
+"""
+try:
+clean_sql = _collapse_whitespace(_strip_comments(sql))
+tree = sqlglot.parse_one(
+clean_sql,
+dialect=DIALECT,
+error_level=sqlglot.ErrorLevel.RAISE,
+)
+# Список таблиц: исключаем CTE-псевдонимы (у них нет реального имени в schema)
+# и subquery-алиасы (exp.Table без db/catalog у которых нет схемы)
+tables = sorted({
+t.name.lower()
+for t in tree.find_all(exp.Table)
+if t.name # пропускаем безымянные подзапросы
+})
+# Булевые признаки
+has_agg = bool(list(tree.find_all(exp.AggFunc)))
+has_window = bool(list(tree.find_all(exp.Window)))
+has_cte = bool(list(tree.find_all(exp.With))) # WITH ... AS (CTE)
+has_subquery = bool(list(tree.find_all(exp.Subquery)))
+join_count = len(list(tree.find_all(exp.Join)))
+# semantic_key включает CTE как отдельный признак (требование #2)
+key = _md5(
+f"{tables}"
+f"|agg={has_agg}"
+f"|win={has_window}"
+f"|cte={has_cte}"
+)
+# Приоритетная классификация типа запроса
+# CTE стоит первым: запросы с WITH — отдельный важный класс для Text2SQL
+if has_cte: query_type = "CTE"
+elif has_window: query_type = "WINDOW"
+elif has_subquery: query_type = "SUBQUERY"
+elif join_count >= 3: query_type = "JOIN_HEAVY"
+elif has_agg: query_type = "AGG"
+elif join_count > 0: query_type = "JOIN_SIMPLE"
+else: query_type = "SIMPLE"
+return {
+"semantic_key" : key,
+"query_type" : query_type,
+"tables_used" : "|".join(tables),
+"has_agg" : has_agg,
+"has_window" : has_window,
+"has_cte" : has_cte,
+"has_subquery" : has_subquery,
+"join_count" : join_count,
+}
+except Exception:
+# Fallback: вытаскиваем таблицы через regex FROM/JOIN
+raw_tables = re.findall(
+r"(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_.]*)",
+sql, flags=re.IGNORECASE,
+)
+tables = sorted({t.lower().split(".")[-1] for t in raw_tables})
+return {
+"semantic_key" : _md5(f"{tables}|agg=?|win=?|cte=?"),
+"query_type" : "UNKNOWN",
+"tables_used" : "|".join(tables),
+"has_agg" : False,
+"has_window" : False,
+"has_cte" : False,
+"has_subquery" : False,
+"join_count" : 0,
+}
+# =============================================================================
+# ВОРКЕР MULTIPROCESSING
+# =============================================================================
+def _process_batch(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+"""
+Обрабатывает один батч строк из sql_raw_logs.
+Запускается в отдельном процессе через mp.Pool.
+Возвращает: (fingerprints, errors)
+fingerprints — список dict(QueryFingerprint) для записи в Doris
+errors — список dict(ParseError) для записи в sql_fp_errors
+Важно: функция НЕ должна держать соединения с БД — они не pickle-сериализуемы.
+Все IO (чтение/запись Doris) происходит только в главном процессе.
+"""
+fingerprints = []
+errors = []
+for row in rows:
+raw_sql = (row.get("sql") or "").strip()
+if not raw_sql:
+continue # пропускаем пустые строки
+# 1. Вычисляем structural fingerprint
+fp, parse_ok, error_msg = structural_fingerprint(raw_sql)
+# 2. Извлекаем семантические признаки
+meta = semantic_key_and_meta(raw_sql)
+if parse_ok:
+# Успешно распарсено — пишем в основной поток
+fingerprints.append(asdict(QueryFingerprint(
+structural_fp = fp,
+semantic_key = meta["semantic_key"],
+raw_sql = raw_sql,
+exec_count = 1, query_type = meta["query_type"],
+tables_used = meta["tables_used"],
+has_agg = meta["has_agg"],
+has_window = meta["has_window"],
+has_cte = meta["has_cte"],
+has_subquery = meta["has_subquery"],
+join_count = meta["join_count"],
+parse_ok = True,
+error_msg = "",
+llm_processed = False,
+llm_metadata_id= "",
+# всегда 1, Doris суммирует через SUM
+)))
+else:
+# Ошибка парсинга — пишем в отдельную таблицу ошибок
+# Запрос не попадает в sql_fingerprints, чтобы не засорять метаданные
+errors.append(asdict(ParseError(
+structural_fp = fp,
+raw_sql = raw_sql,
+error_msg = error_msg,
+)))
+return fingerprints, errors
+# =============================================================================
+# DORIS: ЧТЕНИЕ (pymysql)
+# =============================================================================
+def _doris_conn() -> pymysql.Connection:
+"""
+Создаёт новое соединение с Doris FE через MySQL-протокол.
+Вызывается в главном процессе при каждом обращении к БД.
+Не передаётся в воркеры — pymysql Connection не pickle-сериализуем.
+"""
+return pymysql.connect(
+host = DORIS_HOST,
+port = DORIS_FE_PORT,
+user = DORIS_USER,
+password = DORIS_PASSWORD,
+database = DORIS_DB,
+charset = "utf8mb4",
+connect_timeout = 30,
+)
+def read_source_count() -> int:
+"""Возвращает общее количество строк в исходной таблице."""
+with _doris_conn() as conn:
+with conn.cursor() as cur:
+cur.execute(f"SELECT COUNT(*) FROM {SOURCE_TABLE}")
+return cur.fetchone()[0]
+def read_source_chunk(offset: int, limit: int) -> list[dict]:
+"""
+Читает один чанк из исходной таблицы через LIMIT/OFFSET.
+ORDER BY обязателен для стабильной пагинации — без него Doris может
+возвращать разные строки при одном и том же OFFSET между запросами.
+Возвращает список dict: {sql, query_time_ms}
+"""
+query = f"""
+SELECT
+{SOURCE_SQL_COL} AS sql,
+{SOURCE_MS_COL} AS query_time_ms
+FROM {SOURCE_TABLE}
+ORDER BY {SOURCE_SQL_COL}
+LIMIT {limit} OFFSET {offset}
+"""
+with _doris_conn() as conn:
+with conn.cursor(pymysql.cursors.DictCursor) as cur:
+cur.execute(query)
+return list(cur.fetchall())
+# =============================================================================
+# DORIS: ЗАПИСЬ (Stream Load)
+# =============================================================================
+def _stream_load_batch(table: str, rows: list[dict]) -> int:
+"""
+Загружает один батч строк в Doris через Stream Load (JSON-формат).
+Возвращает количество загруженных строк.
+Stream Load выбран вместо INSERT потому что:
+- атомарная транзакция на батч
+- значительно выше throughput для bulk-загрузки
+- поддерживает AGGREGATE KEY модель корректно
+Для таблицы sql_fingerprints (AGGREGATE KEY):
+- exec_count: SUM — Doris суммирует при совпадении structural_fp
+- raw_sql: REPLACE — Doris берёт последнее значение
+- Остальные поля: REPLACE
+Параметры Stream Load:
+format=json + strip_outer_array=true → принимает JSON-массив
+max_filter_ratio=0.0 → любая ошибка строки = ошибка всего батча
+Expect: 100-continue → стандартный заголовок для PUT с телом
+"""
+if not rows:
+return 0
+url = (
+f"http://{DORIS_HOST}:{DORIS_HTTP_PORT}"
+f"/api/{DORIS_DB}/{table}/_stream_load"
+)
+headers = {
+"format" : "json",
+"strip_outer_array" : "true",
+"Expect" : "100-continue",
+"max_filter_ratio" : "0.0",
+"timeout" : str(STREAM_LOAD_TIMEOUT),
+}
+payload = json.dumps(rows, ensure_ascii=False).encode("utf-8")
+resp = requests.put(
+url,
+data = payload,
+headers = headers,
+auth = (DORIS_USER, DORIS_PASSWORD),
+timeout = STREAM_LOAD_TIMEOUT,
+)
+resp.raise_for_status()
+result = resp.json()
+status = result.get("Status", "")
+# "Publish Timeout" — данные загружены, но транзакция ещё не видна.
+# Это нормально для больших батчей, данные не теряются.
+if status not in ("Success", "Publish Timeout"):
+raise RuntimeError(
+f"Stream Load failed [{table}]: "
+f"{json.dumps(result, ensure_ascii=False)}"
+)
+loaded = result.get("NumberLoadedRows", 0)
+log.debug(
+f" [{table}] loaded={loaded}, "
+f"txn={result.get('TxnId', '?')}, status={status}"
+)
+return loaded
+def flush_buffer(
+table: str,
+buffer: list[dict],
+force: bool = False,
+) -> list[dict]:
+"""
+Сбрасывает буфер в Doris когда накоплено STREAM_LOAD_BATCH строк
+или при force=True (финальный сброс остатка).
+Паттерн использования:
+buffer = []
+for row in rows:
+buffer.append(row)
+buffer = flush_buffer(TABLE, buffer)
+buffer = flush_buffer(TABLE, buffer, force=True)
+Возвращает пустой список после сброса, исходный буфер если ещё не пора.
+"""
+if not force and len(buffer) < STREAM_LOAD_BATCH:
+return buffer # ещё не набрали — возвращаем как есть
+if buffer:
+_stream_load_batch(table, buffer)
+return [] # буфер очищен
+# =============================================================================
+# ОСНОВНОЙ ПАЙПЛАЙН
+# =============================================================================
+def run_identification(
+num_workers : Optional[int] = NUM_WORKERS,
+batch_size : int = BATCH_SIZE,
+) -> None:
+"""
+Основной пайплайн обработки SQL-логов.
+Шаги:
+1. Узнаём размер источника (COUNT(*))
+2. Читаем чанками READ_CHUNK строк через LIMIT/OFFSET
+3. Разбиваем на батчи BATCH_SIZE для воркеров
+4. Параллельная обработка через mp.Pool
+5. Результаты накапливаем в буферы и сбрасываем в Doris батчами:
+- fingerprints → sql_query_raw_fp (все строки, DUPLICATE KEY)
+- fingerprints → sql_fingerprints (AGGREGATE KEY — exec_count суммируется)
+- errors → sql_fp_errors
+6. Финальный принудительный сброс остатков буферов
+Потребление памяти: O(BATCH_SIZE * NUM_WORKERS + STREAM_LOAD_BATCH)
+Никаких DataFrame на весь датасет — OOM исключён.
+"""
+total_source = read_source_count()
+log.info(f"Строк в {SOURCE_TABLE}: {total_source:,}")
+workers = num_workers or mp.cpu_count()
+log.info(
+f"Конфигурация: "
+f"workers={workers}, batch_size={batch_size}, "
+f"read_chunk={READ_CHUNK}, stream_load_batch={STREAM_LOAD_BATCH}"
+)
+# Буферы для батчевого Stream Load.
+# Накапливаем строки и сбрасываем порциями STREAM_LOAD_BATCH.
+# Пиковое потребление памяти буфером: ~STREAM_LOAD_BATCH строк.
+buf_raw_fp : list[dict] = [] # → sql_query_raw_fp (все строки)
+buf_agg : list[dict] = [] # → sql_fingerprints (AGGREGATE KEY)
+buf_errors : list[dict] = [] # → sql_fp_errors
+# Счётчики для финальной статистики
+total_processed = 0
+total_errors = 0
+# Итерируем по исходной таблице чанками, чтобы не грузить всё в память
+offsets = range(0, total_source, READ_CHUNK)
+log.info("Читаем и обрабатываем запросы из Doris...")
+with mp.Pool(processes=num_workers) as pool:
+for offset in tqdm(offsets, desc="Чтение чанков", unit="chunk"):
+# 1. Читаем один чанк из Doris
+chunk_rows = read_source_chunk(offset, READ_CHUNK)
+if not chunk_rows:
+continue
+# 2. Разбиваем чанк на батчи для воркеров
+batches = [
+chunk_rows[i : i + batch_size]
+for i in range(0, len(chunk_rows), batch_size)
+]
+# 3. Параллельная обработка батчей внутри чанка.
+# imap_unordered: не ждём порядка результатов — выше throughput.
+for fp_list, err_list in pool.imap_unordered(_process_batch, batches):
+# 4. Раскладываем результаты по буферам и сбрасываем при заполнении
+for row in fp_list:
+buf_raw_fp.append(row)
+buf_agg.append(row)
+buf_raw_fp = flush_buffer(SINK_RAW_FP, buf_raw_fp)
+buf_agg = flush_buffer(SINK_AGG, buf_agg)
+for row in err_list:
+buf_errors.append(row)
+buf_errors = flush_buffer(SINK_ERRORS, buf_errors)
+total_processed += len(fp_list)
+total_errors += len(err_list)
+# 5. Принудительно сбрасываем остатки буферов (хвост < STREAM_LOAD_BATCH)
+log.info("Сбрасываем остатки буферов...")
+flush_buffer(SINK_RAW_FP, buf_raw_fp, force=True)
+flush_buffer(SINK_AGG, buf_agg, force=True)
+flush_buffer(SINK_ERRORS, buf_errors, force=True)
+log.info(
+f"Готово. "
+f"Обработано: {total_processed:,}, "
+f"ошибок парсинга: {total_errors:,}"
+)
+# =============================================================================
+# ТОЧКА ВХОДА
+# =============================================================================
+if __name__ == "__main__":
+run_identification()
+# =============================================================================
+# DDL Apache Doris
+# =============================================================================
+"""
+-- ==========================================================================
+-- 1. Исходная таблица сырых логов (адаптируй под свою реальную схему)
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS sql_raw_logs (
+id BIGINT NOT NULL COMMENT 'ID записи',
+query_sql TEXT NOT NULL COMMENT 'Текст SQL-запроса',
+query_time_ms BIGINT COMMENT 'Время выполнения в мс',
+query_user VARCHAR(128) COMMENT 'Пользователь',
+query_db VARCHAR(128) COMMENT 'База данных',
+query_date DATETIME COMMENT 'Дата и время запроса'
+)
+DUPLICATE KEY(id)
+DISTRIBUTED BY HASH(id) BUCKETS 16
+PROPERTIES ("replication_num" = "1");
+-- ==========================================================================
+-- 2. Промежуточная таблица: одна строка на каждый вызов из лога (с fp)
+-- -- DUPLICATE KEY — все строки сохраняются, дедупликация не происходит.
+Используется для аудита и отладки пайплайна.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS sql_query_raw_fp (
+structural_fp VARCHAR(32) NOT NULL COMMENT 'MD5 нормализованного AST',
+semantic_key VARCHAR(32) COMMENT 'MD5(tables+признаки)',
+raw_sql TEXT COMMENT 'Оригинальный SQL',
+exec_count INT DEFAULT 1 COMMENT 'Всегда 1 на этом уровне',
+query_type VARCHAR(32) COMMENT 'SIMPLE|AGG|WINDOW|JOIN_SIMPLE|JOIN_HEAVY
+tables_used VARCHAR(2000) COMMENT 'Pipe-separated список таблиц',
+has_agg BOOLEAN DEFAULT FALSE,
+has_window BOOLEAN DEFAULT FALSE,
+has_cte BOOLEAN DEFAULT FALSE,
+has_subquery BOOLEAN DEFAULT FALSE,
+join_count INT DEFAULT 0,
+parse_ok BOOLEAN DEFAULT TRUE,
+error_msg VARCHAR(512) DEFAULT '',
+llm_processed BOOLEAN DEFAULT FALSE,
+llm_metadata_id VARCHAR(64) DEFAULT ''
+)
+DUPLICATE KEY(structural_fp)
+DISTRIBUTED BY HASH(structural_fp) BUCKETS 16
+PROPERTIES ("replication_num" = "1");
+-- ==========================================================================
+-- 3. Агрегированная таблица: одна строка на уникальный structural_fp
+AGGREGATE KEY — Doris автоматически суммирует exec_count при upsert.
+Агрегация происходит в Doris, не в Python (решение OOM проблемы).
+-- -- --
+-- Правила агрегации:
+-- exec_count SUM — суммируем количество вхождений
+-- raw_sql REPLACE — берём последний встреченный пример запроса
+-- Остальные REPLACE — берём последнее значение
+--
+-- -- Примечание: avg_exec_ms и total_exec_ms удалены (требование #5).
+При необходимости можно добавить total_exec_ms BIGINT SUM.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS sql_fingerprints (
+structural_fp VARCHAR(32) NOT NULL COMMENT 'MD5 нормализованного AST — PK',
+semantic_key VARCHAR(32) REPLACE COMMENT 'MD5(tables+признаки)',
+raw_sql TEXT REPLACE COMMENT 'Репрезентативный пример запроса',
+exec_count INT SUM COMMENT 'Суммарное кол-во вхождений в логах',
+query_type VARCHAR(32) REPLACE COMMENT 'SIMPLE|AGG|WINDOW|JOIN_SIMPLE|JOIN_HEAVY
+tables_used VARCHAR(2000) REPLACE COMMENT 'Pipe-separated список таблиц',
+has_agg BOOLEAN REPLACE COMMENT 'Содержит агрегатные функции',
+has_window BOOLEAN REPLACE COMMENT 'Содержит оконные функции',
+has_cte BOOLEAN REPLACE COMMENT 'Содержит WITH ... AS (CTE)',
+has_subquery BOOLEAN REPLACE COMMENT 'Содержит подзапросы',
+join_count INT REPLACE COMMENT 'Количество JOIN-ов',
+parse_ok BOOLEAN REPLACE COMMENT 'Успешно ли распарсен sqlglot',
+error_msg VARCHAR(512) REPLACE COMMENT 'Ошибка парсинга (если есть)',
+llm_processed BOOLEAN REPLACE COMMENT 'Обработан ли LLM',
+llm_metadata_id VARCHAR(64) REPLACE COMMENT 'ID метаданных из LLM-пайплайна'
+)
+AGGREGATE KEY(structural_fp)
+DISTRIBUTED BY HASH(structural_fp) BUCKETS 8
+PROPERTIES ("replication_num" = "1");
+-- ==========================================================================
+-- 4. Таблица ошибок парсинга
+-- Запросы которые sqlglot не смог распарсить.
+-- DUPLICATE KEY — сохраняем все случаи для ручного анализа.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS sql_fp_errors (
+structural_fp VARCHAR(32) COMMENT 'fp через regex-fallback (ненадёжный)',
+raw_sql TEXT COMMENT 'Оригинальный SQL для анализа',
+error_msg VARCHAR(512) COMMENT 'Причина ошибки парсинга sqlglot'
+)
+DUPLICATE KEY(structural_fp)
+DISTRIBUTED BY HASH(structural_fp) BUCKETS 4
+PROPERTIES ("replication_num" = "1");
+"""
