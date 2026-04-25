@@ -7633,3 +7633,521 @@ DUPLICATE KEY(structural_fp)
 DISTRIBUTED BY HASH(structural_fp) BUCKETS 4
 PROPERTIES ("replication_num" = "1");
 """
+
+
+
+
+
+
+
+
+
+
+
+
+"""
+SQL Query Identification Pipeline  (Doris → Doris)
+===================================================
+Шаг 1 из пайплайна обработки SQL-логов StarRocks.
+
+Что делает скрипт:
+  - Читает сырые SQL-логи из таблицы Doris (sql_raw_logs) чанками через LIMIT/OFFSET
+  - Параллельно вычисляет structural_fingerprint и semantic_key (multiprocessing)
+  - Классифицирует запросы: WINDOW / SUBQUERY / JOIN_HEAVY / AGG / JOIN_SIMPLE / SIMPLE
+  - Агрегирует дубли: exec_count, avg_exec_ms, total_exec_ms
+  - Записывает результат в Doris через Stream Load:
+      · sql_fingerprints        — дедуплицированные паттерны (основная таблица)
+      · sql_fingerprint_errors  — запросы, которые не удалось распарсить
+  - Поддерживает инкрементальный режим: пропускает уже известные structural_fp
+
+DDL для Doris — в конце файла.
+
+Зависимости:
+  pip install sqlglot pandas requests tqdm pymysql
+"""
+
+import json
+import re
+import hashlib
+import logging
+import multiprocessing as mp
+from dataclasses import dataclass, asdict
+from typing import Optional
+
+import pandas as pd
+import pymysql
+import pymysql.cursors
+import requests
+import sqlglot
+import sqlglot.expressions as exp
+from tqdm import tqdm
+
+# ---------------------------------------------------------------------------
+# Конфигурация
+# ---------------------------------------------------------------------------
+
+DORIS_HOST      = "doris-fe-host"
+DORIS_FE_PORT   = 9030            # MySQL-протокол (FE)
+DORIS_HTTP_PORT = 8030            # Stream Load (FE HTTP)
+DORIS_USER      = "root"
+DORIS_PASSWORD  = ""
+DORIS_DB        = "dwh_metadata"
+
+# Исходная таблица
+SOURCE_TABLE   = "sql_raw_logs"
+SOURCE_SQL_COL = "query_sql"       # колонка с текстом запроса
+SOURCE_MS_COL  = "query_time_ms"   # время выполнения (может быть NULL)
+
+# Целевые таблицы
+SINK_TABLE     = "sql_fingerprints"
+SINK_ERR_TABLE = "sql_fingerprint_errors"
+
+# Параметры обработки
+DIALECT     = "starrocks"
+BATCH_SIZE  = 2_000      # строк на один воркер multiprocessing
+READ_CHUNK  = 50_000     # строк за один SELECT из Doris
+NUM_WORKERS: Optional[int] = None   # None → os.cpu_count()
+INCREMENTAL = True       # True — пропускаем fp, которые уже есть в SINK_TABLE
+
+# Stream Load
+STREAM_LOAD_TIMEOUT = 600    # секунд
+STREAM_LOAD_BATCH   = 5_000  # строк за один запрос
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Датакласс результата
+# ---------------------------------------------------------------------------
+
+@dataclass
+class IdentifiedQuery:
+    structural_fp  : str          # MD5 нормализованного AST — основной ключ
+    semantic_key   : str          # MD5(sorted_tables | has_agg | has_window)
+    raw_sql        : str          # оригинальный SQL (первый встреченный)
+    query_type     : str          # SIMPLE/AGG/WINDOW/JOIN_SIMPLE/JOIN_HEAVY/SUBQUERY/UNKNOWN
+    tables_used    : str          # pipe-separated: "t1|t2|t3"
+    exec_count     : int   = 1
+    total_exec_ms  : int   = 0
+    avg_exec_ms    : float = 0.0
+    parse_ok       : bool  = True
+    error_msg      : str   = ""
+    llm_processed  : bool  = False
+    llm_metadata_id: str   = ""
+
+
+# ---------------------------------------------------------------------------
+# Функции идентификации (top-level — обязательно для pickle в multiprocessing)
+# ---------------------------------------------------------------------------
+
+def _md5(s: str) -> str:
+    return hashlib.md5(s.encode("utf-8")).hexdigest()
+
+
+def _regex_normalize(sql: str) -> str:
+    """Fallback-нормализация без AST-парсера."""
+    s = re.sub(r"'[^']*'",      "?", sql)
+    s = re.sub(r"\b\d+(\.\d+)?\b", "?", s)
+    s = re.sub(r"--[^\n]*",     " ", s)
+    s = re.sub(r"/\*.*?\*/",    " ", s, flags=re.S)
+    s = re.sub(r"\s+",          " ", s).strip().upper()
+    return s
+
+
+def structural_fingerprint(sql: str) -> tuple[str, bool, str]:
+    """
+    Возвращает (fingerprint, parse_ok, error_msg).
+
+    Алгоритм:
+      1. Парсим AST через sqlglot (dialect=starrocks)
+      2. Заменяем все Literal-узлы → Placeholder (?)
+      3. Нормализуем алиасы таблиц → __t__
+      4. MD5 от итогового SQL
+
+    Fallback при ошибке: regex-нормализация, parse_ok=False.
+    """
+    try:
+        tree = sqlglot.parse_one(
+            sql, dialect=DIALECT, error_level=sqlglot.ErrorLevel.RAISE
+        )
+        for node in tree.walk():
+            if isinstance(node, exp.Literal):
+                node.replace(exp.Placeholder())
+        for node in tree.walk():
+            if isinstance(node, exp.TableAlias):
+                node.set("this", exp.Identifier(this="__t__"))
+        return _md5(tree.sql(dialect=DIALECT)), True, ""
+    except Exception as e:
+        return _md5(_regex_normalize(sql)), False, str(e)[:300]
+
+
+def semantic_key_and_meta(sql: str) -> tuple[str, str, list[str]]:
+    """
+    Возвращает (semantic_key, query_type, tables_list).
+    Приоритет типов: WINDOW > SUBQUERY > JOIN_HEAVY > AGG > JOIN_SIMPLE > SIMPLE
+    """
+    try:
+        tree = sqlglot.parse_one(
+            sql, dialect=DIALECT, error_level=sqlglot.ErrorLevel.RAISE
+        )
+        tables = sorted({
+            t.name.lower()
+            for t in tree.find_all(exp.Table)
+            if t.name
+        })
+        has_agg    = bool(list(tree.find_all(exp.AggFunc)))
+        has_window = bool(list(tree.find_all(exp.Window)))
+        has_sub    = bool(list(tree.find_all(exp.Subquery)))
+        join_count = len(list(tree.find_all(exp.Join)))
+
+        key = _md5(f"{tables}|agg={has_agg}|win={has_window}")
+
+        if has_window:        qtype = "WINDOW"
+        elif has_sub:         qtype = "SUBQUERY"
+        elif join_count >= 3: qtype = "JOIN_HEAVY"
+        elif has_agg:         qtype = "AGG"
+        elif join_count > 0:  qtype = "JOIN_SIMPLE"
+        else:                 qtype = "SIMPLE"
+
+        return key, qtype, tables
+
+    except Exception:
+        raw_tables = re.findall(
+            r"(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_.]*)",
+            sql, flags=re.IGNORECASE,
+        )
+        tables = sorted({t.lower().split(".")[-1] for t in raw_tables})
+        return _md5(f"{tables}|agg=?|win=?"), "UNKNOWN", tables
+
+
+# ---------------------------------------------------------------------------
+# Воркер multiprocessing
+# ---------------------------------------------------------------------------
+
+def _process_batch(rows: list[dict]) -> list[dict]:
+    """
+    Принимает список {sql, query_time_ms}.
+    Возвращает список dict(IdentifiedQuery).
+    Работает в отдельном процессе — не должен держать соединение с БД.
+    """
+    results = []
+    for row in rows:
+        sql     = (row.get("sql") or "").strip()
+        exec_ms = int(row.get("query_time_ms") or 0)
+        if not sql:
+            continue
+
+        fp, parse_ok, error_msg = structural_fingerprint(sql)
+        sk, qtype, tables       = semantic_key_and_meta(sql)
+
+        results.append(asdict(IdentifiedQuery(
+            structural_fp  = fp,
+            semantic_key   = sk,
+            raw_sql        = sql,
+            query_type     = qtype,
+            tables_used    = "|".join(tables),
+            exec_count     = 1,
+            total_exec_ms  = exec_ms,
+            avg_exec_ms    = float(exec_ms),
+            parse_ok       = parse_ok,
+            error_msg      = error_msg,
+        )))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Doris: чтение через pymysql
+# ---------------------------------------------------------------------------
+
+def _doris_conn() -> pymysql.Connection:
+    return pymysql.connect(
+        host            = DORIS_HOST,
+        port            = DORIS_FE_PORT,
+        user            = DORIS_USER,
+        password        = DORIS_PASSWORD,
+        database        = DORIS_DB,
+        charset         = "utf8mb4",
+        connect_timeout = 30,
+    )
+
+
+def read_source_count() -> int:
+    with _doris_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM {SOURCE_TABLE}")
+            return cur.fetchone()[0]
+
+
+def read_source_chunk(offset: int, limit: int) -> list[dict]:
+    """
+    Читаем один чанк из исходной таблицы.
+    ORDER BY гарантирует стабильность при OFFSET-пагинации.
+    """
+    sql = f"""
+        SELECT
+            {SOURCE_SQL_COL}  AS sql,
+            {SOURCE_MS_COL}   AS query_time_ms
+        FROM {SOURCE_TABLE}
+        ORDER BY {SOURCE_SQL_COL}
+        LIMIT {limit} OFFSET {offset}
+    """
+    with _doris_conn() as conn:
+        with conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute(sql)
+            return list(cur.fetchall())
+
+
+def load_existing_fingerprints() -> set[str]:
+    """
+    Инкрементальный режим: загружаем structural_fp уже записанных строк.
+    При большом SINK_TABLE можно заменить на временную таблицу + JOIN на стороне Doris.
+    """
+    with _doris_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT structural_fp FROM {SINK_TABLE}")
+            return {row[0] for row in cur.fetchall()}
+
+
+# ---------------------------------------------------------------------------
+# Doris: запись через Stream Load
+# ---------------------------------------------------------------------------
+
+def _stream_load(table: str, df: pd.DataFrame) -> None:
+    """
+    Загружает DataFrame в Doris через Stream Load (JSON).
+    Разбивает на батчи по STREAM_LOAD_BATCH строк.
+    SINK_TABLE использует UNIQUE KEY → повторная загрузка = upsert.
+    """
+    if df.empty:
+        return
+
+    url = (
+        f"http://{DORIS_HOST}:{DORIS_HTTP_PORT}"
+        f"/api/{DORIS_DB}/{table}/_stream_load"
+    )
+    headers = {
+        "format"            : "json",
+        "strip_outer_array" : "true",
+        "Expect"            : "100-continue",
+        "max_filter_ratio"  : "0.0",
+        "timeout"           : str(STREAM_LOAD_TIMEOUT),
+    }
+
+    total_loaded = 0
+    for start in range(0, len(df), STREAM_LOAD_BATCH):
+        chunk   = df.iloc[start : start + STREAM_LOAD_BATCH]
+        payload = chunk.to_json(orient="records", force_ascii=False)
+
+        resp = requests.put(
+            url,
+            data    = payload.encode("utf-8"),
+            headers = headers,
+            auth    = (DORIS_USER, DORIS_PASSWORD),
+            timeout = STREAM_LOAD_TIMEOUT,
+        )
+        resp.raise_for_status()
+
+        result = resp.json()
+        status = result.get("Status", "")
+        if status not in ("Success", "Publish Timeout"):
+            raise RuntimeError(
+                f"Stream Load failed [{table}]: "
+                f"{json.dumps(result, ensure_ascii=False)}"
+            )
+
+        loaded = result.get("NumberLoadedRows", 0)
+        total_loaded += loaded
+        log.info(
+            f"  [{table}] batch {start}–{start + len(chunk)}: "
+            f"loaded={loaded}, txn={result.get('TxnId', '?')}"
+        )
+
+    log.info(f"Stream Load [{table}] итого: {total_loaded:,} строк")
+
+
+# ---------------------------------------------------------------------------
+# Агрегация дублей
+# ---------------------------------------------------------------------------
+
+def aggregate_duplicates(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Схлопывает строки с одинаковым structural_fp.
+    Возвращает (deduplicated_df, parse_errors_df).
+    """
+    errors_df = df[~df["parse_ok"]].copy()
+    df_ok     = df[ df["parse_ok"]].copy()
+
+    agg = (
+        df_ok.groupby("structural_fp", sort=False)
+        .agg(
+            raw_sql       = ("raw_sql",       "first"),
+            semantic_key  = ("semantic_key",  "first"),
+            query_type    = ("query_type",    "first"),
+            tables_used   = ("tables_used",   "first"),
+            exec_count    = ("exec_count",    "sum"),
+            total_exec_ms = ("total_exec_ms", "sum"),
+        )
+        .reset_index()
+    )
+    agg["avg_exec_ms"]      = (agg["total_exec_ms"] / agg["exec_count"]).round(2)
+    agg["llm_processed"]    = False
+    agg["llm_metadata_id"]  = ""
+
+    return agg, errors_df
+
+
+# ---------------------------------------------------------------------------
+# Основной пайплайн
+# ---------------------------------------------------------------------------
+
+def run_identification(
+    num_workers : Optional[int] = NUM_WORKERS,
+    batch_size  : int           = BATCH_SIZE,
+    incremental : bool          = INCREMENTAL,
+) -> None:
+
+    # 1. Размер источника
+    total_source = read_source_count()
+    log.info(f"Строк в {SOURCE_TABLE}: {total_source:,}")
+
+    # 2. Загружаем известные fingerprints (инкрементальный режим)
+    existing_fps: set[str] = set()
+    if incremental:
+        log.info("Загружаем существующие fingerprints из Doris...")
+        existing_fps = load_existing_fingerprints()
+        log.info(f"Известных fingerprints: {len(existing_fps):,}")
+
+    # 3. Читаем источник чанками
+    all_rows: list[dict] = []
+    offsets = range(0, total_source, READ_CHUNK)
+
+    log.info("Читаем исходные запросы из Doris...")
+    for offset in tqdm(offsets, desc="Чтение из Doris", unit="chunk"):
+        all_rows.extend(read_source_chunk(offset, READ_CHUNK))
+
+    log.info(f"Загружено строк: {len(all_rows):,}")
+
+    # 4. Разбиваем на батчи для multiprocessing
+    batches = [
+        all_rows[i : i + batch_size]
+        for i in range(0, len(all_rows), batch_size)
+    ]
+    workers = num_workers or mp.cpu_count()
+    log.info(
+        f"Запускаем multiprocessing: "
+        f"{len(batches)} батчей × {batch_size} строк, {workers} воркеров"
+    )
+
+    # 5. Параллельная идентификация
+    raw_results: list[dict] = []
+    with mp.Pool(processes=num_workers) as pool:
+        for batch_result in tqdm(
+            pool.imap_unordered(_process_batch, batches),
+            total=len(batches),
+            desc="Идентификация",
+            unit="batch",
+        ):
+            raw_results.extend(batch_result)
+
+    log.info(f"Обработано записей: {len(raw_results):,}")
+
+    # 6. Агрегация дублей
+    log.info("Агрегируем дубли...")
+    df_raw           = pd.DataFrame(raw_results)
+    df_dedup, df_err = aggregate_duplicates(df_raw)
+
+    log.info(
+        f"Уникальных структур: {len(df_dedup):,} "
+        f"(сжатие {len(df_dedup) / max(len(all_rows), 1) * 100:.1f}%)  |  "
+        f"Ошибок парсинга: {len(df_err):,}"
+    )
+
+    # 7. Инкрементальная фильтрация
+    if incremental and existing_fps:
+        before   = len(df_dedup)
+        df_dedup = df_dedup[~df_dedup["structural_fp"].isin(existing_fps)]
+        log.info(
+            f"Инкрементальная фильтрация: "
+            f"{before - len(df_dedup):,} fp уже существуют, "
+            f"новых для записи: {len(df_dedup):,}"
+        )
+
+    # 8. Запись в Doris через Stream Load
+    if not df_dedup.empty:
+        log.info(f"Записываем {len(df_dedup):,} строк → {SINK_TABLE}...")
+        _stream_load(SINK_TABLE, df_dedup)
+    else:
+        log.info("Нет новых fingerprints для записи.")
+
+    if not df_err.empty:
+        log.info(f"Записываем {len(df_err):,} ошибок → {SINK_ERR_TABLE}...")
+        err_cols = [
+            "structural_fp", "raw_sql", "query_type",
+            "tables_used", "parse_ok", "error_msg",
+        ]
+        _stream_load(SINK_ERR_TABLE, df_err[err_cols])
+
+    log.info("Готово.")
+
+
+# ---------------------------------------------------------------------------
+# Точка входа
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    run_identification()
+
+
+# ---------------------------------------------------------------------------
+# DDL Apache Doris
+# ---------------------------------------------------------------------------
+"""
+-- Исходная таблица сырых логов (пример — адаптируй под свою схему)
+CREATE TABLE IF NOT EXISTS sql_raw_logs (
+    id             BIGINT       NOT NULL,
+    query_sql      TEXT         NOT NULL,
+    query_time_ms  BIGINT,
+    query_user     VARCHAR(128),
+    query_db       VARCHAR(128),
+    query_date     DATETIME
+)
+DUPLICATE KEY(id)
+DISTRIBUTED BY HASH(id) BUCKETS 16
+PROPERTIES ("replication_num" = "1");
+
+
+-- Основная таблица дедуплицированных паттернов
+CREATE TABLE IF NOT EXISTS sql_fingerprints (
+    structural_fp    VARCHAR(32)   NOT NULL  COMMENT 'MD5 нормализованного AST — основной ключ',
+    semantic_key     VARCHAR(32)             COMMENT 'MD5(tables+agg_type)',
+    raw_sql          TEXT                    COMMENT 'Репрезентативный пример запроса',
+    query_type       VARCHAR(32)             COMMENT 'SIMPLE|AGG|WINDOW|JOIN_SIMPLE|JOIN_HEAVY|SUBQUERY|UNKNOWN',
+    tables_used      VARCHAR(2000)           COMMENT 'Pipe-separated список таблиц',
+    exec_count       INT           DEFAULT 0 COMMENT 'Кол-во вхождений в логах',
+    total_exec_ms    BIGINT        DEFAULT 0,
+    avg_exec_ms      DOUBLE        DEFAULT 0,
+    llm_processed    BOOLEAN       DEFAULT FALSE,
+    llm_metadata_id  VARCHAR(64)   DEFAULT ''
+)
+UNIQUE KEY(structural_fp)         -- upsert при повторной загрузке
+DISTRIBUTED BY HASH(structural_fp) BUCKETS 8
+PROPERTIES ("replication_num" = "1");
+
+
+-- Таблица запросов с ошибками парсинга
+CREATE TABLE IF NOT EXISTS sql_fingerprint_errors (
+    structural_fp  VARCHAR(32),
+    raw_sql        TEXT,
+    query_type     VARCHAR(32),
+    tables_used    VARCHAR(2000),
+    parse_ok       BOOLEAN,
+    error_msg      VARCHAR(512)
+)
+DUPLICATE KEY(structural_fp)
+DISTRIBUTED BY HASH(structural_fp) BUCKETS 4
+PROPERTIES ("replication_num" = "1");
+"""
