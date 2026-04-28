@@ -8917,3 +8917,485 @@ DUPLICATE KEY(structural_fp)
 DISTRIBUTED BY HASH(structural_fp) BUCKETS 4
 PROPERTIES ("replication_num" = "1");
 """
+
+
+
+
+
+
+
+
+"""
+Column Usage Extractor
+======================
+Извлекает из 10K отборных запросов (sql_fingerprints) список колонок
+с контекстом использования. Результат пишется в Doris.
+
+Логика:
+  - Для каждого запроса парсим AST и собираем колонки по клаузам
+  - SELECT *, EXCEPT — пропускаем (не даёт информации о конкретных колонках)
+  - Резолвим алиасы таблиц → реальные имена таблиц
+  - Считаем usage_score с весами по клаузам
+  - Агрегируем по (table, column) через Doris AGGREGATE KEY
+
+Зависимости: sqlglot, pymysql, requests
+"""
+
+import json
+import re
+import hashlib
+import logging
+import multiprocessing as mp
+from collections import defaultdict
+from dataclasses import dataclass, asdict
+from typing import Optional
+
+import pymysql
+import pymysql.cursors
+import requests
+import sqlglot
+import sqlglot.expressions as exp
+
+log = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+
+# =============================================================================
+# КОНФИГУРАЦИЯ
+# =============================================================================
+
+DORIS_HOST       = "doris-fe-host"
+DORIS_FE_PORT    = 9030
+DORIS_HTTP_PORT  = 8030
+DORIS_USER       = "root"
+DORIS_PASSWORD   = ""
+DORIS_DB         = "dwh_metadata"
+
+DIALECT          = "starrocks"
+
+# Источник — таблица с отборными fingerprints (из предыдущего шага)
+SOURCE_TABLE     = "sql_fingerprints"
+
+# Целевая таблица
+SINK_TABLE       = "sql_column_usage"
+
+BATCH_SIZE       = 500          # запросов на один воркер (AST-парсинг тяжелее)
+READ_CHUNK       = 5_000        # строк за один SELECT
+STREAM_LOAD_BATCH = 5_000
+STREAM_LOAD_TIMEOUT = 300
+
+# Веса клауз для usage_score.
+# WHERE/JOIN ON важнее для понимания семантики чем просто SELECT.
+CLAUSE_WEIGHTS: dict[str, float] = {
+    "SELECT"   : 1.0,
+    "WHERE"    : 2.0,
+    "JOIN"     : 2.5,   # колонки в условии JOIN — ключевые связи таблиц
+    "GROUP_BY" : 1.5,
+    "HAVING"   : 1.5,
+    "ORDER_BY" : 0.5,   # наименее информативны для Text2SQL
+}
+
+
+# =============================================================================
+# ДАТАКЛАСС
+# =============================================================================
+
+@dataclass
+class ColumnUsage:
+    """
+    Одна запись об использовании колонки.
+    Несколько записей для одной (table, column) пары агрегируются в Doris SUM.
+    """
+    table_name      : str           # имя таблицы (из AST, может быть с алиасом если не резолвится)
+    column_name     : str           # имя колонки (без квалификатора)
+    structural_fp   : str           # fingerprint запроса-источника
+
+    # Счётчики по клаузам — суммируются в Doris
+    cnt_select      : int = 0       # встречается в SELECT list
+    cnt_where       : int = 0       # встречается в WHERE
+    cnt_join        : int = 0       # встречается в JOIN ON
+    cnt_group_by    : int = 0       # встречается в GROUP BY
+    cnt_having      : int = 0       # встречается в HAVING
+    cnt_order_by    : int = 0       # встречается в ORDER BY
+
+    # Взвешенный score — суммируется в Doris
+    usage_score     : float = 0.0
+
+    # Тип запроса-источника — для аналитики (REPLACE в Doris)
+    query_type      : str = ""
+
+
+# =============================================================================
+# РЕЗОЛВЕР АЛИАСОВ
+# =============================================================================
+
+def _build_alias_map(tree: exp.Expression) -> dict[str, str]:
+    """
+    Строит маппинг: alias → real_table_name.
+
+    Примеры:
+      FROM users u         → {"u": "users"}
+      FROM orders AS ord   → {"ord": "orders"}
+      JOIN payments p ON … → {"p": "payments"}
+
+    Используется чтобы t1.amount → (users, amount) а не (t1, amount).
+
+    Ограничение: subquery-алиасы (FROM (SELECT ...) sub) не имеют
+    реального имени таблицы — пропускаем их.
+    """
+    alias_map: dict[str, str] = {}
+
+    for table_node in tree.find_all(exp.Table):
+        table_name = table_node.name
+        alias_node = table_node.args.get("alias")
+
+        if table_name and alias_node:
+            alias = alias_node.name
+            if alias:
+                alias_map[alias.lower()] = table_name.lower()
+
+        # Также добавляем само имя таблицы как ключ (без алиаса)
+        if table_name:
+            alias_map[table_name.lower()] = table_name.lower()
+
+    return alias_map
+
+
+def _resolve_table(qualifier: Optional[str], alias_map: dict[str, str]) -> Optional[str]:
+    """
+    Резолвит квалификатор колонки в реальное имя таблицы.
+    Возвращает None если резолвинг невозможен (подзапрос, CTE и т.д.).
+    """
+    if not qualifier:
+        return None
+    return alias_map.get(qualifier.lower())
+
+
+# =============================================================================
+# ИЗВЛЕЧЕНИЕ КОЛОНОК ПО КЛАУЗАМ
+# =============================================================================
+
+def _collect_columns_from_scope(
+    nodes: list[exp.Expression],
+    clause: str,
+    alias_map: dict[str, str],
+    result: dict[tuple[str, str], dict],
+    structural_fp: str,
+    query_type: str,
+) -> None:
+    """
+    Обходит список AST-узлов одной клаузы и собирает колонки.
+
+    result — словарь (table, column) → счётчики, изменяется in-place.
+
+    Пропускаем:
+      - exp.Star         — SELECT * не даёт информации о конкретных колонках
+      - exp.Placeholder  — нормализованные литералы
+      - колонки без резолвируемой таблицы при наличии нескольких таблиц
+        (неоднозначность: непонятно к какой таблице относится)
+    """
+    weight = CLAUSE_WEIGHTS.get(clause, 1.0)
+
+    for node in nodes:
+        # Рекурсивно ищем все Column-узлы внутри переданных узлов
+        for col_node in node.find_all(exp.Column):
+
+            # Пропускаем Star внутри Column (SELECT t.*)
+            if col_node.find(exp.Star):
+                continue
+
+            col_name  = col_node.name
+            qualifier = col_node.table  # имя или алиас таблицы (может быть пустым)
+
+            if not col_name:
+                continue
+
+            # Резолвим таблицу
+            table_name = _resolve_table(qualifier, alias_map) if qualifier else None
+
+            # Если квалификатора нет и таблица одна — присваиваем
+            if not table_name and len(alias_map) == 1:
+                table_name = next(iter(alias_map.values()))
+
+            # Если таблица не резолвится — записываем с маркером __unknown__
+            # чтобы не терять колонку полностью
+            if not table_name:
+                table_name = "__unknown__"
+
+            key = (table_name, col_name.lower())
+
+            if key not in result:
+                result[key] = {
+                    "table_name"   : table_name,
+                    "column_name"  : col_name.lower(),
+                    "structural_fp": structural_fp,
+                    "cnt_select"   : 0,
+                    "cnt_where"    : 0,
+                    "cnt_join"     : 0,
+                    "cnt_group_by" : 0,
+                    "cnt_having"   : 0,
+                    "cnt_order_by" : 0,
+                    "usage_score"  : 0.0,
+                    "query_type"   : query_type,
+                }
+
+            # Инкрементируем нужный счётчик
+            cnt_key = f"cnt_{clause.lower()}"
+            if cnt_key in result[key]:
+                result[key][cnt_key] += 1
+
+            result[key]["usage_score"] += weight
+
+
+def extract_column_usage(
+    raw_sql: str,
+    structural_fp: str,
+    query_type: str,
+) -> list[dict]:
+    """
+    Главная функция извлечения колонок из одного SQL-запроса.
+    Возвращает список dict(ColumnUsage) — по одному на уникальную (table, column).
+
+    Разбивает запрос на клаузы и обрабатывает каждую отдельно:
+      SELECT list → cnt_select
+      WHERE       → cnt_where
+      JOIN ON     → cnt_join
+      GROUP BY    → cnt_group_by
+      HAVING      → cnt_having
+      ORDER BY    → cnt_order_by
+    """
+    try:
+        tree = sqlglot.parse_one(raw_sql, dialect=DIALECT,
+                                 error_level=sqlglot.ErrorLevel.RAISE)
+    except Exception as e:
+        log.debug(f"Не удалось распарсить запрос: {e}")
+        return []
+
+    alias_map = _build_alias_map(tree)
+    result: dict[tuple[str, str], dict] = {}
+
+    # -- SELECT list --
+    # Берём только верхний уровень Select.expressions, не уходя в подзапросы
+    for select in tree.find_all(exp.Select):
+        select_exprs = select.args.get("expressions", [])
+        # Пропускаем SELECT * полностью
+        if any(isinstance(e, exp.Star) for e in select_exprs):
+            continue
+        _collect_columns_from_scope(
+            select_exprs, "SELECT", alias_map, result, structural_fp, query_type
+        )
+
+    # -- WHERE --
+    for where in tree.find_all(exp.Where):
+        _collect_columns_from_scope(
+            [where], "WHERE", alias_map, result, structural_fp, query_type
+        )
+
+    # -- JOIN ON / USING --
+    for join in tree.find_all(exp.Join):
+        on_expr = join.args.get("on")
+        using   = join.args.get("using", [])
+        scope   = ([on_expr] if on_expr else []) + list(using)
+        if scope:
+            _collect_columns_from_scope(
+                scope, "JOIN", alias_map, result, structural_fp, query_type
+            )
+
+    # -- GROUP BY --
+    for group in tree.find_all(exp.Group):
+        _collect_columns_from_scope(
+            group.args.get("expressions", []),
+            "GROUP_BY", alias_map, result, structural_fp, query_type,
+        )
+
+    # -- HAVING --
+    for having in tree.find_all(exp.Having):
+        _collect_columns_from_scope(
+            [having], "HAVING", alias_map, result, structural_fp, query_type
+        )
+
+    # -- ORDER BY --
+    for order in tree.find_all(exp.Order):
+        _collect_columns_from_scope(
+            order.args.get("expressions", []),
+            "ORDER_BY", alias_map, result, structural_fp, query_type,
+        )
+
+    return list(result.values())
+
+
+# =============================================================================
+# ВОРКЕР MULTIPROCESSING
+# =============================================================================
+
+def _process_batch(rows: list[dict]) -> list[dict]:
+    """
+    Обрабатывает батч запросов из sql_fingerprints.
+    Возвращает flat-список dict(ColumnUsage) для всех запросов батча.
+    """
+    all_columns = []
+    for row in rows:
+        raw_sql       = (row.get("raw_sql") or "").strip()
+        structural_fp = row.get("structural_fp", "")
+        query_type    = row.get("query_type", "UNKNOWN")
+
+        if not raw_sql:
+            continue
+
+        cols = extract_column_usage(raw_sql, structural_fp, query_type)
+        all_columns.extend(cols)
+
+    return all_columns
+
+
+# =============================================================================
+# DORIS I/O
+# =============================================================================
+
+def _doris_conn() -> pymysql.Connection:
+    return pymysql.connect(
+        host=DORIS_HOST, port=DORIS_FE_PORT,
+        user=DORIS_USER, password=DORIS_PASSWORD,
+        database=DORIS_DB, charset="utf8mb4", connect_timeout=30,
+    )
+
+
+def read_fingerprints_chunk(offset: int, limit: int) -> list[dict]:
+    """Читает чанк из sql_fingerprints."""
+    sql = f"""
+        SELECT structural_fp, raw_sql, query_type
+        FROM   {SOURCE_TABLE}
+        WHERE  parse_ok = TRUE          -- только успешно распарсенные
+        ORDER  BY structural_fp
+        LIMIT  {limit} OFFSET {offset}
+    """
+    with _doris_conn() as conn:
+        with conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute(sql)
+            return list(cur.fetchall())
+
+
+def read_total_count() -> int:
+    with _doris_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM {SOURCE_TABLE} WHERE parse_ok = TRUE")
+            return cur.fetchone()[0]
+
+
+def _stream_load_batch(rows: list[dict]) -> None:
+    if not rows:
+        return
+    url = f"http://{DORIS_HOST}:{DORIS_HTTP_PORT}/api/{DORIS_DB}/{SINK_TABLE}/_stream_load"
+    headers = {
+        "format": "json", "strip_outer_array": "true",
+        "Expect": "100-continue", "max_filter_ratio": "0.0",
+        "timeout": str(STREAM_LOAD_TIMEOUT),
+    }
+    resp = requests.put(
+        url,
+        data    = json.dumps(rows, ensure_ascii=False).encode("utf-8"),
+        headers = headers,
+        auth    = (DORIS_USER, DORIS_PASSWORD),
+        timeout = STREAM_LOAD_TIMEOUT,
+    )
+    resp.raise_for_status()
+    result = resp.json()
+    if result.get("Status") not in ("Success", "Publish Timeout"):
+        raise RuntimeError(f"Stream Load failed: {result}")
+    log.debug(f"Stream Load: loaded={result.get('NumberLoadedRows')}, txn={result.get('TxnId')}")
+
+
+def flush_buffer(buffer: list[dict], force: bool = False) -> list[dict]:
+    if not force and len(buffer) < STREAM_LOAD_BATCH:
+        return buffer
+    if buffer:
+        _stream_load_batch(buffer)
+    return []
+
+
+# =============================================================================
+# ОСНОВНОЙ ПАЙПЛАЙН
+# =============================================================================
+
+def run_column_extraction(num_workers: Optional[int] = None) -> None:
+    """
+    Пайплайн извлечения column usage из sql_fingerprints → sql_column_usage.
+
+    Потребление памяти: O(BATCH_SIZE * workers + STREAM_LOAD_BATCH).
+    Агрегация по (table_name, column_name): cnt_* и usage_score суммируются в Doris.
+    """
+    total = read_total_count()
+    workers = num_workers or mp.cpu_count()
+    log.info(f"Запросов для обработки: {total:,}, воркеров: {workers}")
+
+    buffer: list[dict] = []
+    total_cols = 0
+
+    with mp.Pool(processes=num_workers) as pool:
+        for offset in range(0, total, READ_CHUNK):
+            chunk = read_fingerprints_chunk(offset, READ_CHUNK)
+            if not chunk:
+                continue
+
+            batches = [chunk[i:i+BATCH_SIZE] for i in range(0, len(chunk), BATCH_SIZE)]
+
+            for col_list in pool.imap_unordered(_process_batch, batches):
+                for row in col_list:
+                    buffer.append(row)
+                    buffer = flush_buffer(buffer)
+                total_cols += len(col_list)
+
+    buffer = flush_buffer(buffer, force=True)
+    log.info(f"Готово. Записей column usage: {total_cols:,}")
+
+
+if __name__ == "__main__":
+    run_column_extraction()
+
+
+# =============================================================================
+# DDL
+# =============================================================================
+"""
+-- AGGREGATE KEY: cnt_* и usage_score суммируются при совпадении (table, column).
+-- structural_fp: REPLACE — оставляем один из источников для трейсабилити.
+-- query_type: REPLACE — информационно.
+
+CREATE TABLE IF NOT EXISTS sql_column_usage (
+    table_name      VARCHAR(256)  NOT NULL  COMMENT 'Имя таблицы',
+    column_name     VARCHAR(256)  NOT NULL  COMMENT 'Имя колонки',
+    structural_fp   VARCHAR(32)   REPLACE   COMMENT 'Один из fp-источников (для трейсабилити)',
+    cnt_select      INT           SUM       COMMENT 'Кол-во появлений в SELECT',
+    cnt_where       INT           SUM       COMMENT 'Кол-во появлений в WHERE',
+    cnt_join        INT           SUM       COMMENT 'Кол-во появлений в JOIN ON',
+    cnt_group_by    INT           SUM       COMMENT 'Кол-во появлений в GROUP BY',
+    cnt_having      INT           SUM       COMMENT 'Кол-во появлений в HAVING',
+    cnt_order_by    INT           SUM       COMMENT 'Кол-во появлений в ORDER BY',
+    usage_score     DOUBLE        SUM       COMMENT 'Взвешенный score (WHERE/JOIN весят больше)',
+    query_type      VARCHAR(32)   REPLACE   COMMENT 'Тип запроса-источника'
+)
+AGGREGATE KEY(table_name, column_name)
+DISTRIBUTED BY HASH(table_name) BUCKETS 8
+PROPERTIES ("replication_num" = "1");
+
+
+-- Вьюха для RAG: фильтруем колонки с низким usage_score
+-- Порог подбирается эмпирически под твой датасет
+CREATE VIEW sql_column_usage_filtered AS
+SELECT
+    table_name,
+    column_name,
+    cnt_select + cnt_where + cnt_join + cnt_group_by + cnt_having AS total_cnt,
+    usage_score,
+    -- Доля появлений в "важных" клаузах
+    ROUND((cnt_where + cnt_join + cnt_having) * 100.0
+          / NULLIF(cnt_select + cnt_where + cnt_join + cnt_group_by + cnt_having + cnt_order_by, 0), 1
+    ) AS filter_clause_pct
+FROM sql_column_usage
+WHERE usage_score >= 3.0   -- колонки с минимальным использованием
+ORDER BY table_name, usage_score DESC;
+"""
+
+
