@@ -10407,3 +10407,106 @@ ORDER BY table_full_name, usage_score DESC;
 “””
 
 
+
+
+
+
+
+BATCH_SIZE = 50  # было 200 — уменьшаем
+MAX_COLS_PER_BATCH = 10_000  # защита от аномально широких запросов
+
+def _process_batch(rows: list[dict]) -> list[dict]:
+    assert _worker_registry is not None
+
+    all_cols = []
+    for row in rows:
+        raw_sql       = (row.get("raw_sql") or "").strip()
+        structural_fp = row.get("structural_fp", "")
+        query_type    = row.get("query_type", "UNKNOWN")
+
+        if not raw_sql:
+            continue
+
+        try:
+            # Защита от зависания на одном запросе
+            cols = extract_column_usage(
+                raw_sql, structural_fp, query_type, _worker_registry
+            )
+            all_cols.extend(cols)
+
+            # Защита от аномально большого результата одного батча
+            if len(all_cols) > MAX_COLS_PER_BATCH:
+                log.warning(
+                    f"Батч превысил MAX_COLS_PER_BATCH={MAX_COLS_PER_BATCH}, "
+                    f"обрезаем остаток"
+                )
+                break
+
+        except Exception as e:
+            log.warning(f"Ошибка при обработке запроса {structural_fp}: {e}")
+            continue
+
+    return all_cols
+
+
+def run_column_extraction(num_workers: Optional[int] = NUM_WORKERS) -> None:
+
+    registry = SchemaRegistry()
+    registry.load_from_starrocks(...)
+    registry_dict = registry.to_dict()
+
+    total   = read_total_count()
+    workers = num_workers or mp.cpu_count()
+    buffer: list[dict] = []
+    total_cols = 0
+
+    with mp.Pool(
+        processes   = num_workers,
+        initializer = _worker_init,
+        initargs    = (registry_dict,),
+    ) as pool:
+
+        for offset in range(0, total, READ_CHUNK):
+            chunk = read_fingerprints_chunk(offset, READ_CHUNK)
+            if not chunk:
+                continue
+
+            batches = [
+                chunk[i : i + BATCH_SIZE]
+                for i in range(0, len(chunk), BATCH_SIZE)
+            ]
+
+            # async_results собираем отдельно чтобы контролировать таймаут
+            async_results = [
+                pool.apply_async(_process_batch, (batch,))
+                for batch in batches
+            ]
+
+            for ar in async_results:
+                try:
+                    # Таймаут на получение результата одного батча
+                    col_list = ar.get(timeout=120)
+                except mp.TimeoutError:
+                    log.warning("Батч не ответил за 120 сек — пропускаем")
+                    continue
+                except Exception as e:
+                    log.warning(f"Ошибка в батче: {e}")
+                    continue
+
+                for row in col_list:
+                    buffer.append(row)
+                    buffer = flush_buffer(buffer)
+
+                total_cols += len(col_list)
+
+            log.info(
+                f"Offset {offset}: обработано ~{min(offset+READ_CHUNK, total):,}/{total:,}, "
+                f"колонок: {total_cols:,}"
+            )
+
+    flush_buffer(buffer, force=True)
+    log.info(f"Готово. Всего записей: {total_cols:,}")
+
+
+
+
