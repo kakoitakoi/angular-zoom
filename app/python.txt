@@ -1,3 +1,7 @@
+
+
+
+
 import cx_Oracle
 
 # --- Подключение к Oracle ---
@@ -9397,5 +9401,1009 @@ FROM sql_column_usage
 WHERE usage_score >= 3.0   -- колонки с минимальным использованием
 ORDER BY table_name, usage_score DESC;
 """
+
+
+
+
+
+
+
+
+
+
+
+
+# “””
+Column Usage Extractor  v2
+
+Извлекает из отборных SQL-запросов (sql_fingerprints в Doris) список колонок
+с контекстом использования. Использует метаданные StarRocks для валидации
+и точного резолвинга имён.
+
+Архитектура резолвинга:
+┌─────────────────────────────────────────────────────────────┐
+│  StarRocks information_schema  →  SchemaRegistry            │
+│  (db → table → set of columns)                              │
+└──────────────────────────┬──────────────────────────────────┘
+│ validate + resolve
+┌──────────────────────────▼──────────────────────────────────┐
+│  SQL AST  →  ScopeTree                                      │
+│    каждый подзапрос/CTE → свой Scope с изолированным        │
+│    namespace алиасов (alias → QualifiedTable)               │
+└──────────────────────────┬──────────────────────────────────┘
+│ (table, column) пары
+┌──────────────────────────▼──────────────────────────────────┐
+│  ColumnUsage records  →  Doris AGGREGATE KEY                │
+└─────────────────────────────────────────────────────────────┘
+
+Ключевые решения:
+
+- Scope-дерево строится вручную обходом AST (не через sqlglot.optimizer,
+  который требует полной схемы для работы). Каждый SELECT / CTE / подзапрос
+  создаёт новый Scope с унаследованными алиасами из родителя.
+- Колонки без квалификатора резолвятся через метаданные:
+  · ровно 1 таблица в скоупе содержит такую колонку → резолвим
+  · несколько таблиц содержат → ambiguous, пишем все варианты
+  · ни одна не содержит → unresolved
+- Имена таблиц на выходе: db.table_name (из метаданных, оригинальный регистр)
+- Имена колонок на выходе: UPPER (требование #9)
+- Кавычки снимаются при нормализации для сравнения
+
+Зависимости:
+pip install sqlglot pymysql requests
+“””
+
+from **future** import annotations
+
+import json
+import logging
+import multiprocessing as mp
+import re
+from collections import defaultdict
+from dataclasses import dataclass, asdict, field
+from typing import Optional
+
+import pymysql
+import pymysql.cursors
+import requests
+import sqlglot
+import sqlglot.expressions as exp
+
+log = logging.getLogger(**name**)
+logging.basicConfig(
+level=logging.INFO,
+format=”%(asctime)s [%(levelname)s] %(message)s”,
+)
+
+# =============================================================================
+
+# КОНФИГУРАЦИЯ
+
+# =============================================================================
+
+# – Doris (хранит fingerprints и принимает результаты) –
+
+DORIS_HOST        = “doris-fe-host”
+DORIS_FE_PORT     = 9030
+DORIS_HTTP_PORT   = 8030
+DORIS_USER        = “root”
+DORIS_PASSWORD    = “”
+DORIS_DB          = “dwh_metadata”
+
+# – StarRocks (источник метаданных схемы) –
+
+SR_HOST           = “starrocks-fe-host”
+SR_PORT           = 9030
+SR_USER           = “root”
+SR_PASSWORD       = “”
+
+# Базы данных StarRocks для загрузки метаданных (список)
+
+# Если пусто — загружаем все доступные пользователю базы
+
+SR_DATABASES: list[str] = []
+
+# – Таблицы –
+
+SOURCE_TABLE      = “sql_fingerprints”   # источник запросов
+SINK_TABLE        = “sql_column_usage”   # результат
+
+# – Параметры обработки –
+
+DIALECT           = “starrocks”
+BATCH_SIZE        = 200          # запросов на воркер (меньше чем раньше — резолвинг тяжелее)
+READ_CHUNK        = 2_000
+NUM_WORKERS: Optional[int] = None
+
+# – Stream Load –
+
+STREAM_LOAD_BATCH   = 5_000
+STREAM_LOAD_TIMEOUT = 300
+
+# Веса клауз для usage_score
+
+CLAUSE_WEIGHTS: dict[str, float] = {
+“SELECT”   : 1.0,
+“WHERE”    : 2.0,
+“JOIN”     : 2.5,
+“GROUP_BY” : 1.5,
+“HAVING”   : 1.5,
+“ORDER_BY” : 0.5,
+}
+
+# =============================================================================
+
+# РЕЕСТР СХЕМЫ (загружается один раз из StarRocks)
+
+# =============================================================================
+
+@dataclass
+class QualifiedTable:
+“””
+Полностью квалифицированная таблица: db + table_name.
+db и table_name хранятся в оригинальном регистре (как в метаданных).
+Для сравнения используются lower-версии.
+“””
+db         : str   # имя базы данных
+table_name : str   # имя таблицы
+
+```
+@property
+def full_name(self) -> str:
+    """db.table_name — итоговый формат для записи в Doris."""
+    return f"{self.db}.{self.table_name}"
+
+@property
+def db_lower(self) -> str:
+    return self.db.lower()
+
+@property
+def table_lower(self) -> str:
+    return self.table_name.lower()
+```
+
+class SchemaRegistry:
+“””
+Кэш метаданных StarRocks: какие колонки есть в каких таблицах.
+
+```
+Структура:
+  _schema: dict[db_lower][table_lower] = set(column_lower)
+  _qtable: dict[(db_lower, table_lower)] = QualifiedTable  — оригинальные имена
+
+Используется для:
+  1. Резолвинга неквалифицированных колонок (в каких таблицах есть эта колонка?)
+  2. Валидации (таблица и колонка существуют в реальной схеме?)
+  3. Получения полного имени таблицы db.table_name
+"""
+
+def __init__(self) -> None:
+    # db_lower → table_lower → frozenset(column_lower)
+    self._schema: dict[str, dict[str, frozenset[str]]] = {}
+    # (db_lower, table_lower) → QualifiedTable (оригинальные имена)
+    self._qtable: dict[tuple[str, str], QualifiedTable] = {}
+
+def load_from_starrocks(
+    self,
+    host: str,
+    port: int,
+    user: str,
+    password: str,
+    databases: list[str],
+) -> None:
+    """
+    Загружает метаданные из information_schema.columns StarRocks.
+
+    Если databases пуст — загружает все доступные БД.
+    Исключает системные базы: information_schema, sys, _statistics_.
+    """
+    SYSTEM_DBS = {"information_schema", "sys", "_statistics_"}
+
+    conn = pymysql.connect(
+        host=host, port=port,
+        user=user, password=password,
+        charset="utf8mb4", connect_timeout=30,
+    )
+
+    try:
+        with conn.cursor(pymysql.cursors.DictCursor) as cur:
+
+            # Определяем список баз для загрузки
+            if databases:
+                db_list = [d for d in databases if d.lower() not in SYSTEM_DBS]
+            else:
+                cur.execute("SHOW DATABASES")
+                db_list = [
+                    row["Database"]
+                    for row in cur.fetchall()
+                    if row["Database"].lower() not in SYSTEM_DBS
+                ]
+
+            log.info(f"Загружаем метаданные для {len(db_list)} баз: {db_list[:5]}{'…' if len(db_list) > 5 else ''}")
+
+            for db in db_list:
+                # information_schema.columns доступна в каждой БД StarRocks
+                query = f"""
+                    SELECT
+                        TABLE_SCHEMA    AS db,
+                        TABLE_NAME      AS table_name,
+                        COLUMN_NAME     AS column_name
+                    FROM `{db}`.information_schema.columns
+                    WHERE TABLE_SCHEMA = '{db}'
+                    ORDER BY TABLE_NAME, ORDINAL_POSITION
+                """
+                try:
+                    cur.execute(query)
+                    rows = cur.fetchall()
+                except Exception as e:
+                    log.warning(f"Не удалось загрузить схему для БД '{db}': {e}")
+                    continue
+
+                for row in rows:
+                    db_orig    = row["db"]
+                    tbl_orig   = row["table_name"]
+                    col_lower  = row["column_name"].lower()
+
+                    db_lo  = db_orig.lower()
+                    tbl_lo = tbl_orig.lower()
+
+                    if db_lo not in self._schema:
+                        self._schema[db_lo] = {}
+
+                    if tbl_lo not in self._schema[db_lo]:
+                        self._schema[db_lo][tbl_lo] = set()
+                        self._qtable[(db_lo, tbl_lo)] = QualifiedTable(
+                            db=db_orig, table_name=tbl_orig
+                        )
+
+                    self._schema[db_lo][tbl_lo].add(col_lower)
+
+    finally:
+        conn.close()
+
+    # Замораживаем множества для thread-safety при передаче в воркеры
+    for db_lo in self._schema:
+        for tbl_lo in self._schema[db_lo]:
+            self._schema[db_lo][tbl_lo] = frozenset(self._schema[db_lo][tbl_lo])
+
+    total_tables = sum(len(v) for v in self._schema.values())
+    total_cols   = sum(
+        len(cols)
+        for tbls in self._schema.values()
+        for cols in tbls.values()
+    )
+    log.info(f"Схема загружена: {total_tables:,} таблиц, {total_cols:,} колонок")
+
+def get_qualified(
+    self,
+    table_lower: str,
+    db_lower: Optional[str] = None,
+) -> list[QualifiedTable]:
+    """
+    Ищет таблицу по имени (и опционально по БД).
+    Возвращает список совпадений (может быть >1 если таблица есть в нескольких БД).
+    """
+    if db_lower:
+        key = (db_lower, table_lower)
+        qt  = self._qtable.get(key)
+        return [qt] if qt else []
+
+    # Ищем во всех БД
+    results = []
+    for db_lo, tbls in self._schema.items():
+        if table_lower in tbls:
+            qt = self._qtable.get((db_lo, table_lower))
+            if qt:
+                results.append(qt)
+    return results
+
+def has_column(self, db_lower: str, table_lower: str, column_lower: str) -> bool:
+    """Проверяет существование колонки в таблице."""
+    return column_lower in self._schema.get(db_lower, {}).get(table_lower, frozenset())
+
+def find_tables_with_column(
+    self,
+    column_lower: str,
+    candidate_tables: list[QualifiedTable],
+) -> list[QualifiedTable]:
+    """
+    Из списка кандидатов (таблицы текущего скоупа) возвращает те,
+    в которых есть данная колонка.
+    Используется для резолвинга неквалифицированных колонок.
+    """
+    return [
+        qt for qt in candidate_tables
+        if self.has_column(qt.db_lower, qt.table_lower, column_lower)
+    ]
+
+def to_dict(self) -> dict:
+    """Сериализация для передачи в воркеры через multiprocessing."""
+    return {
+        "schema": {
+            db: {tbl: list(cols) for tbl, cols in tbls.items()}
+            for db, tbls in self._schema.items()
+        },
+        "qtable": {
+            f"{k[0]}\x00{k[1]}": {"db": v.db, "table_name": v.table_name}
+            for k, v in self._qtable.items()
+        },
+    }
+
+@classmethod
+def from_dict(cls, d: dict) -> "SchemaRegistry":
+    """Десериализация в воркере."""
+    reg = cls()
+    for db, tbls in d["schema"].items():
+        reg._schema[db] = {tbl: frozenset(cols) for tbl, cols in tbls.items()}
+    for k, v in d["qtable"].items():
+        db_lo, tbl_lo = k.split("\x00", 1)
+        reg._qtable[(db_lo, tbl_lo)] = QualifiedTable(
+            db=v["db"], table_name=v["table_name"]
+        )
+    return reg
+```
+
+# =============================================================================
+
+# SCOPE — ДЕРЕВО ПРОСТРАНСТВ ИМЁН
+
+# =============================================================================
+
+@dataclass
+class Scope:
+“””
+Пространство имён одного SELECT/подзапроса/CTE.
+
+```
+alias_map: alias_lower → список QualifiedTable
+  Список (не одна таблица!) потому что в UNION-запросах один алиас
+  может разрешаться в разные таблицы ветвей — сохраняем все варианты.
+
+cte_names: имена CTE определённых в этом скоупе (их колонки не резолвятся
+  через SchemaRegistry — CTE это виртуальные таблицы).
+
+parent: родительский Scope (для поиска алиасов из внешнего запроса).
+"""
+alias_map : dict[str, list[QualifiedTable]] = field(default_factory=dict)
+cte_names : set[str]                        = field(default_factory=set)
+parent    : Optional["Scope"]               = field(default=None, repr=False)
+
+def resolve_alias(self, alias_lower: str) -> list[QualifiedTable]:
+    """
+    Ищет алиас в текущем скоупе и рекурсивно в родительских.
+    Возвращает список QualifiedTable (пуст если алиас не найден).
+    """
+    if alias_lower in self.alias_map:
+        return self.alias_map[alias_lower]
+    if alias_lower in self.cte_names:
+        return []  # CTE — виртуальная таблица, не резолвим
+    if self.parent:
+        return self.parent.resolve_alias(alias_lower)
+    return []
+
+def all_real_tables(self) -> list[QualifiedTable]:
+    """Все реальные таблицы текущего скоупа (не CTE, не подзапросы)."""
+    result = []
+    seen   = set()
+    for tables in self.alias_map.values():
+        for qt in tables:
+            key = qt.full_name
+            if key not in seen:
+                result.append(qt)
+                seen.add(key)
+    return result
+
+def is_cte(self, name_lower: str) -> bool:
+    """Проверяет — является ли имя CTE-псевдонимом."""
+    if name_lower in self.cte_names:
+        return True
+    if self.parent:
+        return self.parent.is_cte(name_lower)
+    return False
+```
+
+def _norm_name(identifier: Optional[exp.Expression]) -> str:
+“””
+Нормализует имя из AST-узла:
+- снимает кавычки (backtick, двойные, одинарные)
+- приводит к lower для сравнения
+
+```
+Требование #7: учитываем возможные кавычки в запросе.
+"""
+if identifier is None:
+    return ""
+name = identifier.name if hasattr(identifier, "name") else str(identifier)
+# Снимаем кавычки вручную (sqlglot иногда оставляет их в .name)
+name = name.strip("`\"'")
+return name.lower()
+```
+
+def _build_scope_tree(
+tree: exp.Expression,
+registry: SchemaRegistry,
+parent_scope: Optional[Scope] = None,
+) -> Scope:
+“””
+Рекурсивно строит дерево Scope для всего AST.
+
+```
+Алгоритм:
+  1. Создаём новый Scope с parent_scope как родителем
+  2. Обрабатываем CTE (WITH ... AS): регистрируем имена как виртуальные
+  3. Обрабатываем FROM и JOIN: каждую реальную таблицу добавляем в alias_map
+     - Если таблица не найдена в registry → пропускаем (внешний источник, VIEW)
+     - Если у таблицы нет алиаса → используем имя таблицы как ключ
+  4. Подзапросы в FROM/JOIN обрабатываем рекурсивно с текущим scope как parent
+
+Важно: алиасы уникальны в рамках одного скоупа.
+В разных подзапросах один алиас 't' — это разные скоупы, они не конфликтуют.
+"""
+scope = Scope(parent=parent_scope)
+
+# -- Шаг 1: CTE (WITH ... AS) --
+# CTE должны быть зарегистрированы ДО обработки FROM/JOIN,
+# чтобы не пытаться резолвить CTE-псевдонимы через registry
+for with_node in tree.find_all(exp.With):
+    for cte in with_node.find_all(exp.CTE):
+        cte_alias = _norm_name(cte.args.get("alias"))
+        if cte_alias:
+            scope.cte_names.add(cte_alias)
+    # WITH обрабатываем только на верхнем уровне текущего дерева,
+    # не уходим в подзапросы — они рекурсивно обработаются ниже
+    break
+
+# -- Шаг 2: FROM и JOIN --
+# Ищем таблицы только на непосредственном уровне этого SELECT,
+# не погружаясь в подзапросы (они обрабатываются рекурсивно ниже)
+for from_node in tree.find_all(exp.From, exp.Join):
+    for child in from_node.walk():
+        node = child if isinstance(child, exp.Expression) else child
+
+        if isinstance(node, exp.Table):
+            _register_table_in_scope(node, scope, registry)
+
+        elif isinstance(node, exp.Subquery):
+            # Подзапрос: рекурсивно строим вложенный скоуп
+            # Алиас подзапроса регистрируем как CTE (виртуальная таблица)
+            sub_alias = _norm_name(node.args.get("alias"))
+            if sub_alias:
+                scope.cte_names.add(sub_alias)
+            _build_scope_tree(node, registry, parent_scope=scope)
+
+return scope
+```
+
+def _register_table_in_scope(
+table_node: exp.Table,
+scope: Scope,
+registry: SchemaRegistry,
+) -> None:
+“””
+Регистрирует одну таблицу (exp.Table) в скоупе.
+
+```
+Логика определения ключа (alias):
+  1. Если у таблицы есть алиас → используем alias как ключ
+  2. Если нет алиаса → используем имя таблицы как ключ
+
+Логика поиска таблицы в registry:
+  - Пробуем с db-квалификатором (db.table)
+  - Если не нашли — ищем по имени таблицы во всех БД
+  - CTE-псевдоним → пропускаем
+
+Требование #8: полное имя db.table_name берётся из registry (оригинальный регистр).
+"""
+raw_db    = _norm_name(table_node.args.get("db"))
+raw_table = _norm_name(table_node)   # .name таблицы
+
+if not raw_table:
+    return
+
+# Пропускаем если это CTE-псевдоним
+if scope.is_cte(raw_table):
+    return
+
+# Определяем alias-ключ
+alias_node = table_node.args.get("alias")
+alias_key  = _norm_name(alias_node) if alias_node else raw_table
+
+# Ищем таблицу в registry
+qualified_list = registry.get_qualified(raw_table, db_lower=raw_db if raw_db else None)
+
+if not qualified_list:
+    # Таблица не найдена в схеме — возможно это VIEW, временная таблица,
+    # или внешняя БД. Логируем и пропускаем.
+    log.debug(f"Таблица не найдена в схеме: '{raw_db}.{raw_table}' — пропускаем")
+    return
+
+# Добавляем в alias_map: один ключ может вести к нескольким таблицам
+# (например если одноимённая таблица есть в нескольких БД)
+if alias_key not in scope.alias_map:
+    scope.alias_map[alias_key] = []
+scope.alias_map[alias_key].extend(qualified_list)
+```
+
+# =============================================================================
+
+# ДАТАКЛАСС РЕЗУЛЬТАТА
+
+# =============================================================================
+
+@dataclass
+class ColumnUsage:
+“””
+Одна запись об использовании колонки.
+Агрегируется в Doris по (table_full_name, column_name) через SUM.
+
+```
+table_full_name: db.table_name (оригинальный регистр из метаданных)
+column_name:     UPPER (требование #9)
+"""
+table_full_name : str           # db.table_name
+column_name     : str           # UPPER
+structural_fp   : str           # fingerprint источника
+
+cnt_select      : int   = 0
+cnt_where       : int   = 0
+cnt_join        : int   = 0
+cnt_group_by    : int   = 0
+cnt_having      : int   = 0
+cnt_order_by    : int   = 0
+usage_score     : float = 0.0
+
+query_type      : str   = ""
+
+# Статус резолвинга — для аналитики качества
+# RESOLVED    — точно определена таблица
+# AMBIGUOUS   — колонка есть в нескольких таблицах скоупа
+# UNRESOLVED  — таблица не определена
+resolve_status  : str   = "RESOLVED"
+```
+
+# =============================================================================
+
+# ИЗВЛЕЧЕНИЕ КОЛОНОК С УЧЁТОМ СКОУПОВ
+
+# =============================================================================
+
+def _get_clause_for_node(node: exp.Expression) -> Optional[str]:
+“””
+Определяет клаузу (SELECT/WHERE/JOIN/GROUP_BY/HAVING/ORDER_BY)
+в которой находится узел, обходя дерево вверх по parent-ссылкам.
+
+```
+sqlglot хранит parent в node.parent_select и node.arg_key,
+но надёжнее проверить типы предков.
+"""
+current = node.parent
+while current is not None:
+    if isinstance(current, exp.Select):
+        return "SELECT"
+    if isinstance(current, exp.Where):
+        return "WHERE"
+    if isinstance(current, (exp.Join,)):
+        # Проверяем что мы в ON-условии (args["on"]), не в подзапросе
+        return "JOIN"
+    if isinstance(current, exp.Group):
+        return "GROUP_BY"
+    if isinstance(current, exp.Having):
+        return "HAVING"
+    if isinstance(current, exp.Order):
+        return "ORDER_BY"
+    current = current.parent
+return None
+```
+
+def _collect_columns_in_tree(
+tree: exp.Expression,
+scope: Scope,
+registry: SchemaRegistry,
+structural_fp: str,
+query_type: str,
+) -> list[dict]:
+“””
+Обходит дерево AST и извлекает все Column-узлы с их контекстом.
+
+```
+Для каждой колонки:
+  1. Определяем клаузу (SELECT/WHERE/JOIN/…)
+  2. Резолвим таблицу:
+       a. Если есть квалификатор (t1.col) → ищем в scope.alias_map
+       b. Если нет квалификатора → ищем по всем таблицам скоупа через registry
+  3. Валидируем через registry (колонка реально существует в таблице)
+  4. Создаём ColumnUsage запись
+
+Требование #6: find_all(exp.Column) рекурсивно находит колонки внутри
+любых функций — JSON_EXTRACT(col, '$.key'), COALESCE(a, b), SUM(amount) и т.д.
+
+Требование #5: неоднозначные колонки помечаются как AMBIGUOUS и пишутся
+для каждой возможной таблицы (не теряем данные).
+"""
+# Аккумулятор: (table_full_name, column_upper) → ColumnUsage dict
+result: dict[tuple[str, str], dict] = {}
+
+def _upsert(
+    qt: QualifiedTable,
+    col_upper: str,
+    clause: str,
+    resolve_status: str,
+) -> None:
+    """Добавляет или обновляет запись в result."""
+    key = (qt.full_name, col_upper)
+    w   = CLAUSE_WEIGHTS.get(clause, 1.0)
+
+    if key not in result:
+        result[key] = asdict(ColumnUsage(
+            table_full_name = qt.full_name,
+            column_name     = col_upper,
+            structural_fp   = structural_fp,
+            query_type      = query_type,
+            resolve_status  = resolve_status,
+        ))
+    # Инкрементируем счётчик клаузы
+    cnt_key = f"cnt_{clause.lower()}"
+    if cnt_key in result[key]:
+        result[key][cnt_key] += 1
+    result[key]["usage_score"] += w
+
+# Обходим все Column-узлы рекурсивно (покрывает вложенные функции)
+for col_node in tree.find_all(exp.Column):
+
+    # Пропускаем Star (SELECT * или t.*)
+    if col_node.find(exp.Star):
+        continue
+
+    col_name_lower = _norm_name(col_node.args.get("this"))
+    if not col_name_lower:
+        continue
+
+    col_upper  = col_name_lower.upper()   # требование #9
+    qualifier  = _norm_name(col_node.args.get("table"))  # алиас или имя таблицы
+
+    # Определяем клаузу
+    clause = _get_clause_for_node(col_node) or "SELECT"
+
+    # --- Резолвинг таблицы ---
+
+    if qualifier:
+        # Случай A: есть квалификатор (t1.col, users.col, db.table.col)
+        # Пробуем резолвить через scope
+        candidates = scope.resolve_alias(qualifier)
+
+        if not candidates:
+            # Квалификатор не найден в скоупе — возможно это db-prefix
+            # или внешняя таблица. Ищем в registry напрямую.
+            db_part    = _norm_name(col_node.args.get("db"))
+            candidates = registry.get_qualified(qualifier, db_lower=db_part or None)
+
+        if not candidates:
+            log.debug(f"Не удалось резолвить квалификатор '{qualifier}' для колонки '{col_upper}'")
+            continue
+
+        for qt in candidates:
+            # Валидация: колонка реально существует в этой таблице?
+            if registry.has_column(qt.db_lower, qt.table_lower, col_name_lower):
+                status = "RESOLVED" if len(candidates) == 1 else "AMBIGUOUS"
+                _upsert(qt, col_upper, clause, status)
+            else:
+                log.debug(
+                    f"Колонка '{col_upper}' не найдена в '{qt.full_name}' — "
+                    f"возможно алиас колонки или вычисляемое поле"
+                )
+
+    else:
+        # Случай B: нет квалификатора — ищем во всех таблицах скоупа
+        all_tables = scope.all_real_tables()
+
+        if not all_tables:
+            log.debug(f"Пустой скоуп для колонки '{col_upper}' — unresolved")
+            continue
+
+        matching = registry.find_tables_with_column(col_name_lower, all_tables)
+
+        if len(matching) == 1:
+            # Ровно одна таблица содержит эту колонку → точный резолвинг
+            _upsert(matching[0], col_upper, clause, "RESOLVED")
+
+        elif len(matching) > 1:
+            # Несколько таблиц содержат одноимённую колонку → AMBIGUOUS
+            # Пишем для всех вариантов, чтобы не потерять информацию
+            log.debug(
+                f"Колонка '{col_upper}' ambiguous в {[qt.full_name for qt in matching]}"
+            )
+            for qt in matching:
+                _upsert(qt, col_upper, clause, "AMBIGUOUS")
+
+        else:
+            # Колонка не найдена ни в одной таблице скоупа
+            # Возможно: alias колонки (SELECT amount * 2 AS total → WHERE total > 0)
+            # или колонка из внешнего скоупа (correlated subquery)
+            log.debug(f"Колонка '{col_upper}' не найдена ни в одной таблице скоупа — unresolved")
+
+return list(result.values())
+```
+
+# =============================================================================
+
+# ГЛАВНАЯ ФУНКЦИЯ ОБРАБОТКИ ОДНОГО ЗАПРОСА
+
+# =============================================================================
+
+def extract_column_usage(
+raw_sql: str,
+structural_fp: str,
+query_type: str,
+registry: SchemaRegistry,
+) -> list[dict]:
+“””
+Извлекает все колонки с контекстом из одного SQL-запроса.
+Возвращает список dict(ColumnUsage).
+
+```
+Шаги:
+  1. Парсим AST
+  2. Строим дерево скоупов (_build_scope_tree)
+  3. Обходим дерево и извлекаем колонки (_collect_columns_in_tree)
+"""
+try:
+    tree = sqlglot.parse_one(
+        raw_sql, dialect=DIALECT,
+        error_level=sqlglot.ErrorLevel.RAISE,
+    )
+except Exception as e:
+    log.debug(f"Ошибка парсинга: {e}")
+    return []
+
+scope = _build_scope_tree(tree, registry)
+return _collect_columns_in_tree(tree, scope, registry, structural_fp, query_type)
+```
+
+# =============================================================================
+
+# ВОРКЕР MULTIPROCESSING
+
+# Принимает сериализованный registry dict, а не объект —
+
+# объекты с frozenset не всегда корректно pickle-сериализуются на Windows.
+
+# =============================================================================
+
+# Глобальная переменная воркера — инициализируется один раз при старте процесса
+
+_worker_registry: Optional[SchemaRegistry] = None
+
+def _worker_init(registry_dict: dict) -> None:
+“””
+Инициализатор пула: десериализует SchemaRegistry один раз на воркер.
+Намного эффективнее чем передавать registry в каждом батче.
+“””
+global _worker_registry
+_worker_registry = SchemaRegistry.from_dict(registry_dict)
+log.debug(f”Воркер инициализирован (pid={mp.current_process().pid})”)
+
+def _process_batch(rows: list[dict]) -> list[dict]:
+“””
+Обрабатывает батч запросов.
+Использует глобальный _worker_registry (инициализирован в _worker_init).
+“””
+assert _worker_registry is not None, “_worker_registry не инициализирован”
+
+```
+all_cols = []
+for row in rows:
+    raw_sql       = (row.get("raw_sql") or "").strip()
+    structural_fp = row.get("structural_fp", "")
+    query_type    = row.get("query_type", "UNKNOWN")
+
+    if not raw_sql:
+        continue
+
+    cols = extract_column_usage(raw_sql, structural_fp, query_type, _worker_registry)
+    all_cols.extend(cols)
+
+return all_cols
+```
+
+# =============================================================================
+
+# DORIS I/O
+
+# =============================================================================
+
+def _doris_conn() -> pymysql.Connection:
+return pymysql.connect(
+host=DORIS_HOST, port=DORIS_FE_PORT,
+user=DORIS_USER, password=DORIS_PASSWORD,
+database=DORIS_DB, charset=“utf8mb4”, connect_timeout=30,
+)
+
+def read_total_count() -> int:
+with _doris_conn() as conn:
+with conn.cursor() as cur:
+cur.execute(
+f”SELECT COUNT(*) FROM {SOURCE_TABLE} WHERE parse_ok = TRUE”
+)
+return cur.fetchone()[0]
+
+def read_fingerprints_chunk(offset: int, limit: int) -> list[dict]:
+“”“Читает чанк из sql_fingerprints (только успешно распарсенные).”””
+sql = f”””
+SELECT structural_fp, raw_sql, query_type
+FROM   {SOURCE_TABLE}
+WHERE  parse_ok = TRUE
+ORDER  BY structural_fp
+LIMIT  {limit} OFFSET {offset}
+“””
+with _doris_conn() as conn:
+with conn.cursor(pymysql.cursors.DictCursor) as cur:
+cur.execute(sql)
+return list(cur.fetchall())
+
+def _stream_load_batch(rows: list[dict]) -> None:
+if not rows:
+return
+url = (
+f”http://{DORIS_HOST}:{DORIS_HTTP_PORT}”
+f”/api/{DORIS_DB}/{SINK_TABLE}/_stream_load”
+)
+headers = {
+“format”            : “json”,
+“strip_outer_array” : “true”,
+“Expect”            : “100-continue”,
+“max_filter_ratio”  : “0.0”,
+“timeout”           : str(STREAM_LOAD_TIMEOUT),
+}
+resp = requests.put(
+url,
+data    = json.dumps(rows, ensure_ascii=False).encode(“utf-8”),
+headers = headers,
+auth    = (DORIS_USER, DORIS_PASSWORD),
+timeout = STREAM_LOAD_TIMEOUT,
+)
+resp.raise_for_status()
+result = resp.json()
+if result.get(“Status”) not in (“Success”, “Publish Timeout”):
+raise RuntimeError(f”Stream Load failed: {json.dumps(result, ensure_ascii=False)}”)
+log.debug(f”Stream Load: loaded={result.get(‘NumberLoadedRows’)}, txn={result.get(‘TxnId’)}”)
+
+def flush_buffer(buffer: list[dict], force: bool = False) -> list[dict]:
+“”“Сбрасывает буфер в Doris при накоплении STREAM_LOAD_BATCH строк.”””
+if not force and len(buffer) < STREAM_LOAD_BATCH:
+return buffer
+if buffer:
+_stream_load_batch(buffer)
+return []
+
+# =============================================================================
+
+# ОСНОВНОЙ ПАЙПЛАЙН
+
+# =============================================================================
+
+def run_column_extraction(num_workers: Optional[int] = NUM_WORKERS) -> None:
+“””
+Основной пайплайн.
+
+```
+1. Загружаем SchemaRegistry из StarRocks (один раз)
+2. Сериализуем registry для передачи в воркеры
+3. Читаем sql_fingerprints чанками
+4. Параллельно извлекаем колонки через mp.Pool с initializer
+5. Батчевый Stream Load результатов в Doris
+"""
+
+# -- 1. Загрузка схемы из StarRocks --
+registry = SchemaRegistry()
+registry.load_from_starrocks(
+    host      = SR_HOST,
+    port      = SR_PORT,
+    user      = SR_USER,
+    password  = SR_PASSWORD,
+    databases = SR_DATABASES,
+)
+registry_dict = registry.to_dict()  # сериализуем для воркеров
+
+# -- 2. Размер источника --
+total = read_total_count()
+workers = num_workers or mp.cpu_count()
+log.info(f"Запросов для обработки: {total:,}, воркеров: {workers}")
+
+buffer    : list[dict] = []
+total_cols = 0
+
+# -- 3. Запуск пула с инициализатором --
+# initargs передаётся в _worker_init ОДИН РАЗ на воркер при старте процесса.
+# Это намного эффективнее чем передавать registry_dict в каждом батче.
+with mp.Pool(
+    processes  = num_workers,
+    initializer= _worker_init,
+    initargs   = (registry_dict,),
+) as pool:
+
+    for offset in range(0, total, READ_CHUNK):
+        chunk = read_fingerprints_chunk(offset, READ_CHUNK)
+        if not chunk:
+            continue
+
+        batches = [
+            chunk[i : i + BATCH_SIZE]
+            for i in range(0, len(chunk), BATCH_SIZE)
+        ]
+
+        for col_list in pool.imap_unordered(_process_batch, batches):
+            for row in col_list:
+                buffer.append(row)
+                buffer = flush_buffer(buffer)
+            total_cols += len(col_list)
+
+        log.info(
+            f"Обработано {min(offset + READ_CHUNK, total):,}/{total:,}, "
+            f"колонок собрано: {total_cols:,}"
+        )
+
+# -- 4. Финальный сброс --
+flush_buffer(buffer, force=True)
+log.info(f"Готово. Всего записей column usage: {total_cols:,}")
+```
+
+# =============================================================================
+
+# ТОЧКА ВХОДА
+
+# =============================================================================
+
+if **name** == “**main**”:
+run_column_extraction()
+
+# =============================================================================
+
+# DDL Apache Doris
+
+# =============================================================================
+
+“””
+– AGGREGATE KEY по (table_full_name, column_name):
+–   cnt_* и usage_score суммируются при повторной загрузке.
+–   structural_fp и query_type — REPLACE (берём последний источник).
+–   resolve_status — REPLACE (последний статус).
+
+CREATE TABLE IF NOT EXISTS sql_column_usage (
+table_full_name  VARCHAR(512)  NOT NULL  COMMENT ‘db.table_name (оригинальный регистр)’,
+column_name      VARCHAR(256)  NOT NULL  COMMENT ‘Имя колонки UPPER’,
+structural_fp    VARCHAR(32)   REPLACE   COMMENT ‘fp запроса-источника’,
+cnt_select       INT           SUM       COMMENT ‘Появлений в SELECT’,
+cnt_where        INT           SUM       COMMENT ‘Появлений в WHERE’,
+cnt_join         INT           SUM       COMMENT ‘Появлений в JOIN ON’,
+cnt_group_by     INT           SUM       COMMENT ‘Появлений в GROUP BY’,
+cnt_having       INT           SUM       COMMENT ‘Появлений в HAVING’,
+cnt_order_by     INT           SUM       COMMENT ‘Появлений в ORDER BY’,
+usage_score      DOUBLE        SUM       COMMENT ‘Взвешенный score’,
+query_type       VARCHAR(32)   REPLACE   COMMENT ‘Тип запроса-источника’,
+resolve_status   VARCHAR(16)   REPLACE   COMMENT ‘RESOLVED | AMBIGUOUS | UNRESOLVED’
+)
+AGGREGATE KEY(table_full_name, column_name)
+DISTRIBUTED BY HASH(table_full_name) BUCKETS 8
+PROPERTIES (“replication_num” = “1”);
+
+– Вьюха для фильтрации RAG-чанков:
+– берём только колонки с достаточным usage и хорошим resolve_status
+CREATE VIEW sql_column_usage_for_rag AS
+SELECT
+table_full_name,
+column_name,
+cnt_select + cnt_where + cnt_join + cnt_group_by + cnt_having AS total_cnt,
+usage_score,
+ROUND(
+(cnt_where + cnt_join + cnt_having) * 100.0
+/ NULLIF(cnt_select + cnt_where + cnt_join + cnt_group_by + cnt_having + cnt_order_by, 0),
+1
+) AS filter_clause_pct,
+resolve_status
+FROM sql_column_usage
+WHERE usage_score  >= 3.0
+AND resolve_status IN (‘RESOLVED’, ‘AMBIGUOUS’)
+ORDER BY table_full_name, usage_score DESC;
+“””
 
 
