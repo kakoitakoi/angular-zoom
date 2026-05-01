@@ -10960,4 +10960,97 @@ state = registry.get(table_id)
 
 
 
+# config/settings.py
+# Все креды и настройки в одном месте
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class RegistryDbConfig:
+    """БД где хранится реестр таблиц и логи пайплайна"""
+    host: str
+    port: int
+    user: str
+    password: str
+    database: str
+    charset: str = "utf8mb4"
+
+
+@dataclass
+class DwhDbConfig:
+    """StarRocks / источник метаданных таблиц"""
+    host: str
+    port: int
+    user: str
+    password: str
+    database: str
+    charset: str = "utf8mb4"
+
+
+@dataclass
+class JiraConfig:
+    base_url: str        # https://jira.company.com
+    user: str            # email или логин
+    token: str           # API token
+    project_key: str     # PROJECT
+    timeout: int = 30
+
+
+@dataclass
+class LlmConfig:
+    base_url: str        # http://localhost:11434/v1  (ollama) или OpenAI-совместимый
+    api_key: str
+    model: str           # llama3, gpt-4o-mini и т.д.
+    temperature: float = 0.1
+    max_tokens: int = 1024
+    timeout: int = 60
+
+
+@dataclass
+class AppConfig:
+    registry_db: RegistryDbConfig
+    dwh_db: DwhDbConfig
+    jira: JiraConfig
+    llm: LlmConfig
+
+
+# -----------------------------------------------------------------------
+# Конкретные значения — меняй здесь или вынеси в .env
+# -----------------------------------------------------------------------
+
+def load_config() -> AppConfig:
+    return AppConfig(
+        registry_db=RegistryDbConfig(
+            host="localhost",
+            port=9030,
+            user="registry_user",
+            password="registry_pass",
+            database="text2sql_meta",
+        ),
+        dwh_db=DwhDbConfig(
+            host="starrocks-host",
+            port=9030,
+            user="dwh_reader",
+            password="dwh_pass",
+            database="dwh",
+        ),
+        jira=JiraConfig(
+            base_url="https://jira.company.com",
+            user="svc_text2sql@company.com",
+            token="ATATT3xFfGF0...",
+            project_key="DWH",
+        ),
+        llm=LlmConfig(
+            base_url="http://localhost:11434/v1",
+            api_key="ollama",           # для ollama любое значение
+            model="llama3.1:8b",
+            temperature=0.1,
+            max_tokens=1024,
+        ),
+    )
+
+
+
+
 
