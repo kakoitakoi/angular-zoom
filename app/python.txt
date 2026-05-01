@@ -10510,3 +10510,454 @@ def run_column_extraction(num_workers: Optional[int] = NUM_WORKERS) -> None:
 
 
 
+
+
+text2sql/
+├── pipeline/
+│   ├── __init__.py
+│   ├── runner.py          # главный исполнитель
+│   ├── base_stage.py      # абстрактный класс этапа
+│   └── stages/
+│       ├── __init__.py
+│       ├── dwh_enricher.py
+│       ├── confluence_enricher.py
+│       ├── jira_enricher.py
+│       ├── llm_describer.py
+│       └── rag_builder.py
+├── registry/
+│   └── manager.py         # работа с registry-таблицей
+├── config.py
+└── main.py                # CLI точка входа
+
+
+# pipeline/base_stage.py
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any
+
+@dataclass
+class StageResult:
+    success: bool
+    data: dict = field(default_factory=dict)
+    error: str = None
+    skipped: bool = False
+
+class BaseStage(ABC):
+    
+    # Переопределяется в каждом этапе
+    name: str = None
+    required: bool = True        # False = ошибка не ломает пайплайн
+    depends_on: list[str] = []   # имена этапов, которые должны быть выполнены
+    
+    @abstractmethod
+    def execute(self, table_id: str, context: dict) -> StageResult:
+        """
+        context — словарь, который накапливается по ходу пайплайна.
+        Каждый этап может читать результаты предыдущих и писать свои.
+        """
+        ...
+
+    def should_skip(self, table_id: str, context: dict) -> bool:
+        """Переопределить если нужна логика пропуска (напр. уже обогащено)"""
+        return False
+
+
+
+
+# pipeline/stages/dwh_enricher.py
+from pipeline.base_stage import BaseStage, StageResult
+
+# Импортируем всю существующую логику как есть
+from scripts.dwh_enrichment import DwhEnrichmentLogic  # твой скрипт
+
+class DwhEnricher(BaseStage):
+    name = "dwh"
+    required = True
+    depends_on = []
+
+    def __init__(self, db_config: dict):
+        self._logic = DwhEnrichmentLogic(db_config)  # инициализация твоего кода
+
+    def should_skip(self, table_id: str, context: dict) -> bool:
+        # Пропускаем если уже обогащено и нет флага force
+        return context.get('registry', {}).get('enriched_dwh') \
+               and not context.get('force_reenrich')
+
+    def execute(self, table_id: str, context: dict) -> StageResult:
+        try:
+            # Вызываем существующую логику
+            result = self._logic.run(table_id)
+            
+            # Кладём результат в context для следующих этапов
+            return StageResult(
+                success=True,
+                data={"dwh_meta": result}  # колонки, типы, партиции и т.д.
+            )
+        except Exception as e:
+            return StageResult(success=False, error=str(e))
+
+
+
+
+сердце пайплайна
+
+# pipeline/runner.py
+import logging
+from datetime import datetime
+from typing import Type
+from pipeline.base_stage import BaseStage, StageResult
+from registry.manager import RegistryManager
+
+logger = logging.getLogger(__name__)
+
+class PipelineRunner:
+
+    def __init__(self, registry: RegistryManager):
+        self._registry = registry
+        self._stages: list[BaseStage] = []
+
+    def register_stage(self, stage: BaseStage) -> "PipelineRunner":
+        """Fluent API для регистрации этапов"""
+        self._stages.append(stage)
+        return self
+
+    def run(self, table_id: str, force_reenrich: bool = False) -> bool:
+        logger.info(f"[{table_id}] Pipeline started")
+        self._registry.set_status(table_id, 'enriching')
+
+        # Контекст передаётся сквозь все этапы
+        context = {
+            'registry': self._registry.get(table_id),
+            'force_reenrich': force_reenrich,
+            'stages': {},       # сюда пишут результаты этапы
+            'started_at': datetime.now(),
+        }
+
+        for stage in self._stages:
+            stage_name = stage.name
+            logger.info(f"[{table_id}] Stage [{stage_name}] starting")
+
+            # Проверка зависимостей
+            if not self._deps_satisfied(stage, context):
+                msg = f"Dependencies not met: {stage.depends_on}"
+                logger.error(f"[{table_id}] Stage [{stage_name}] {msg}")
+                if stage.required:
+                    self._registry.set_status(table_id, 'degraded', error=msg)
+                    return False
+                continue
+
+            # Пропуск
+            if stage.should_skip(table_id, context):
+                logger.info(f"[{table_id}] Stage [{stage_name}] skipped")
+                context['stages'][stage_name] = {}
+                continue
+
+            # Выполнение
+            t0 = datetime.now()
+            result: StageResult = stage.execute(table_id, context)
+            duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
+
+            # Логируем в БД
+            self._registry.log_event(
+                table_id, stage_name,
+                'success' if result.success else 'failed',
+                duration_ms, result.data or {'error': result.error}
+            )
+
+            if result.success:
+                context['stages'][stage_name] = result.data
+                self._registry.mark_stage_done(table_id, stage_name)
+                logger.info(f"[{table_id}] Stage [{stage_name}] OK ({duration_ms}ms)")
+            else:
+                logger.error(f"[{table_id}] Stage [{stage_name}] FAILED: {result.error}")
+                if stage.required:
+                    self._registry.set_status(table_id, 'degraded', error=result.error)
+                    return False
+                # Необязательный этап — продолжаем
+                context['stages'][stage_name] = {}
+
+        self._registry.set_status(table_id, 'ready')
+        logger.info(f"[{table_id}] Pipeline completed successfully")
+        return True
+
+    def _deps_satisfied(self, stage: BaseStage, context: dict) -> bool:
+        return all(
+            dep in context['stages']
+            for dep in stage.depends_on
+        )
+
+
+
+точка входа
+
+# main.py
+import argparse
+from pipeline.runner import PipelineRunner
+from pipeline.stages.dwh_enricher import DwhEnricher
+from pipeline.stages.confluence_enricher import ConfluenceEnricher
+from pipeline.stages.jira_enricher import JiraEnricher
+from pipeline.stages.llm_describer import LlmDescriber
+from pipeline.stages.rag_builder import RagBuilder
+from registry.manager import RegistryManager
+from config import load_config
+
+def build_pipeline(cfg: dict) -> PipelineRunner:
+    registry = RegistryManager(cfg['db'])
+    
+    return (
+        PipelineRunner(registry)
+        .register_stage(DwhEnricher(cfg['dwh']))
+        .register_stage(ConfluenceEnricher(cfg['confluence']))
+        .register_stage(JiraEnricher(cfg['jira']))
+        .register_stage(LlmDescriber(cfg['llm']))
+        .register_stage(RagBuilder(cfg['doris']))
+    )
+
+def main():
+    parser = argparse.ArgumentParser(description='Text2SQL table pipeline')
+    sub = parser.add_subparsers(dest='command')
+
+    # Добавить таблицу
+    add = sub.add_parser('add')
+    add.add_argument('table_id', help='schema.table_name')
+    add.add_argument('--force', action='store_true', help='переобогатить даже если ready')
+
+    # Удалить таблицу
+    rm = sub.add_parser('remove')
+    rm.add_argument('table_id')
+
+    # Синхронизация с DWH
+    sub.add_parser('sync')
+
+    # Ретрай деградировавших
+    sub.add_parser('retry-degraded')
+
+    args = parser.parse_args()
+    cfg = load_config()
+    pipeline = build_pipeline(cfg)
+
+    if args.command == 'add':
+        pipeline.registry.register(args.table_id)
+        pipeline.run(args.table_id, force_reenrich=args.force)
+
+    elif args.command == 'remove':
+        pipeline.registry.remove(args.table_id)
+
+    elif args.command == 'sync':
+        pipeline.sync_with_dwh()
+
+    elif args.command == 'retry-degraded':
+        for table_id in pipeline.registry.get_by_status('degraded'):
+            pipeline.run(table_id)
+
+if __name__ == '__main__':
+    main()
+
+
+
+
+
+
+
+
+
+
+registry manager
+
+
+# registry/manager.py
+import pymysql
+import json
+import hashlib
+import logging
+from datetime import datetime
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+class RegistryManager:
+
+    def __init__(self, db_config: dict):
+        self._cfg = db_config
+
+    def _conn(self):
+        return pymysql.connect(
+            **self._cfg,
+            cursorclass=pymysql.cursors.DictCursor
+        )
+
+    # -------------------------
+    # Жизненный цикл таблицы
+    # -------------------------
+
+    def register(self, table_id: str, priority: int = 0):
+        """Добавить таблицу в реестр (idempotent)"""
+        schema, table = table_id.split('.')
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO text2sql_table_registry
+                        (table_id, schema_name, table_name, status, priority, registered_at)
+                    VALUES (%s, %s, %s, 'pending', %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        status = IF(status = 'removed', 'pending', status),
+                        priority = VALUES(priority)
+                """, (table_id, schema, table, priority, datetime.now()))
+            conn.commit()
+
+    def remove(self, table_id: str):
+        """Мягкое удаление — запись остаётся для аудита"""
+        self.set_status(table_id, 'removing')
+
+    def get(self, table_id: str) -> Optional[dict]:
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM text2sql_table_registry WHERE table_id = %s",
+                    (table_id,)
+                )
+                return cur.fetchone()
+
+    def get_by_status(self, status: str) -> list[str]:
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT table_id FROM text2sql_table_registry WHERE status = %s",
+                    (status,)
+                )
+                return [r['table_id'] for r in cur.fetchall()]
+
+    def get_active_tables(self) -> list[str]:
+        """Все таблицы кроме removed"""
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT table_id FROM text2sql_table_registry
+                    WHERE status NOT IN ('removed', 'removing')
+                """)
+                return [r['table_id'] for r in cur.fetchall()]
+
+    # -------------------------
+    # Обновление состояния
+    # -------------------------
+
+    def set_status(self, table_id: str, status: str, error: str = None):
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE text2sql_table_registry
+                    SET status = %s,
+                        error_message = %s,
+                        retry_count = IF(%s = 'enriching', retry_count + 1, retry_count)
+                    WHERE table_id = %s
+                """, (status, error, status, table_id))
+            conn.commit()
+
+    def mark_stage_done(self, table_id: str, stage_name: str):
+        """Выставляет флаг enriched_<stage> = TRUE"""
+        flag_map = {
+            'dwh':        'enriched_dwh',
+            'confluence': 'enriched_confluence',
+            'jira':       'enriched_jira',
+            'llm':        'enriched_llm',
+            'rag':        'rag_chunks_built',
+        }
+        flag = flag_map.get(stage_name)
+        if not flag:
+            return
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    UPDATE text2sql_table_registry
+                    SET {flag} = TRUE,
+                        last_enriched_at = %s
+                    WHERE table_id = %s
+                """, (datetime.now(), table_id))
+            conn.commit()
+
+    def update_ddl_hash(self, table_id: str, ddl: str):
+        """Для отслеживания изменений структуры таблицы"""
+        ddl_hash = hashlib.md5(ddl.encode()).hexdigest()
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE text2sql_table_registry
+                    SET ddl_hash = %s WHERE table_id = %s
+                """, (ddl_hash, table_id))
+            conn.commit()
+        return ddl_hash
+
+    def ddl_hash_changed(self, table_id: str, current_ddl: str) -> bool:
+        stored = (self.get(table_id) or {}).get('ddl_hash')
+        current = hashlib.md5(current_ddl.encode()).hexdigest()
+        return stored != current
+
+    # -------------------------
+    # Логирование событий
+    # -------------------------
+
+    def log_event(self, table_id: str, stage: str,
+                  status: str, duration_ms: int, details: dict):
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO text2sql_enrichment_log
+                        (table_id, stage, status, duration_ms, details, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (table_id, stage, status, duration_ms,
+                      json.dumps(details, ensure_ascii=False), datetime.now()))
+            conn.commit()
+
+    # -------------------------
+    # Синхронизация с DWH
+    # -------------------------
+
+    def sync_with_dwh(self, dwh_tables: set[str],
+                      get_ddl_fn) -> dict:
+        """
+        dwh_tables  — актуальный список таблиц из DWH
+        get_ddl_fn  — callable(table_id) -> str, возвращает DDL
+        
+        Возвращает словарь с тремя списками для логирования
+        """
+        registered = set(self.get_active_tables())
+
+        to_add    = dwh_tables - registered
+        to_remove = registered - dwh_tables
+        to_check  = dwh_tables & registered  # проверить на изменения DDL
+
+        changed = []
+        for table_id in to_check:
+            try:
+                if self.ddl_hash_changed(table_id, get_ddl_fn(table_id)):
+                    changed.append(table_id)
+            except Exception as e:
+                logger.warning(f"DDL check failed for {table_id}: {e}")
+
+        return {
+            'to_add':    list(to_add),
+            'to_remove': list(to_remove),
+            'changed':   changed,
+        }
+
+как использовать
+# Регистрация
+registry.register('dwh.fact_sales')
+
+# Runner обновляет статус
+registry.set_status(table_id, 'enriching')
+
+# После каждого этапа
+registry.mark_stage_done(table_id, 'dwh')
+registry.log_event(table_id, 'dwh', 'success', 340, {"rows": 150})
+
+# Stage читает текущее состояние для should_skip()
+state = registry.get(table_id)
+# {'enriched_dwh': True, 'enriched_confluence': False, ...}
+
+
+
+
+
+
+
