@@ -11054,3 +11054,1228 @@ def load_config() -> AppConfig:
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+v2
+
+# main.py
+
+# 
+
+# Точка входа. Использование:
+
+# 
+
+# python main.py add dwh.fact_sales          # зарегистрировать таблицу
+
+# python main.py run                         # обработать одну PENDING таблицу
+
+# python main.py run-all                     # обработать все PENDING таблицы
+
+# python main.py retry-degraded              # повторить упавшие
+
+# python main.py status dwh.fact_sales       # посмотреть состояние таблицы
+
+# python main.py list-pending                # список ожидающих таблиц
+
+import argparse
+import logging
+import sys
+
+from config.settings import load_config
+from registry.manager import RegistryManager
+from pipeline.runner import PipelineRunner
+from pipeline.stages.dwh_enricher import DwhEnricher
+from pipeline.stages.jira_enricher import JiraEnricher
+from pipeline.stages.llm_describer import LlmDescriber
+
+# ——————————————————————
+
+# Логирование
+
+# ——————————————————————
+
+logging.basicConfig(
+level=logging.INFO,
+format=”%(asctime)s [%(levelname)s] %(name)s: %(message)s”,
+datefmt=”%Y-%m-%d %H:%M:%S”,
+handlers=[
+logging.StreamHandler(sys.stdout),
+logging.FileHandler(“pipeline.log”, encoding=“utf-8”),
+],
+)
+logger = logging.getLogger(**name**)
+
+# ——————————————————————
+
+# Сборка пайплайна
+
+# ——————————————————————
+
+def build_pipeline(cfg) -> tuple[RegistryManager, PipelineRunner]:
+registry = RegistryManager(cfg.registry_db)
+registry.ensure_tables()
+
+```
+runner = (
+    PipelineRunner(registry)
+    .register_stage(DwhEnricher(cfg.dwh_db, cfg.registry_db))
+    .register_stage(JiraEnricher(cfg.jira, cfg.registry_db))
+    .register_stage(LlmDescriber(cfg.llm, cfg.registry_db))
+)
+return registry, runner
+```
+
+# ——————————————————————
+
+# CLI-команды
+
+# ——————————————————————
+
+def cmd_add(args, registry: RegistryManager, runner: PipelineRunner):
+“”“Зарегистрировать таблицу в реестре”””
+registry.register(args.table_id, priority=args.priority)
+print(f”✓ Registered: {args.table_id}”)
+
+```
+if args.run:
+    # Сразу запустить пайплайн не через очередь, а напрямую
+    logger.info(f"Starting pipeline immediately for {args.table_id}")
+    runner.run_for(args.table_id)
+```
+
+def cmd_run(args, registry: RegistryManager, runner: PipelineRunner):
+“”“Обработать одну PENDING таблицу”””
+table_id = runner.run_next()
+if table_id:
+print(f”✓ Processed: {table_id}”)
+else:
+print(“Queue is empty — nothing to process”)
+
+def cmd_run_all(args, registry: RegistryManager, runner: PipelineRunner):
+“”“Обработать все PENDING таблицы последовательно”””
+processed = 0
+while True:
+table_id = runner.run_next()
+if table_id is None:
+break
+processed += 1
+print(f”✓ Processed {processed} table(s)”)
+
+def cmd_retry_degraded(args, registry: RegistryManager, runner: PipelineRunner):
+“””
+Повторить все DEGRADED таблицы.
+resume_from_stage сохранён в реестре — пайплайн продолжится с упавшего этапа.
+“””
+degraded = registry.get_by_status(“degraded”)
+if not degraded:
+print(“No degraded tables found”)
+return
+
+```
+print(f"Found {len(degraded)} degraded table(s): {degraded}")
+for table_id in degraded:
+    # Сбрасываем в pending — claim_pending подхватит
+    registry.reset_to_pending(table_id)
+
+# Обрабатываем все
+processed = 0
+while True:
+    table_id = runner.run_next()
+    if table_id is None:
+        break
+    processed += 1
+print(f"✓ Retried {processed} table(s)")
+```
+
+def cmd_status(args, registry: RegistryManager, runner: PipelineRunner):
+“”“Показать состояние конкретной таблицы”””
+row = registry.get(args.table_id)
+if not row:
+print(f”Table {args.table_id} not found in registry”)
+return
+
+```
+print(f"\n{'─'*50}")
+print(f"  Table:          {row['table_id']}")
+print(f"  Status:         {row['status']}")
+print(f"  Retry count:    {row['retry_count']}")
+print(f"  Resume from:    {row.get('resume_from_stage') or '—'}")
+print(f"  Error:          {row.get('error_message') or '—'}")
+print(f"  Registered at:  {row.get('registered_at')}")
+print(f"  Completed at:   {row.get('completed_at') or '—'}")
+print(f"  Stages:")
+print(f"    dwh done:     {bool(row.get('stage_dwh_done'))}")
+print(f"    jira done:    {bool(row.get('stage_jira_done'))}")
+print(f"    llm done:     {bool(row.get('stage_llm_done'))}")
+print(f"{'─'*50}\n")
+```
+
+def cmd_list_pending(args, registry: RegistryManager, runner: PipelineRunner):
+“”“Список таблиц в очереди”””
+pending = registry.get_by_status(“pending”)
+if not pending:
+print(“No pending tables”)
+return
+print(f”Pending ({len(pending)}):”)
+for t in pending:
+print(f”  • {t}”)
+
+# ——————————————————————
+
+# Точка входа
+
+# ——————————————————————
+
+def main():
+parser = argparse.ArgumentParser(
+description=“Text2SQL table enrichment pipeline”,
+formatter_class=argparse.RawDescriptionHelpFormatter,
+epilog=”””
+Examples:
+python main.py add dwh.fact_sales
+python main.py add dwh.fact_sales –run
+python main.py run
+python main.py run-all
+python main.py retry-degraded
+python main.py status dwh.fact_sales
+python main.py list-pending
+“””,
+)
+sub = parser.add_subparsers(dest=“command”, required=True)
+
+```
+# add
+p_add = sub.add_parser("add", help="Register a table in the registry")
+p_add.add_argument("table_id", help="schema.table_name")
+p_add.add_argument("--priority", type=int, default=0,
+                   help="Processing priority (higher = sooner)")
+p_add.add_argument("--run", action="store_true",
+                   help="Start pipeline immediately after registration")
+
+# run
+sub.add_parser("run", help="Process one PENDING table")
+
+# run-all
+sub.add_parser("run-all", help="Process all PENDING tables")
+
+# retry-degraded
+sub.add_parser("retry-degraded", help="Retry all DEGRADED tables from failed stage")
+
+# status
+p_status = sub.add_parser("status", help="Show table status")
+p_status.add_argument("table_id", help="schema.table_name")
+
+# list-pending
+sub.add_parser("list-pending", help="List pending tables")
+
+args = parser.parse_args()
+
+cfg = load_config()
+registry, runner = build_pipeline(cfg)
+
+commands = {
+    "add":             cmd_add,
+    "run":             cmd_run,
+    "run-all":         cmd_run_all,
+    "retry-degraded":  cmd_retry_degraded,
+    "status":          cmd_status,
+    "list-pending":    cmd_list_pending,
+}
+commands[args.command](args, registry, runner)
+```
+
+if **name** == “**main**”:
+main()
+
+
+
+# pipeline/runner.py
+
+import logging
+from datetime import datetime
+from typing import Optional
+
+from pipeline.base_stage import BaseStage, StageResult
+from registry.manager import RegistryManager
+
+logger = logging.getLogger(**name**)
+
+class PipelineRunner:
+
+```
+def __init__(self, registry: RegistryManager):
+    self._registry = registry
+    self._stages: list[BaseStage] = []
+
+def register_stage(self, stage: BaseStage) -> "PipelineRunner":
+    """Fluent API — порядок вызовов определяет порядок выполнения"""
+    self._stages.append(stage)
+    return self
+
+# ------------------------------------------------------------------
+# Главный метод — обработать одну PENDING таблицу
+# ------------------------------------------------------------------
+
+def run_next(self) -> Optional[str]:
+    """
+    Атомарно захватывает одну PENDING таблицу и прогоняет по пайплайну.
+    Возвращает table_id если была обработана, None если очередь пуста.
+    """
+    table_id = self._registry.claim_pending()
+    if not table_id:
+        logger.info("No pending tables in queue")
+        return None
+
+    self._run(table_id)
+    return table_id
+
+def run_for(self, table_id: str):
+    """Запустить пайплайн для конкретной таблицы (уже должна быть в реестре)"""
+    self._run(table_id)
+
+# ------------------------------------------------------------------
+# Внутренняя логика
+# ------------------------------------------------------------------
+
+def _run(self, table_id: str):
+    logger.info(f"[{table_id}] ===== Pipeline started =====")
+    started_at = datetime.now()
+
+    # Читаем текущее состояние из реестра
+    # registry_row содержит флаги stage_<name>_done и resume_from_stage
+    registry_row = self._registry.get(table_id)
+    if not registry_row:
+        logger.error(f"[{table_id}] Not found in registry, aborting")
+        return
+
+    resume_from = registry_row.get("resume_from_stage")
+    if resume_from:
+        logger.info(f"[{table_id}] Resuming from stage [{resume_from}]")
+
+    skipping = bool(resume_from)  # пропускаем этапы до resume_from
+
+    for stage in self._stages:
+        stage_name = stage.name
+
+        # Режим возобновления: пропускаем всё до нужного этапа
+        if skipping:
+            if stage_name == resume_from:
+                skipping = False  # дошли до аварийного этапа — начинаем
+            else:
+                # Но дополнительно проверяем флаг — вдруг этап уже выполнен
+                if stage.should_skip(registry_row):
+                    logger.info(f"[{table_id}] Stage [{stage_name}] already done, skipping")
+                    continue
+                # Этап до resume_from, но не выполнен — нештатная ситуация,
+                # запускаем его
+                logger.warning(
+                    f"[{table_id}] Stage [{stage_name}] is before resume point "
+                    f"but not done — executing anyway"
+                )
+
+        # Обычный пропуск уже выполненных этапов (при повторном запуске)
+        if not skipping and stage.should_skip(registry_row):
+            logger.info(f"[{table_id}] Stage [{stage_name}] already done, skipping")
+            self._registry.log_event(table_id, stage_name, "skipped")
+            continue
+
+        # --- Выполнение этапа ---
+        logger.info(f"[{table_id}] Stage [{stage_name}] starting")
+        self._registry.log_event(table_id, stage_name, "started")
+        t0 = datetime.now()
+
+        try:
+            result: StageResult = stage.execute(table_id)
+        except Exception as e:
+            # Неожиданное исключение вне StageResult
+            result = StageResult(success=False, error=f"Unhandled exception: {e}")
+            logger.exception(f"[{table_id}] Stage [{stage_name}] raised exception")
+
+        duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
+
+        if result.success:
+            self._registry.mark_stage_done(table_id, stage_name)
+            self._registry.log_event(
+                table_id, stage_name, "success",
+                duration_ms, result.details
+            )
+            logger.info(
+                f"[{table_id}] Stage [{stage_name}] OK "
+                f"({duration_ms}ms) {result.details}"
+            )
+        else:
+            self._registry.log_event(
+                table_id, stage_name, "failed",
+                duration_ms, {"error": result.error}
+            )
+            logger.error(f"[{table_id}] Stage [{stage_name}] FAILED: {result.error}")
+
+            if stage.required:
+                # Запоминаем с какого этапа возобновить при следующем запуске
+                self._registry.mark_failed(table_id, stage_name, result.error)
+                total_sec = (datetime.now() - started_at).total_seconds()
+                logger.info(
+                    f"[{table_id}] ===== Pipeline FAILED "
+                    f"at [{stage_name}] after {total_sec:.1f}s ====="
+                )
+                return
+            else:
+                # Необязательный этап — логируем и продолжаем
+                logger.warning(
+                    f"[{table_id}] Stage [{stage_name}] is not required, continuing"
+                )
+                # Помечаем как done чтобы не повторять при resume
+                self._registry.mark_stage_done(table_id, stage_name)
+
+    # Все этапы пройдены
+    self._registry.mark_ready(table_id)
+    total_sec = (datetime.now() - started_at).total_seconds()
+    logger.info(
+        f"[{table_id}] ===== Pipeline COMPLETED in {total_sec:.1f}s ====="
+    )
+```
+
+
+
+# registry/manager.py
+
+import json
+import logging
+from datetime import datetime
+from typing import Optional
+
+import pymysql
+import pymysql.cursors
+
+logger = logging.getLogger(**name**)
+
+class RegistryManager:
+
+```
+def __init__(self, db_config):
+    self._cfg = db_config
+
+def _conn(self):
+    return pymysql.connect(
+        host=self._cfg.host,
+        port=self._cfg.port,
+        user=self._cfg.user,
+        password=self._cfg.password,
+        database=self._cfg.database,
+        charset=self._cfg.charset,
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=False,
+    )
+
+# ------------------------------------------------------------------
+# DDL — создание таблиц если не существуют
+# ------------------------------------------------------------------
+
+def ensure_tables(self):
+    """Создать служебные таблицы при первом запуске"""
+    ddl_registry = """
+    CREATE TABLE IF NOT EXISTS text2sql_table_registry (
+        table_id            VARCHAR(255)    NOT NULL PRIMARY KEY,
+        schema_name         VARCHAR(128)    NOT NULL,
+        table_name          VARCHAR(128)    NOT NULL,
+        status              VARCHAR(32)     NOT NULL DEFAULT 'pending',
+        -- статусы: pending | enriching | ready | degraded | removing | removed
+
+        -- флаги выполненных этапов
+        stage_dwh_done      BOOLEAN         NOT NULL DEFAULT FALSE,
+        stage_jira_done     BOOLEAN         NOT NULL DEFAULT FALSE,
+        stage_llm_done      BOOLEAN         NOT NULL DEFAULT FALSE,
+
+        -- с какого этапа возобновить при ошибке
+        resume_from_stage   VARCHAR(64)     NULL,
+
+        priority            INT             NOT NULL DEFAULT 0,
+        retry_count         INT             NOT NULL DEFAULT 0,
+        error_message       TEXT            NULL,
+
+        registered_at       DATETIME        NOT NULL,
+        last_updated_at     DATETIME        NULL,
+        completed_at        DATETIME        NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """
+
+    ddl_log = """
+    CREATE TABLE IF NOT EXISTS text2sql_enrichment_log (
+        id              BIGINT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        table_id        VARCHAR(255)    NOT NULL,
+        stage           VARCHAR(64)     NOT NULL,
+        status          VARCHAR(32)     NOT NULL,   -- started | success | failed | skipped
+        duration_ms     INT             NULL,
+        details         JSON            NULL,
+        created_at      DATETIME        NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """
+
+    with self._conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(ddl_registry)
+            cur.execute(ddl_log)
+        conn.commit()
+    logger.info("Registry tables ensured")
+
+# ------------------------------------------------------------------
+# Жизненный цикл
+# ------------------------------------------------------------------
+
+def register(self, table_id: str, priority: int = 0):
+    """Idempotent — повторная регистрация не ломает состояние"""
+    schema, table = table_id.split(".", 1)
+    with self._conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO text2sql_table_registry
+                    (table_id, schema_name, table_name, status, priority, registered_at)
+                VALUES (%s, %s, %s, 'pending', %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    status          = IF(status IN ('removed','degraded'), 'pending', status),
+                    priority        = VALUES(priority),
+                    resume_from_stage = NULL,
+                    error_message   = NULL
+            """, (table_id, schema, table, priority, datetime.now()))
+        conn.commit()
+    logger.info(f"Registered: {table_id}")
+
+def claim_pending(self) -> Optional[str]:
+    """
+    Атомарно захватывает одну PENDING-таблицу и переводит в ENRICHING.
+    Возвращает table_id или None если очередь пуста.
+    """
+    with self._conn() as conn:
+        with conn.cursor() as cur:
+            # Сначала ищем — с учётом приоритета и retry
+            cur.execute("""
+                SELECT table_id FROM text2sql_table_registry
+                WHERE status = 'pending'
+                ORDER BY priority DESC, registered_at ASC
+                LIMIT 1
+                FOR UPDATE
+            """)
+            row = cur.fetchone()
+            if not row:
+                return None
+
+            table_id = row["table_id"]
+            cur.execute("""
+                UPDATE text2sql_table_registry
+                SET status        = 'enriching',
+                    retry_count   = retry_count + 1,
+                    last_updated_at = %s
+                WHERE table_id = %s
+            """, (datetime.now(), table_id))
+        conn.commit()
+    logger.info(f"Claimed: {table_id}")
+    return table_id
+
+def get(self, table_id: str) -> Optional[dict]:
+    with self._conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM text2sql_table_registry WHERE table_id = %s",
+                (table_id,)
+            )
+            return cur.fetchone()
+
+def get_by_status(self, status: str) -> list:
+    with self._conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT table_id FROM text2sql_table_registry WHERE status = %s",
+                (status,)
+            )
+            return [r["table_id"] for r in cur.fetchall()]
+
+# ------------------------------------------------------------------
+# Обновление состояния
+# ------------------------------------------------------------------
+
+def mark_stage_done(self, table_id: str, stage_name: str):
+    """
+    Отмечает этап как выполненный.
+    resume_from_stage сбрасывается — при следующей ошибке
+    он будет выставлен заново на упавшем этапе.
+    """
+    flag_col = f"stage_{stage_name}_done"
+    with self._conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                UPDATE text2sql_table_registry
+                SET {flag_col}        = TRUE,
+                    resume_from_stage = NULL,
+                    last_updated_at   = %s
+                WHERE table_id = %s
+            """, (datetime.now(), table_id))
+        conn.commit()
+
+def mark_failed(self, table_id: str, failed_stage: str, error: str):
+    """
+    Переводит в DEGRADED и запоминает с какого этапа возобновить.
+    """
+    with self._conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE text2sql_table_registry
+                SET status            = 'degraded',
+                    resume_from_stage = %s,
+                    error_message     = %s,
+                    last_updated_at   = %s
+                WHERE table_id = %s
+            """, (failed_stage, error[:2000], datetime.now(), table_id))
+        conn.commit()
+    logger.error(f"[{table_id}] Marked degraded at stage [{failed_stage}]: {error}")
+
+def mark_ready(self, table_id: str):
+    with self._conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE text2sql_table_registry
+                SET status            = 'ready',
+                    resume_from_stage = NULL,
+                    error_message     = NULL,
+                    completed_at      = %s,
+                    last_updated_at   = %s
+                WHERE table_id = %s
+            """, (datetime.now(), datetime.now(), table_id))
+        conn.commit()
+
+def reset_to_pending(self, table_id: str):
+    """Для retry деградировавших — статус pending, resume_from_stage сохраняется"""
+    with self._conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE text2sql_table_registry
+                SET status = 'pending', last_updated_at = %s
+                WHERE table_id = %s
+            """, (datetime.now(), table_id))
+        conn.commit()
+
+# ------------------------------------------------------------------
+# Логирование
+# ------------------------------------------------------------------
+
+def log_event(self, table_id: str, stage: str,
+              status: str, duration_ms: int = None, details: dict = None):
+    with self._conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO text2sql_enrichment_log
+                    (table_id, stage, status, duration_ms, details, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (
+                table_id, stage, status, duration_ms,
+                json.dumps(details or {}, ensure_ascii=False),
+                datetime.now(),
+            ))
+        conn.commit()
+```
+
+
+
+# config/settings.py
+
+# Все креды и настройки в одном месте
+
+from dataclasses import dataclass, field
+
+@dataclass
+class RegistryDbConfig:
+“”“БД где хранится реестр таблиц и логи пайплайна”””
+host: str
+port: int
+user: str
+password: str
+database: str
+charset: str = “utf8mb4”
+
+@dataclass
+class DwhDbConfig:
+“”“StarRocks / источник метаданных таблиц”””
+host: str
+port: int
+user: str
+password: str
+database: str
+charset: str = “utf8mb4”
+
+@dataclass
+class JiraConfig:
+base_url: str        # https://jira.company.com
+user: str            # email или логин
+token: str           # API token
+project_key: str     # PROJECT
+timeout: int = 30
+
+@dataclass
+class LlmConfig:
+base_url: str        # http://localhost:11434/v1  (ollama) или OpenAI-совместимый
+api_key: str
+model: str           # llama3, gpt-4o-mini и т.д.
+temperature: float = 0.1
+max_tokens: int = 1024
+timeout: int = 60
+
+@dataclass
+class AppConfig:
+registry_db: RegistryDbConfig
+dwh_db: DwhDbConfig
+jira: JiraConfig
+llm: LlmConfig
+
+# ———————————————————————–
+
+# Конкретные значения — меняй здесь или вынеси в .env
+
+# ———————————————————————–
+
+def load_config() -> AppConfig:
+return AppConfig(
+registry_db=RegistryDbConfig(
+host=“localhost”,
+port=9030,
+user=“registry_user”,
+password=“registry_pass”,
+database=“text2sql_meta”,
+),
+dwh_db=DwhDbConfig(
+host=“starrocks-host”,
+port=9030,
+user=“dwh_reader”,
+password=“dwh_pass”,
+database=“dwh”,
+),
+jira=JiraConfig(
+base_url=“https://jira.company.com”,
+user=“svc_text2sql@company.com”,
+token=“ATATT3xFfGF0…”,
+project_key=“DWH”,
+),
+llm=LlmConfig(
+base_url=“http://localhost:11434/v1”,
+api_key=“ollama”,           # для ollama любое значение
+model=“llama3.1:8b”,
+temperature=0.1,
+max_tokens=1024,
+),
+)
+
+
+# pipeline/base_stage.py
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+
+@dataclass
+class StageResult:
+success: bool
+error: str = None
+details: dict = field(default_factory=dict)   # пишется в enrichment_log
+skipped: bool = False
+
+class BaseStage(ABC):
+“””
+Каждый этап:
+- имеет уникальное имя (совпадает с колонкой stage_<name>_done в реестре)
+- сохраняет результаты в свою таблицу самостоятельно
+- не передаёт данные следующим этапам через context
+“””
+name: str = None        # обязательно переопределить
+required: bool = True   # если False — ошибка этапа не останавливает пайплайн
+
+```
+@abstractmethod
+def execute(self, table_id: str) -> StageResult:
+    ...
+
+def should_skip(self, registry_row: dict) -> bool:
+    """
+    Пропустить если уже выполнено (для возобновления с аварийного места).
+    Читает флаг stage_<name>_done из реестра.
+    """
+    flag = f"stage_{self.name}_done"
+    return bool(registry_row.get(flag, False))
+```
+
+
+
+# pipeline/stages/dwh_enricher.py
+
+# 
+
+# Этап 1: обогащение метаданными из DWH (StarRocks/MySQL-compatible)
+
+# Сохраняет результат в таблицу text2sql_dwh_meta
+
+import logging
+import pymysql
+import pymysql.cursors
+from datetime import datetime
+
+from pipeline.base_stage import BaseStage, StageResult
+
+logger = logging.getLogger(**name**)
+
+class DwhEnricher(BaseStage):
+name = “dwh”
+required = True
+
+```
+def __init__(self, dwh_config, registry_config):
+    self._dwh_cfg = dwh_config
+    self._reg_cfg = registry_config
+
+def _dwh_conn(self):
+    return pymysql.connect(
+        host=self._dwh_cfg.host,
+        port=self._dwh_cfg.port,
+        user=self._dwh_cfg.user,
+        password=self._dwh_cfg.password,
+        database=self._dwh_cfg.database,
+        charset=self._dwh_cfg.charset,
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+
+def _reg_conn(self):
+    return pymysql.connect(
+        host=self._reg_cfg.host,
+        port=self._reg_cfg.port,
+        user=self._reg_cfg.user,
+        password=self._reg_cfg.password,
+        database=self._reg_cfg.database,
+        charset=self._reg_cfg.charset,
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=False,
+    )
+
+def _ensure_output_table(self, conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS text2sql_dwh_meta (
+                table_id        VARCHAR(255)    NOT NULL,
+                column_name     VARCHAR(128)    NOT NULL,
+                data_type       VARCHAR(128)    NOT NULL,
+                is_nullable     BOOLEAN,
+                column_comment  TEXT,
+                ordinal_position INT,
+                enriched_at     DATETIME        NOT NULL,
+                PRIMARY KEY (table_id, column_name)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+    conn.commit()
+
+def execute(self, table_id: str) -> StageResult:
+    schema_name, table_name = table_id.split(".", 1)
+
+    # 1. Читаем метаданные колонок из DWH
+    try:
+        with self._dwh_conn() as dwh:
+            with dwh.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        COLUMN_NAME       AS column_name,
+                        DATA_TYPE         AS data_type,
+                        IS_NULLABLE       AS is_nullable,
+                        COLUMN_COMMENT    AS column_comment,
+                        ORDINAL_POSITION  AS ordinal_position
+                    FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = %s
+                      AND TABLE_NAME   = %s
+                    ORDER BY ORDINAL_POSITION
+                """, (schema_name, table_name))
+                columns = dwh.fetchall()
+    except Exception as e:
+        return StageResult(success=False, error=f"DWH read error: {e}")
+
+    if not columns:
+        return StageResult(
+            success=False,
+            error=f"Table {table_id} not found in DWH information_schema"
+        )
+
+    # 2. Сохраняем в свою таблицу в registry БД
+    try:
+        with self._reg_conn() as reg:
+            self._ensure_output_table(reg)
+            with reg.cursor() as cur:
+                # Удаляем устаревшие данные перед вставкой
+                cur.execute(
+                    "DELETE FROM text2sql_dwh_meta WHERE table_id = %s",
+                    (table_id,)
+                )
+                cur.executemany("""
+                    INSERT INTO text2sql_dwh_meta
+                        (table_id, column_name, data_type,
+                         is_nullable, column_comment, ordinal_position, enriched_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, [
+                    (
+                        table_id,
+                        col["column_name"],
+                        col["data_type"],
+                        col["is_nullable"] == "YES",
+                        col.get("column_comment", ""),
+                        col["ordinal_position"],
+                        datetime.now(),
+                    )
+                    for col in columns
+                ])
+            reg.commit()
+    except Exception as e:
+        return StageResult(success=False, error=f"Registry write error: {e}")
+
+    logger.info(f"[{table_id}] DWH: saved {len(columns)} columns")
+    return StageResult(
+        success=True,
+        details={"columns_count": len(columns)}
+    )
+```
+
+
+
+# pipeline/stages/jira_enricher.py
+
+# 
+
+# Этап 2: поиск связанных задач Jira по имени таблицы
+
+# Сохраняет результат в таблицу text2sql_jira_issues
+
+import logging
+import requests
+from datetime import datetime
+
+import pymysql
+import pymysql.cursors
+
+from pipeline.base_stage import BaseStage, StageResult
+
+logger = logging.getLogger(**name**)
+
+class JiraEnricher(BaseStage):
+name = “jira”
+required = False        # Jira может быть недоступна — не блокируем пайплайн
+
+```
+def __init__(self, jira_config, registry_config):
+    self._jira_cfg = jira_config
+    self._reg_cfg = registry_config
+
+def _reg_conn(self):
+    return pymysql.connect(
+        host=self._reg_cfg.host,
+        port=self._reg_cfg.port,
+        user=self._reg_cfg.user,
+        password=self._reg_cfg.password,
+        database=self._reg_cfg.database,
+        charset=self._reg_cfg.charset,
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=False,
+    )
+
+def _ensure_output_table(self, conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS text2sql_jira_issues (
+                id              BIGINT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                table_id        VARCHAR(255)    NOT NULL,
+                issue_key       VARCHAR(64)     NOT NULL,
+                summary         TEXT,
+                status          VARCHAR(64),
+                issue_type      VARCHAR(64),
+                description     TEXT,
+                enriched_at     DATETIME        NOT NULL,
+                UNIQUE KEY uq_table_issue (table_id, issue_key)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+    conn.commit()
+
+def _search_jira(self, table_name: str) -> list[dict]:
+    """JQL-поиск задач упоминающих имя таблицы"""
+    jql = (
+        f'project = "{self._jira_cfg.project_key}" '
+        f'AND text ~ "{table_name}" '
+        f'ORDER BY updated DESC'
+    )
+    url = f"{self._jira_cfg.base_url}/rest/api/2/search"
+    resp = requests.get(
+        url,
+        params={"jql": jql, "maxResults": 20,
+                "fields": "summary,status,issuetype,description"},
+        auth=(self._jira_cfg.user, self._jira_cfg.token),
+        timeout=self._jira_cfg.timeout,
+    )
+    resp.raise_for_status()
+    return resp.json().get("issues", [])
+
+def execute(self, table_id: str) -> StageResult:
+    _, table_name = table_id.split(".", 1)
+
+    # 1. Запрос в Jira
+    try:
+        issues = self._search_jira(table_name)
+    except requests.RequestException as e:
+        return StageResult(success=False, error=f"Jira API error: {e}")
+
+    # 2. Сохраняем в registry БД
+    try:
+        with self._reg_conn() as reg:
+            self._ensure_output_table(reg)
+            with reg.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM text2sql_jira_issues WHERE table_id = %s",
+                    (table_id,)
+                )
+                if issues:
+                    cur.executemany("""
+                        INSERT INTO text2sql_jira_issues
+                            (table_id, issue_key, summary, status, issue_type, description, enriched_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """, [
+                        (
+                            table_id,
+                            issue["key"],
+                            issue["fields"].get("summary", ""),
+                            issue["fields"].get("status", {}).get("name", ""),
+                            issue["fields"].get("issuetype", {}).get("name", ""),
+                            (issue["fields"].get("description") or "")[:4000],
+                            datetime.now(),
+                        )
+                        for issue in issues
+                    ])
+            reg.commit()
+    except Exception as e:
+        return StageResult(success=False, error=f"Registry write error: {e}")
+
+    logger.info(f"[{table_id}] Jira: found {len(issues)} issues")
+    return StageResult(
+        success=True,
+        details={"issues_found": len(issues)}
+    )
+```
+
+
+
+# pipeline/stages/llm_describer.py
+
+# 
+
+# Этап 3: генерация описания таблицы через LLM
+
+# Читает из text2sql_dwh_meta и text2sql_jira_issues (уже сохранены предыдущими этапами)
+
+# Сохраняет результат в text2sql_llm_descriptions
+
+import json
+import logging
+import requests
+from datetime import datetime
+
+import pymysql
+import pymysql.cursors
+
+from pipeline.base_stage import BaseStage, StageResult
+
+logger = logging.getLogger(**name**)
+
+PROMPT_TEMPLATE = “”“Ты эксперт по корпоративным данным. На основе информации о таблице сформируй её описание для системы Text2SQL.
+
+Таблица: {table_id}
+
+Колонки:
+{columns_block}
+
+Связанные задачи Jira:
+{jira_block}
+
+Сформируй JSON строго по схеме (никакого текста вне JSON):
+{{
+“table_description”: “краткое описание таблицы на русском (2-3 предложения)”,
+“business_purpose”: “для чего используется бизнесом”,
+“column_descriptions”: {{
+“column_name”: “описание колонки”
+}},
+“typical_queries”: [“пример запроса 1”, “пример запроса 2”]
+}}”””
+
+class LlmDescriber(BaseStage):
+name = “llm”
+required = True
+
+```
+def __init__(self, llm_config, registry_config):
+    self._llm_cfg = llm_config
+    self._reg_cfg = registry_config
+
+def _reg_conn(self):
+    return pymysql.connect(
+        host=self._reg_cfg.host,
+        port=self._reg_cfg.port,
+        user=self._reg_cfg.user,
+        password=self._reg_cfg.password,
+        database=self._reg_cfg.database,
+        charset=self._reg_cfg.charset,
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=False,
+    )
+
+def _ensure_output_table(self, conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS text2sql_llm_descriptions (
+                table_id            VARCHAR(255)    NOT NULL PRIMARY KEY,
+                table_description   TEXT,
+                business_purpose    TEXT,
+                column_descriptions JSON,
+                typical_queries     JSON,
+                raw_response        TEXT,
+                enriched_at         DATETIME        NOT NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+    conn.commit()
+
+def _load_dwh_meta(self, conn, table_id: str) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT column_name, data_type, column_comment
+            FROM text2sql_dwh_meta
+            WHERE table_id = %s
+            ORDER BY ordinal_position
+        """, (table_id,))
+        return cur.fetchall()
+
+def _load_jira_issues(self, conn, table_id: str) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT issue_key, summary, status, description
+            FROM text2sql_jira_issues
+            WHERE table_id = %s
+            LIMIT 5
+        """, (table_id,))
+        return cur.fetchall()
+
+def _call_llm(self, prompt: str) -> str:
+    payload = {
+        "model": self._llm_cfg.model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": self._llm_cfg.temperature,
+        "max_tokens": self._llm_cfg.max_tokens,
+    }
+    resp = requests.post(
+        f"{self._llm_cfg.base_url}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {self._llm_cfg.api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=self._llm_cfg.timeout,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+def _parse_llm_response(self, raw: str) -> dict:
+    # Убираем возможные markdown-обёртки
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("```")[1]
+        if cleaned.startswith("json"):
+            cleaned = cleaned[4:]
+    return json.loads(cleaned.strip())
+
+def execute(self, table_id: str) -> StageResult:
+    with self._reg_conn() as reg:
+        self._ensure_output_table(reg)
+
+        # 1. Загружаем данные предыдущих этапов из БД
+        columns = self._load_dwh_meta(reg, table_id)
+        issues  = self._load_jira_issues(reg, table_id)
+
+    if not columns:
+        return StageResult(
+            success=False,
+            error=f"No DWH metadata found for {table_id}. Run dwh stage first."
+        )
+
+    # 2. Строим промпт
+    columns_block = "\n".join(
+        f"  - {c['column_name']} ({c['data_type']})"
+        + (f": {c['column_comment']}" if c.get("column_comment") else "")
+        for c in columns
+    )
+    jira_block = "\n".join(
+        f"  [{i['issue_key']}] {i['summary']} ({i['status']})"
+        for i in issues
+    ) or "  Связанные задачи не найдены"
+
+    prompt = PROMPT_TEMPLATE.format(
+        table_id=table_id,
+        columns_block=columns_block,
+        jira_block=jira_block,
+    )
+
+    # 3. Вызов LLM
+    try:
+        raw_response = self._call_llm(prompt)
+    except Exception as e:
+        return StageResult(success=False, error=f"LLM API error: {e}")
+
+    # 4. Парсинг ответа
+    try:
+        parsed = self._parse_llm_response(raw_response)
+    except json.JSONDecodeError as e:
+        return StageResult(
+            success=False,
+            error=f"LLM returned invalid JSON: {e}",
+            details={"raw_response": raw_response[:500]}
+        )
+
+    # 5. Сохраняем в БД
+    try:
+        with self._reg_conn() as reg:
+            with reg.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO text2sql_llm_descriptions
+                        (table_id, table_description, business_purpose,
+                         column_descriptions, typical_queries, raw_response, enriched_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        table_description   = VALUES(table_description),
+                        business_purpose    = VALUES(business_purpose),
+                        column_descriptions = VALUES(column_descriptions),
+                        typical_queries     = VALUES(typical_queries),
+                        raw_response        = VALUES(raw_response),
+                        enriched_at         = VALUES(enriched_at)
+                """, (
+                    table_id,
+                    parsed.get("table_description", ""),
+                    parsed.get("business_purpose", ""),
+                    json.dumps(parsed.get("column_descriptions", {}), ensure_ascii=False),
+                    json.dumps(parsed.get("typical_queries", []), ensure_ascii=False),
+                    raw_response[:8000],
+                    datetime.now(),
+                ))
+            reg.commit()
+    except Exception as e:
+        return StageResult(success=False, error=f"Registry write error: {e}")
+
+    logger.info(f"[{table_id}] LLM: description generated successfully")
+    return StageResult(
+        success=True,
+        details={"prompt_len": len(prompt), "response_len": len(raw_response)}
+    )
+```
+
+
+
