@@ -12279,3 +12279,20 @@ def execute(self, table_id: str) -> StageResult:
 
 
 
+
+
+
+import hashlib
+import pymysql
+
+def get_ddl_hash(conn, table_id: str) -> str:
+    schema, table = table_id.split(".", 1)
+    with conn.cursor() as cur:
+        cur.execute(f"SHOW CREATE TABLE `{schema}`.`{table}`")
+        row = cur.fetchone()
+        # StarRocks возвращает (table_name, create_statement)
+        ddl = row[1] if isinstance(row, tuple) else row["Create Table"]
+    return hashlib.md5(ddl.encode("utf-8")).hexdigest()
+
+
+
