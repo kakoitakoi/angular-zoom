@@ -12296,3 +12296,163 @@ def get_ddl_hash(conn, table_id: str) -> str:
 
 
 
+
+
+
+
+
+
+
+import json
+import pymysql
+from dataclasses import dataclass
+
+# ── Конфиг ────────────────────────────────────────────────────────────────────
+
+DORIS_CFG = dict(
+    host="your_doris_host",
+    port=9030,
+    user="your_user",
+    password="your_password",
+    database="your_db",
+    charset="utf8mb4",
+)
+
+THRESHOLD = 0.8  # 80% схожести
+
+
+# ── Датакласс для результата ───────────────────────────────────────────────────
+
+@dataclass
+class SimilarityResult:
+    row_id: int
+    name: str
+    arr: list[str]
+    intersection: set
+    union_size: int
+    jaccard: float
+
+    def __str__(self):
+        return (
+            f"[{self.jaccard:.1%}] id={self.row_id} name={self.name} "
+            f"| common={sorted(self.intersection)}"
+        )
+
+
+# ── Утилиты ───────────────────────────────────────────────────────────────────
+
+def parse_array(raw: str) -> set[str]:
+    """Парсит текстовое поле '["table1", "table3"]' → set."""
+    if not raw:
+        return set()
+    try:
+        parsed = json.loads(raw)
+        return {str(x).lower().strip() for x in parsed}  # нормализация
+    except json.JSONDecodeError:
+        return set()
+
+
+def jaccard(a: set, b: set) -> float:
+    """Симметричная схожесть Jaccard: |A ∩ B| / |A ∪ B|."""
+    if not a and not b:
+        return 1.0
+    union = a | b
+    return len(a & b) / len(union) if union else 0.0
+
+
+def containment(a: set, b: set) -> float:
+    """Направленная схожесть: сколько % из A присутствует в B."""
+    if not a:
+        return 0.0
+    return len(a & b) / len(a)
+
+
+# ── Основная логика ────────────────────────────────────────────────────────────
+
+def get_reference_array(conn, table: str, row_id: int, col: str) -> set[str]:
+    """Достаём один эталонный массив по ID."""
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT {col} FROM {table} WHERE id = %s", (row_id,))
+        row = cur.fetchone()
+    if not row:
+        raise ValueError(f"Row id={row_id} not found in {table}")
+    return parse_array(row[0])
+
+
+def find_similar(
+    conn,
+    ref_set: set[str],
+    table: str,
+    col: str,
+    threshold: float = THRESHOLD,
+    mode: str = "jaccard",   # "jaccard" | "containment"
+) -> list[SimilarityResult]:
+    """
+    Сравниваем ref_set со всеми строками таблицы.
+    mode='containment' — сколько % из ref присутствует в каждой строке.
+    mode='jaccard'     — симметричная схожесть.
+    """
+    results = []
+
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT id, name, {col} FROM {table}")
+        rows = cur.fetchall()
+
+    for row_id, name, raw in rows:
+        candidate = parse_array(raw)
+        if not candidate:
+            continue
+
+        score = jaccard(ref_set, candidate) if mode == "jaccard" else containment(ref_set, candidate)
+
+        if score >= threshold:
+            results.append(SimilarityResult(
+                row_id=row_id,
+                name=name,
+                arr=sorted(candidate),
+                intersection=ref_set & candidate,
+                union_size=len(ref_set | candidate),
+                jaccard=score,
+            ))
+
+    return sorted(results, key=lambda r: r.jaccard, reverse=True)
+
+
+# ── Точка входа ────────────────────────────────────────────────────────────────
+
+def main():
+    conn = pymysql.connect(**DORIS_CFG)
+
+    try:
+        # 1. Эталонный массив из таблицы 1
+        ref = get_reference_array(
+            conn,
+            table="table_one",
+            row_id=42,
+            col="tables_array",
+        )
+        print(f"Reference set ({len(ref)} items): {sorted(ref)}\n")
+
+        # 2. Ищем схожие в таблице 2
+        matches = find_similar(
+            conn,
+            ref_set=ref,
+            table="table_two",
+            col="tables_array",
+            threshold=THRESHOLD,
+            mode="jaccard",          # или "containment"
+        )
+
+        # 3. Вывод
+        print(f"Found {len(matches)} matches (threshold={THRESHOLD:.0%}):\n")
+        for m in matches:
+            print(m)
+
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()
+
+
