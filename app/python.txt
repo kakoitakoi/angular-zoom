@@ -12456,3 +12456,168 @@ if __name__ == "__main__":
     main()
 
 
+
+
+
+
+
+mcp server
+
+"""
+MCP SSE Server — инструмент query_doris
+Запуск: python mcp_doris_server.py
+Зависимости: pip install "mcp[cli]" pymysql
+"""
+
+import os
+import pymysql
+import pymysql.cursors
+from mcp.server.fastmcp import FastMCP
+
+# ── Конфигурация Doris ────────────────────────────────────────────────────────
+DORIS_HOST = os.getenv("DORIS_HOST", "localhost")
+DORIS_PORT = int(os.getenv("DORIS_PORT", "9030"))
+DORIS_USER = os.getenv("DORIS_USER", "root")
+DORIS_PASSWORD = os.getenv("DORIS_PASSWORD", "")
+DORIS_DB = os.getenv("DORIS_DB", "test_db")
+# ─────────────────────────────────────────────────────────────────────────────
+
+mcp = FastMCP("doris-query-server")
+
+
+def get_connection() -> pymysql.connections.Connection:
+    return pymysql.connect(
+        host=DORIS_HOST,
+        port=DORIS_PORT,
+        user=DORIS_USER,
+        password=DORIS_PASSWORD,
+        database=DORIS_DB,
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+        connect_timeout=10,
+    )
+
+
+@mcp.tool()
+def query_doris(sql: str) -> dict:
+    """
+    Выполняет SELECT-запрос в Apache Doris и возвращает результат.
+
+    Args:
+        sql: SQL-запрос (только SELECT; другие операторы будут отклонены).
+
+    Returns:
+        Словарь с ключами:
+          - columns: список названий колонок
+          - rows:    список строк (каждая строка — словарь {колонка: значение})
+          - row_count: количество строк
+    """
+    # Простая защита — разрешаем только SELECT
+    normalized = sql.strip().upper()
+    if not normalized.startswith("SELECT"):
+        return {"error": "Разрешены только SELECT-запросы."}
+
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(sql)
+                rows = cursor.fetchall()  # list[dict]
+                columns = [desc[0] for desc in cursor.description] if cursor.description else []
+        finally:
+            conn.close()
+
+        # pymysql с DictCursor уже даёт list[dict], но значения могут быть
+        # не-JSON-сериализуемыми (Decimal, date, …) — конвертируем в str
+        safe_rows = [
+            {k: (str(v) if v is not None else None) for k, v in row.items()}
+            for row in rows
+        ]
+
+        return {
+            "columns": columns,
+            "rows": safe_rows,
+            "row_count": len(safe_rows),
+        }
+
+    except pymysql.MySQLError as e:
+        return {"error": f"Ошибка Doris: {e}"}
+    except Exception as e:
+        return {"error": f"Неожиданная ошибка: {e}"}
+
+
+if __name__ == "__main__":
+    # SSE transport — сервер поднимается на http://localhost:8000/sse
+    mcp.run(transport="sse")
+
+
+
+mcp client
+
+"""
+MCP SSE Client — тестирует инструмент query_doris
+Запуск: python mcp_doris_client.py
+Зависимости: pip install "mcp[cli]"
+"""
+
+import asyncio
+import json
+from mcp.client.sse import sse_client
+from mcp import ClientSession
+
+SERVER_URL = "http://localhost:8000/sse"
+
+# Запросы для тестирования — подставьте свои таблицы
+TEST_QUERIES = [
+    "SELECT 1 AS ping",                          # health-check без Doris
+    "SELECT NOW() AS server_time",               # время сервера Doris
+    "SELECT DATABASE() AS current_db",           # текущая БД
+    "SELECT * FROM information_schema.tables LIMIT 5",  # реальные данные
+]
+
+
+async def run_client():
+    print(f"Подключаемся к MCP-серверу: {SERVER_URL}\n{'='*60}")
+
+    async with sse_client(SERVER_URL) as (read, write):
+        async with ClientSession(read, write) as session:
+
+            # 1. Инициализация
+            await session.initialize()
+            print("✅ Сессия инициализирована\n")
+
+            # 2. Список инструментов
+            tools_response = await session.list_tools()
+            print("Доступные инструменты:")
+            for tool in tools_response.tools:
+                print(f"  • {tool.name}: {tool.description}")
+            print()
+
+            # 3. Вызов каждого тестового запроса
+            for sql in TEST_QUERIES:
+                print(f"─── SQL: {sql}")
+                result = await session.call_tool("query_doris", {"sql": sql})
+
+                # result.content — список TextContent / ImageContent / …
+                for block in result.content:
+                    if block.type == "text":
+                        try:
+                            data = json.loads(block.text)
+                            if "error" in data:
+                                print(f"  ⚠️  Ошибка: {data['error']}")
+                            else:
+                                print(f"  Колонки:   {data['columns']}")
+                                print(f"  Строк:     {data['row_count']}")
+                                for row in data["rows"]:
+                                    print(f"             {row}")
+                        except json.JSONDecodeError:
+                            print(f"  Raw: {block.text}")
+                print()
+
+    print("='*60\nКлиент завершил работу.")
+
+
+if __name__ == "__main__":
+    asyncio.run(run_client())
+
+
