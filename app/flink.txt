@@ -115,3 +115,44 @@ public class CreateIcebergTable {
         catalog.close();
     }
 }
+
+
+
+
+
+
+-- 1. Зарегистрировать Iceberg каталог в Flink
+CREATE CATALOG iceberg_catalog WITH (
+    'type' = 'iceberg',
+    'catalog-type' = 'jdbc',
+    'uri' = 'jdbc:postgresql://your-pg-host:5432/iceberg_catalog',
+    'jdbc.user' = 'iceberg',
+    'jdbc.password' = 'password',
+    'warehouse' = 's3://your-bucket/iceberg',
+    's3.endpoint' = 'http://your-minio-host:9000',
+    's3.access-key' = 'YOUR_ACCESS_KEY',
+    's3.secret-key' = 'YOUR_SECRET_KEY',
+    's3.path-style-access' = 'true'  -- для MinIO
+);
+
+-- 2. Переключиться в каталог
+USE CATALOG iceberg_catalog;
+
+-- 3. Создать базу
+CREATE DATABASE test_db;
+USE test_db;
+
+-- 4. Создать таблицу
+CREATE TABLE events (
+    id          BIGINT,
+    dt          DATE,
+    source      STRING,
+    amount      DECIMAL(18, 2),
+    created_at  TIMESTAMP(6)
+)
+PARTITIONED BY (dt)
+WITH (
+    'format-version' = '2',
+    'write.target-file-size-bytes' = '536870912'  -- 512 MB
+);
+
