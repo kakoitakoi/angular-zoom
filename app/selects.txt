@@ -312,3 +312,45 @@ ORDER BY jaccard_pct DESC;
 
 
 
+
+
+CREATE TABLE aws_events (
+    ssohash               STRING,
+    user_id_hash          STRING,
+    product_id            STRING,
+    event_name            STRING,
+    is_promoted           STRING,
+    platform              STRING,
+    category_id           STRING,
+    category_level_1      STRING,
+    category_level_2      STRING,
+    category_level_3      STRING,
+    category_level_4      STRING,
+    category_level_5      STRING,
+    brand                 STRING,
+    rating                STRING,
+    product_name          STRING,
+    shop_test_group       STRING,
+    shop_city             STRING,
+    price                 STRING,
+    event_timestamp       TIMESTAMP(6),
+    block_name            STRING,
+    page_category         STRING,
+    ads_unique_id         STRING,
+    ads_supplier_id       STRING,
+    listitems_product_id  STRING,
+    app_id                STRING,
+    sso_hash              STRING,
+    dt                    DATE,
+    PRIMARY KEY (event_name, user_id_hash, event_timestamp, dt) NOT ENFORCED
+)
+PARTITIONED BY (dt)
+WITH (
+    'format-version' = '2',
+    'write.upsert.enabled' = 'true',
+    'write.merge.mode' = 'merge-on-read',
+    'write.target-file-size-bytes' = '536870912'
+);
+
+
+
