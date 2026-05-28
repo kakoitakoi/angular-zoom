@@ -1,0 +1,117 @@
+<dependency>
+    <groupId>org.apache.iceberg</groupId>
+    <artifactId>iceberg-core</artifactId>
+    <version>1.4.0</version>
+</dependency>
+<dependency>
+    <groupId>org.apache.iceberg</groupId>
+    <artifactId>iceberg-aws</artifactId>
+    <version>1.4.0</version>
+</dependency>
+<dependency>
+    <groupId>org.apache.iceberg</groupId>
+    <artifactId>iceberg-flink-runtime-1.18</artifactId>
+    <version>1.4.0</version>
+</dependency>
+<dependency>
+    <groupId>org.postgresql</groupId>
+    <artifactId>postgresql</artifactId>
+    <version>42.6.0</version>
+</dependency>
+
+
+
+import org.apache.iceberg.*;
+import org.apache.iceberg.catalog.*;
+import org.apache.iceberg.jdbc.JdbcCatalog;
+import org.apache.iceberg.types.Types;
+import org.apache.hadoop.conf.Configuration;
+
+import java.util.HashMap;
+import java.util.Map;
+
+public class CreateIcebergTable {
+
+    public static void main(String[] args) {
+
+        // 1. Настройка каталога
+        Map<String, String> catalogProps = new HashMap<>();
+        catalogProps.put("uri", "jdbc:postgresql://your-pg-host:5432/iceberg_catalog");
+        catalogProps.put("jdbc.user", "iceberg");
+        catalogProps.put("jdbc.password", "password");
+        catalogProps.put("warehouse", "s3://your-bucket/iceberg");
+
+        // S3/MinIO настройки
+        catalogProps.put("io-impl", "org.apache.iceberg.aws.s3.S3FileIO");
+        catalogProps.put("s3.endpoint", "http://your-minio-host:9000");
+        catalogProps.put("s3.access-key-id", "YOUR_ACCESS_KEY");
+        catalogProps.put("s3.secret-access-key", "YOUR_SECRET_KEY");
+        catalogProps.put("s3.path-style-access", "true"); // для MinIO
+
+        // 2. Инициализация каталога
+        JdbcCatalog catalog = new JdbcCatalog();
+        catalog.initialize("iceberg_catalog", catalogProps, new Configuration());
+
+        // 3. Создать базу (namespace)
+        Namespace namespace = Namespace.of("test_db");
+        if (!catalog.namespaceExists(namespace)) {
+            catalog.createNamespace(namespace);
+            System.out.println("Namespace создан: test_db");
+        }
+
+        // 4. Определить схему
+        Schema schema = new Schema(
+            Types.NestedField.optional(1,  "ssohash",              Types.StringType.get()),
+            Types.NestedField.optional(2,  "user_id_hash",         Types.StringType.get()),
+            Types.NestedField.optional(3,  "product_id",           Types.StringType.get()),
+            Types.NestedField.required(4,  "event_name",           Types.StringType.get()),
+            Types.NestedField.optional(5,  "is_promoted",          Types.StringType.get()),
+            Types.NestedField.optional(6,  "platform",             Types.StringType.get()),
+            Types.NestedField.optional(7,  "category_id",          Types.StringType.get()),
+            Types.NestedField.optional(8,  "category_level_1",     Types.StringType.get()),
+            Types.NestedField.optional(9,  "category_level_2",     Types.StringType.get()),
+            Types.NestedField.optional(10, "category_level_3",     Types.StringType.get()),
+            Types.NestedField.optional(11, "category_level_4",     Types.StringType.get()),
+            Types.NestedField.optional(12, "category_level_5",     Types.StringType.get()),
+            Types.NestedField.optional(13, "brand",                Types.StringType.get()),
+            Types.NestedField.optional(14, "rating",               Types.StringType.get()),
+            Types.NestedField.optional(15, "product_name",         Types.StringType.get()),
+            Types.NestedField.optional(16, "shop_test_group",      Types.StringType.get()),
+            Types.NestedField.optional(17, "shop_city",            Types.StringType.get()),
+            Types.NestedField.optional(18, "price",                Types.StringType.get()),
+            Types.NestedField.required(19, "event_timestamp",      Types.TimestampType.withoutZone()),
+            Types.NestedField.optional(20, "block_name",           Types.StringType.get()),
+            Types.NestedField.optional(21, "page_category",        Types.StringType.get()),
+            Types.NestedField.optional(22, "ads_unique_id",        Types.StringType.get()),
+            Types.NestedField.optional(23, "ads_supplier_id",      Types.StringType.get()),
+            Types.NestedField.optional(24, "listitems_product_id", Types.StringType.get()),
+            Types.NestedField.optional(25, "app_id",               Types.StringType.get()),
+            Types.NestedField.optional(26, "sso_hash",             Types.StringType.get()),
+            Types.NestedField.required(27, "dt",                   Types.DateType.get())
+        );
+
+        // 5. Партиционирование по dt
+        PartitionSpec spec = PartitionSpec.builderFor(schema)
+            .day("dt")
+            .build();
+
+        // 6. Свойства таблицы
+        Map<String, String> tableProps = new HashMap<>();
+        tableProps.put("format-version", "2");
+        tableProps.put("write.upsert.enabled", "true");
+        tableProps.put("write.merge.mode", "merge-on-read");
+        tableProps.put("write.target-file-size-bytes", "536870912");
+
+        // 7. Создать таблицу
+        TableIdentifier tableId = TableIdentifier.of(namespace, "aws_events");
+
+        if (!catalog.tableExists(tableId)) {
+            catalog.createTable(tableId, schema, spec, tableProps);
+            System.out.println("Таблица создана: test_db.aws_events");
+        } else {
+            System.out.println("Таблица уже существует");
+        }
+
+        catalog.close();
+    }
+}
