@@ -242,3 +242,267 @@ public class MaintenanceScheduler {
         }
     }
 }
+
+
+
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+         http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>org.example</groupId>
+    <artifactId>iceberg-maintenance</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <properties>
+        <flink.version>1.20.0</flink.version>
+        <iceberg.version>1.11.0</iceberg.version>
+        <awssdk.version>2.20.68</awssdk.version>
+        <java.version>11</java.version>
+        <maven.compiler.source>${java.version}</maven.compiler.source>
+        <maven.compiler.target>${java.version}</maven.compiler.target>
+    </properties>
+
+    <dependencies>
+
+        <!-- Flink Streaming -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-streaming-java</artifactId>
+            <version>${flink.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- Iceberg Flink Runtime (fat jar — содержит всё) -->
+        <dependency>
+            <groupId>org.apache.iceberg</groupId>
+            <artifactId>iceberg-flink-runtime-1.20</artifactId>
+            <version>${iceberg.version}</version>
+        </dependency>
+
+        <!-- S3 FileIO -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>s3</artifactId>
+            <version>${awssdk.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>url-connection-client</artifactId>
+            <version>${awssdk.version}</version>
+        </dependency>
+
+        <!-- JDBC Catalog — PostgreSQL -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>42.6.0</version>
+        </dependency>
+
+        <!-- ZooKeeper Lock (опционально) -->
+        <dependency>
+            <groupId>org.apache.curator</groupId>
+            <artifactId>curator-framework</artifactId>
+            <version>5.5.0</version>
+            <optional>true</optional>
+        </dependency>
+
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.4.1</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals><goal>shade</goal></goals>
+                        <configuration>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>
+
+
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.flink.CatalogLoader;
+import org.apache.iceberg.flink.TableLoader;
+import org.apache.iceberg.flink.maintenance.api.DeleteOrphanFiles;
+import org.apache.iceberg.flink.maintenance.api.ExpireSnapshots;
+import org.apache.iceberg.flink.maintenance.api.RewriteDataFiles;
+import org.apache.iceberg.flink.maintenance.api.TableMaintenance;
+import org.apache.iceberg.flink.maintenance.operator.TaskResultAggregator;
+import org.apache.iceberg.flink.maintenance.api.TriggerLockFactory;
+import org.apache.iceberg.flink.maintenance.api.JdbcLockFactory;
+
+import java.util.HashMap;
+import java.util.Map;
+
+public class IcebergStreamingMaintenanceJob {
+
+    static final String DB    = "test_db";
+    static final String TABLE = "ANALOGS_BY_PROMOTED_AGG_DAILY";
+
+    public static void main(String[] args) throws Exception {
+
+        StreamExecutionEnvironment env =
+            StreamExecutionEnvironment.getExecutionEnvironment();
+
+        // Checkpoint обязателен для Streaming maintenance
+        env.enableCheckpointing(60_000);
+        env.getCheckpointConfig().setMinPauseBetweenCheckpoints(30_000);
+
+        // ============================================================
+        // Catalog Loader — твои реальные настройки
+        // ============================================================
+        Map<String, String> catalogProps = new HashMap<>();
+        catalogProps.put("catalog-impl",
+            "org.apache.iceberg.jdbc.JdbcCatalog");
+        catalogProps.put("uri",
+            "jdbc:postgresql://dwh-dbp30-ld2:5432/iceberg_catalog_ods"
+            + "?user=iceberg.catalog&password=P8in04I6xnxJRK");
+        catalogProps.put("io-impl",
+            "org.apache.iceberg.aws.s3.S3FileIO");
+        catalogProps.put("warehouse",
+            "s3://starrocks-ods/warehouse");
+        catalogProps.put("s3.endpoint",
+            "http://s3-hua5510-yr.hq.bc/");
+        catalogProps.put("s3.access-key-id",
+            "CT3OMI400WYYL64NQ6ZM");
+        catalogProps.put("s3.secret-access-key",
+            "/CM/3eqrR7u6ZQ8pdX654qI8MIDW5ad8cj/ABdKa");
+        catalogProps.put("s3.path-style-access",  "true");
+        catalogProps.put("s3.ssl.enabled",         "false");
+        catalogProps.put("s3.checksum-enabled",    "false");
+        catalogProps.put("s3.region",              "us-east-1");
+        catalogProps.put("client.region",          "us-east-1");
+
+        CatalogLoader catalogLoader = CatalogLoader.custom(
+            "iceberg_ods",
+            catalogProps,
+            new org.apache.hadoop.conf.Configuration(),
+            "org.apache.iceberg.jdbc.JdbcCatalog"
+        );
+
+        TableLoader tableLoader = TableLoader.fromCatalog(
+            catalogLoader,
+            TableIdentifier.of(DB, TABLE)
+        );
+
+        // ============================================================
+        // Lock Factory — нужен чтобы не запускать два maintenance
+        // одновременно. Используем тот же PostgreSQL что и для каталога
+        // ============================================================
+        TriggerLockFactory lockFactory = JdbcLockFactory.builder()
+            .uri("jdbc:postgresql://dwh-dbp30-ld2:5432/iceberg_catalog_ods"
+                + "?user=iceberg.catalog&password=P8in04I6xnxJRK")
+            .tableName("iceberg_maintenance_locks")   // создастся автоматически
+            .build();
+
+        // ============================================================
+        // TableMaintenance Streaming Pipeline
+        // ============================================================
+        TableMaintenance.forTable(env, tableLoader, lockFactory)
+
+            // --- 1. Expire Snapshots ---
+            // Каждые 30 минут, удалять снапшоты старше 1 часа
+            .add(ExpireSnapshots.builder()
+                .scheduleOnCommitCount(10)             // триггер: каждые 10 коммитов
+                .scheduleOnInterval(30 * 60 * 1000L)  // или каждые 30 мин
+                .maxSnapshotAge(60 * 60 * 1000L)       // удалять старше 1 часа
+                .retainLast(5)                         // минимум 5 снапшотов оставить
+                .parallelism(1)                        // одного потока достаточно
+                .build()
+            )
+
+            // --- 2. Rewrite Data Files (Compaction) ---
+            // Каждые 15 минут или каждые 5 коммитов
+            .add(RewriteDataFiles.builder()
+                .scheduleOnCommitCount(5)              // триггер: каждые 5 коммитов
+                .scheduleOnInterval(15 * 60 * 1000L)  // или каждые 15 мин
+                .targetFileSizeBytes(512 * 1024 * 1024L)   // 512MB целевой размер
+                .minFileSizeBytes(128 * 1024 * 1024L)      // < 128MB → переписать
+                .maxFileSizeBytes(768 * 1024 * 1024L)      // > 768MB → переписать
+                .deleteFileThreshold(2)                // >= 2 delete файлов → compaction
+                .partialProgressEnabled(true)          // частичный прогресс — не падать
+                .partialProgressMaxCommits(5)          // коммитить каждые 5 групп файлов
+                .parallelism(4)
+                .build()
+            )
+
+            // --- 3. Delete Orphan Files ---
+            // Раз в час, файлы старше 24 часов
+            .add(DeleteOrphanFiles.builder()
+                .scheduleOnInterval(60 * 60 * 1000L)  // каждый час
+                .olderThan(24 * 60 * 60 * 1000L)      // старше 24 часов
+                .parallelism(1)
+                .build()
+            )
+
+            .append();  // добавляем в pipeline
+
+        env.execute("Iceberg Streaming Maintenance — " + TABLE);
+    }
+}
+
+
+
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.iceberg.flink.maintenance.api.TableMaintenance;
+import org.apache.iceberg.flink.maintenance.api.RewriteDataFiles;
+
+public class IcebergBatchMaintenanceJob {
+
+    public static void main(String[] args) throws Exception {
+
+        StreamExecutionEnvironment env =
+            StreamExecutionEnvironment.getExecutionEnvironment();
+
+        // Batch режим — запускается один раз и завершается
+        env.setRuntimeMode(
+            org.apache.flink.api.common.RuntimeExecutionMode.BATCH);
+
+        // ... (тот же catalogLoader и tableLoader что выше) ...
+
+        // В batch режиме нет триггеров — просто выполняется один раз
+        TableMaintenance.forTable(env, tableLoader,
+                TriggerLockFactory.noLock())   // в batch lock не нужен
+            .add(RewriteDataFiles.builder()
+                .targetFileSizeBytes(512 * 1024 * 1024L)
+                .deleteFileThreshold(2)
+                .parallelism(4)
+                .build()
+            )
+            .add(ExpireSnapshots.builder()
+                .maxSnapshotAge(24 * 60 * 60 * 1000L)
+                .retainLast(5)
+                .build()
+            )
+            .append();
+
+        env.execute("Iceberg Batch Maintenance — one shot");
+    }
+}
+
+
