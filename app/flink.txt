@@ -358,4 +358,159 @@ public class KafkaToIcebergJob {
 }
 
 
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
+
+public class KafkaToIcebergSqlJob {
+
+   public static void main(String[] args) throws Exception {
+
+       StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+       env.enableCheckpointing(60_000);
+
+       StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+
+       // ================================================================
+       // 1. Kafka Source Table
+       // ================================================================
+       tEnv.executeSql("""
+           CREATE TEMPORARY TABLE kafka_source (
+               session_id          STRING,
+               user_id             STRING,
+               product_id          STRING,
+               event_timestamp     STRING,       -- парсим руками в INSERT
+               event_name          STRING,
+               is_promoted         STRING,
+               platform            STRING,
+               category_id         STRING,
+               category_level      STRING,
+               category_level_1    STRING,
+               category_level_2    STRING,
+               category_level_3    STRING,
+               brand               STRING,
+               rating              STRING,
+               product_name        STRING,
+               shop_test_group     STRING,
+               city                STRING,
+               item_price          STRING,
+               app_id              STRING,
+               cnt_views           STRING,
+               cnt_clicks          STRING,
+               cnt_purchases_all   STRING,
+               cnt_purchases_given STRING,
+               load_dt             STRING        -- парсим руками в INSERT
+           ) WITH (
+               'connector'                     = 'kafka',
+               'topic'                         = 'your_topic_name',
+               'properties.bootstrap.servers'  = 'kafka-broker:9092',
+               'properties.group.id'           = 'flink-iceberg-sql-writer',
+               'scan.startup.mode'             = 'earliest-offset',
+               'format'                        = 'json',
+               'json.ignore-parse-errors'      = 'true',
+               'json.timestamp-format.standard'= 'ISO-8601'
+           )
+       """);
+
+       // ================================================================
+       // 2. Iceberg Sink Table
+       //    Повторяем DDL из скриншота, добавляем catalog
+       // ================================================================
+       tEnv.executeSql("""
+           CREATE CATALOG iceberg_catalog WITH (
+               'type'            = 'iceberg',
+               'catalog-type'    = 'hadoop',
+               'warehouse'       = 's3://starrocks-ods/warehouse/test_db',
+               'property-version'= '1'
+           )
+       """);
+
+       tEnv.executeSql("USE CATALOG iceberg_catalog");
+       tEnv.executeSql("USE test_db");
+
+       // Создаём таблицу если не существует
+       // Если таблица уже создана в StarRocks — этот блок можно пропустить
+       tEnv.executeSql("""
+           CREATE TABLE IF NOT EXISTS ANALOGS_BY_PROMOTED_AGG_DAILY (
+               ssohash                 STRING,
+               user_id_hash            STRING,
+               product_id              STRING,
+               event_timestamp         TIMESTAMP(6),
+               event_name              STRING,
+               is_promoted             STRING,
+               platform                STRING,
+               category_id             STRING,
+               category_level_1        STRING,
+               category_level_2        STRING,
+               category_level_3        STRING,
+               category_level_4        STRING,
+               category_level_5        STRING,
+               brand                   STRING,
+               rating                  STRING,
+               product_name            STRING,
+               shop_test_group         STRING,
+               shop_city               STRING,
+               price                   STRING,
+               block_name              STRING,
+               page_category           STRING,
+               ads_unique_id           STRING,
+               ads_supplier_id         STRING,
+               listitems_product_id    STRING,
+               app_id                  STRING,
+               sso_hash                STRING,
+               dt                      DATE,
+               PRIMARY KEY (user_id_hash, product_id, event_timestamp) NOT ENFORCED
+           ) PARTITIONED BY (dt)
+           WITH (
+               'write.upsert.enabled'              = 'true',
+               'write.merge.mode'                  = 'merge-on-read',
+               'write.format.default'              = 'parquet',
+               'write.parquet.compression-codec'   = 'zstd',
+               'write.target-file-size-bytes'      = '536870912'
+           )
+       """);
+
+       // ================================================================
+       // 3. INSERT: Kafka → Iceberg с маппингом полей
+       // ================================================================
+       tEnv.executeSql("""
+           INSERT INTO ANALOGS_BY_PROMOTED_AGG_DAILY
+           SELECT
+               session_id                                          AS ssohash,
+               user_id                                             AS user_id_hash,
+               product_id,
+               -- ISO-8601 с timezone → TIMESTAMP без timezone
+               TO_TIMESTAMP(
+                   REGEXP_REPLACE(event_timestamp, '\\+\\d{2}:\\d{2}$', ''),
+                   'yyyy-MM-dd''T''HH:mm:ss.SSS'
+               )                                                   AS event_timestamp,
+               event_name,
+               is_promoted,
+               platform,
+               category_id,
+               category_level_1,
+               category_level_2,
+               category_level_3,
+               CAST(NULL AS STRING)                                AS category_level_4,
+               CAST(NULL AS STRING)                                AS category_level_5,
+               brand,
+               rating,
+               product_name,
+               shop_test_group,
+               city                                                AS shop_city,
+               item_price                                          AS price,
+               CAST(NULL AS STRING)                                AS block_name,
+               CAST(NULL AS STRING)                                AS page_category,
+               CAST(NULL AS STRING)                                AS ads_unique_id,
+               CAST(NULL AS STRING)                                AS ads_supplier_id,
+               CAST(NULL AS STRING)                                AS listitems_product_id,
+               app_id,
+               session_id                                          AS sso_hash,
+               -- load_dt: "2026-05-21T17:09:18.000+05:00" → DATE
+               TO_DATE(SUBSTRING(load_dt, 1, 10))                  AS dt
+           FROM kafka_source
+       """);
+   }
+}
+
+
 
