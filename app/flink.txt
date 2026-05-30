@@ -514,3 +514,261 @@ public class KafkaToIcebergSqlJob {
 
 
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.serialization.SimpleStringSchema;
+import org.apache.flink.connector.kafka.source.KafkaSource;
+import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
+import org.apache.flink.table.data.*;
+import org.apache.flink.table.data.binary.BinaryStringData;
+import org.apache.flink.table.types.logical.*;
+import org.apache.flink.types.RowKind;
+import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.flink.CatalogLoader;
+import org.apache.iceberg.flink.TableLoader;
+import org.apache.iceberg.flink.sink.FlinkSink;
+
+import java.time.LocalDate;
+import java.time.OffsetDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public class KafkaToIcebergDataStreamJob {
+
+    static final String JOB_TITLE = "Kafka → Iceberg ANALOGS_BY_PROMOTED_AGG_DAILY";
+
+    // ----------------------------------------------------------------
+    // Порядок и типы колонок — должны совпадать с Iceberg схемой
+    // ----------------------------------------------------------------
+    static final String[] COLUMNS = {
+        "ssohash", "user_id_hash", "product_id",
+        "event_timestamp",
+        "event_name", "is_promoted", "platform", "category_id",
+        "category_level_1", "category_level_2", "category_level_3",
+        "category_level_4", "category_level_5",
+        "brand", "rating", "product_name",
+        "shop_test_group", "shop_city", "price",
+        "block_name", "page_category",
+        "ads_unique_id", "ads_supplier_id", "listitems_product_id",
+        "app_id", "sso_hash", "dt"
+    };
+
+    static final LogicalType[] TYPES = buildTypes();
+
+    private static LogicalType[] buildTypes() {
+        LogicalType[] t = new LogicalType[COLUMNS.length];
+        for (int i = 0; i < COLUMNS.length; i++) {
+            t[i] = switch (COLUMNS[i]) {
+                case "event_timestamp" -> new TimestampType(6);
+                case "dt"             -> new DateType();
+                default               -> VarCharType.STRING_TYPE;
+            };
+        }
+        return t;
+    }
+
+    // ----------------------------------------------------------------
+    // Flink RowType — нужен FlinkSink для маппинга схемы
+    // ----------------------------------------------------------------
+    static org.apache.flink.table.types.logical.RowType buildRowType() {
+        List<org.apache.flink.table.types.logical.RowType.RowField> fields =
+            new java.util.ArrayList<>();
+        for (int i = 0; i < COLUMNS.length; i++) {
+            fields.add(new org.apache.flink.table.types.logical.RowType.RowField(
+                COLUMNS[i], TYPES[i]
+            ));
+        }
+        return org.apache.flink.table.types.logical.RowType.of(
+            TYPES, COLUMNS
+        );
+    }
+
+    public static void main(String[] args) throws Exception {
+
+        // ============================================================
+        // 1. Execution Environment
+        // ============================================================
+        StreamExecutionEnvironment env =
+            StreamExecutionEnvironment.getExecutionEnvironment();
+        env.enableCheckpointing(60_000);
+        env.getCheckpointConfig().setMinPauseBetweenCheckpoints(30_000);
+        env.setParallelism(4);
+
+        // ============================================================
+        // 2. Kafka Source
+        // ============================================================
+        KafkaSource<String> kafkaSource = KafkaSource.<String>builder()
+            .setBootstrapServers("kafka-broker:9092")
+            .setTopics("your_topic_name")
+            .setGroupId("flink-iceberg-datastream-writer")
+            .setStartingOffsets(OffsetsInitializer.earliest())
+            .setValueOnlyDeserializer(new SimpleStringSchema())
+            .build();
+
+        var rawStream = env.fromSource(
+            kafkaSource,
+            WatermarkStrategy.noWatermarks(),
+            "Kafka Source"
+        );
+
+        // ============================================================
+        // 3. JSON → RowData
+        // ============================================================
+        var rowStream = rawStream
+            .map(new KafkaJsonMapper())
+            .filter(row -> row != null)
+            .name("Kafka JSON → RowData");
+
+        // ============================================================
+        // 4. Iceberg CatalogLoader — твои реальные настройки
+        // ============================================================
+        Map<String, String> catalogProps = new HashMap<>();
+
+        // Catalog impl
+        catalogProps.put("type",         "iceberg");
+        catalogProps.put("catalog-impl", "org.apache.iceberg.jdbc.JdbcCatalog");
+        catalogProps.put("uri",
+            "jdbc:postgresql://dwh-dbp30-ld2:5432/iceberg_catalog_ods" +
+            "?user=iceberg.catalog&password=P8in04I6xnxJRK");
+
+        // S3 / MinIO
+        catalogProps.put("io-impl",                       "org.apache.iceberg.aws.s3.S3FileIO");
+        catalogProps.put("warehouse",                     "s3://starrocks-ods/warehouse");
+        catalogProps.put("s3.endpoint",                   "http://s3-hua5510-yr.hq.bc/");
+        catalogProps.put("s3.access-key-id",              "CT3OMI400WYYL64NQ6ZM");
+        catalogProps.put("s3.secret-access-key",          "/CM/3eqrR7u6ZQ8pdX654qI8MIDW5ad8cj/ABdKa");
+        catalogProps.put("s3.path-style-access",          "true");
+        catalogProps.put("s3.ssl.enabled",                "false");
+        catalogProps.put("s3.checksum-enabled",           "false");
+        catalogProps.put("s3.checksum-algorithm",         "NONE");
+        catalogProps.put("s3.request-checksum-calculation","WHEN_REQUIRED");
+        catalogProps.put("s3.response-checksum-validation","WHEN_REQUIRED");
+        catalogProps.put("s3.use-arn-region-enable",      "false");
+        catalogProps.put("s3.http-client.type",           "url-connection");
+        catalogProps.put("s3.region",                     "us-east-1");
+        catalogProps.put("client.region",                 "us-east-1");
+
+        CatalogLoader catalogLoader = CatalogLoader.custom(
+            "iceberg_ods",
+            catalogProps,
+            new org.apache.hadoop.conf.Configuration(),
+            "org.apache.iceberg.jdbc.JdbcCatalog"
+        );
+
+        TableLoader tableLoader = TableLoader.fromCatalog(
+            catalogLoader,
+            TableIdentifier.of("test_db", "ANALOGS_BY_PROMOTED_AGG_DAILY")
+        );
+
+        // ============================================================
+        // 5. Iceberg Sink
+        // ============================================================
+        FlinkSink.forRowData(rowStream)
+            .tableLoader(tableLoader)
+            .upsert(true)
+            .equalityFieldColumns(List.of(
+                "user_id_hash", "product_id", "event_timestamp"
+            ))
+            .overwrite(false)
+            .writeParallelism(4)
+            .build();
+
+        env.execute(JOB_TITLE);
+    }
+
+    // ================================================================
+    // Mapper: JSON String → RowData
+    // ================================================================
+    public static class KafkaJsonMapper
+        implements org.apache.flink.api.common.functions.MapFunction<String, RowData> {
+
+        private static final ObjectMapper MAPPER = new ObjectMapper();
+        private static final DateTimeFormatter ISO_FMT =
+            DateTimeFormatter.ISO_OFFSET_DATE_TIME;
+
+        @Override
+        public RowData map(String json) {
+            try {
+                JsonNode n = MAPPER.readTree(json);
+                GenericRowData row = new GenericRowData(RowKind.INSERT, COLUMNS.length);
+
+                //  idx  Iceberg колонка       Kafka поле
+                setStr(row,  0, n, "session_id");        // ssohash
+                setStr(row,  1, n, "user_id");           // user_id_hash
+                setStr(row,  2, n, "product_id");
+                setTs (row,  3, n, "event_timestamp");
+                setStr(row,  4, n, "event_name");
+                setStr(row,  5, n, "is_promoted");
+                setStr(row,  6, n, "platform");
+                setStr(row,  7, n, "category_id");
+                setStr(row,  8, n, "category_level_1");
+                setStr(row,  9, n, "category_level_2");
+                setStr(row, 10, n, "category_level_3");
+                row.setField(11, null);                  // category_level_4 — нет в Kafka
+                row.setField(12, null);                  // category_level_5 — нет в Kafka
+                setStr(row, 13, n, "brand");
+                setStr(row, 14, n, "rating");
+                setStr(row, 15, n, "product_name");
+                setStr(row, 16, n, "shop_test_group");
+                setStr(row, 17, n, "city");              // shop_city
+                setStr(row, 18, n, "item_price");        // price
+                row.setField(19, null);                  // block_name
+                row.setField(20, null);                  // page_category
+                row.setField(21, null);                  // ads_unique_id
+                row.setField(22, null);                  // ads_supplier_id
+                row.setField(23, null);                  // listitems_product_id
+                setStr(row, 24, n, "app_id");
+                setStr(row, 25, n, "session_id");        // sso_hash
+                setDate(row, 26, n, "load_dt");          // dt
+
+                return row;
+
+            } catch (Exception e) {
+                System.err.println("[SKIP] parse error: " + e.getMessage()
+                    + "\njson: " + json);
+                return null;
+            }
+        }
+
+        private void setStr(GenericRowData row, int idx, JsonNode n, String field) {
+            JsonNode v = n.get(field);
+            row.setField(idx, (v == null || v.isNull())
+                ? null
+                : BinaryStringData.fromString(v.asText()));
+        }
+
+        private void setTs(GenericRowData row, int idx, JsonNode n, String field) {
+            JsonNode v = n.get(field);
+            if (v == null || v.isNull()) { row.setField(idx, null); return; }
+            try {
+                var ldt = OffsetDateTime.parse(v.asText(), ISO_FMT).toLocalDateTime();
+                row.setField(idx, TimestampData.fromLocalDateTime(ldt));
+            } catch (Exception e) {
+                row.setField(idx, null);
+            }
+        }
+
+        private void setDate(GenericRowData row, int idx, JsonNode n, String field) {
+            JsonNode v = n.get(field);
+            if (v == null || v.isNull()) { row.setField(idx, null); return; }
+            try {
+                String raw = v.asText();
+                LocalDate ld = raw.length() > 10
+                    ? OffsetDateTime.parse(raw, ISO_FMT).toLocalDate()
+                    : LocalDate.parse(raw);
+                row.setField(idx, (int) ld.toEpochDay());
+            } catch (Exception e) {
+                row.setField(idx, null);
+            }
+        }
+    }
+}
+
+
+
+
