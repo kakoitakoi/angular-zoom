@@ -220,3 +220,429 @@ while True:
     time.sleep(30)
 
 
+
+
+
+
+
+CREATE TABLE bench_metrics (
+    id                  SERIAL PRIMARY KEY,
+    ts                  TIMESTAMPTZ DEFAULT NOW(),
+    phase               TEXT,
+
+    -- Латентность
+    p95_ms              FLOAT,
+    p99_ms              FLOAT,
+    avg_ms              FLOAT,
+    qps                 INT,
+
+    -- Файлы суммарно
+    total_files         INT,
+    total_size_bytes    BIGINT,
+
+    -- Data files
+    data_files          INT,
+    data_size_bytes     BIGINT,
+    data_avg_bytes      BIGINT,
+    data_records        BIGINT,
+
+    -- Delete files
+    del_files           INT,       -- positional deletes
+    eq_del_files        INT,       -- equality deletes (upsert)
+
+    -- Партиции
+    partition_cnt       INT,
+
+    -- Snapshots
+    snapshot_cnt        INT,
+
+    -- Metadata
+    manifest_cnt        INT,
+    manifest_bytes      BIGINT,
+    meta_json_cnt       INT
+);
+
+CREATE TABLE bench_phases (
+    ts      TIMESTAMPTZ DEFAULT NOW(),
+    phase   TEXT,
+    note    TEXT
+);
+
+-- Индекс для быстрой выборки по времени в дашборде
+CREATE INDEX idx_bench_metrics_ts ON bench_metrics (ts);
+
+
+
+# collector.py
+import psycopg2
+import pymysql
+import pandas as pd
+import time
+import os
+
+PG = psycopg2.connect("postgresql://user:pass@localhost/bench")
+SR = dict(host="localhost", port=9030, user="root", password="")
+
+PHASE = os.getenv("BENCH_PHASE", "unknown")
+CATALOG = os.getenv("ICEBERG_CATALOG", "iceberg_ods")
+DB      = os.getenv("ICEBERG_DB",      "test_db")
+TABLE   = os.getenv("ICEBERG_TABLE",   "ANALOGS_BY_PROMOTED_AGG_DAILY")
+
+def q(sql):
+   conn = pymysql.connect(**SR)
+   df = pd.read_sql(sql, conn)
+   conn.close()
+   return df
+
+def collect():
+   sr_conn = pymysql.connect(**SR)
+   full_table = f"{CATALOG}.{DB}.{TABLE}"
+
+   # ----------------------------------------------------------------
+   # 1. Латентность запросов из audit log
+   # ----------------------------------------------------------------
+   lat = pd.read_sql(f"""
+       SELECT
+           PERCENTILE_APPROX(query_time_ms, 0.95) AS p95,
+           PERCENTILE_APPROX(query_time_ms, 0.99) AS p99,
+           AVG(query_time_ms)                      AS avg_ms,
+           COUNT(*)                                AS qps
+       FROM starrocks_audit_db__.starrocks_audit_tbl__
+       WHERE query_time > NOW() - INTERVAL 2 MINUTE
+         AND stmt LIKE '%{TABLE}%'
+   """, sr_conn)
+
+   # ----------------------------------------------------------------
+   # 2. Файлы: data / delete / общее
+   # ----------------------------------------------------------------
+   files = pd.read_sql(f"""
+       SELECT
+           file_content,
+           COUNT(*)                        AS cnt,
+           SUM(file_size_in_bytes)         AS total_bytes,
+           AVG(file_size_in_bytes)         AS avg_bytes,
+           SUM(record_count)               AS total_records
+       FROM {full_table}$files
+       GROUP BY file_content
+   """, sr_conn)
+   # file_content: 0=data, 1=position_deletes, 2=equality_deletes
+
+   data_row  = files[files.file_content == 0].iloc[0] if not files[files.file_content == 0].empty else None
+   del_row   = files[files.file_content == 1].iloc[0] if not files[files.file_content == 1].empty else None
+   eq_row    = files[files.file_content == 2].iloc[0] if not files[files.file_content == 2].empty else None
+
+   total_files      = int(files.cnt.sum())
+   total_size_bytes = int(files.total_bytes.sum())
+
+   data_files       = int(data_row.cnt)          if data_row is not None else 0
+   data_size_bytes  = int(data_row.total_bytes)  if data_row is not None else 0
+   data_avg_bytes   = int(data_row.avg_bytes)    if data_row is not None else 0
+   data_records     = int(data_row.total_records)if data_row is not None else 0
+   del_files        = int(del_row.cnt)           if del_row  is not None else 0
+   eq_del_files     = int(eq_row.cnt)            if eq_row   is not None else 0
+
+   # ----------------------------------------------------------------
+   # 3. Партиции
+   # ----------------------------------------------------------------
+   parts = pd.read_sql(f"""
+       SELECT COUNT(DISTINCT partition) AS partition_cnt
+       FROM {full_table}$partitions
+   """, sr_conn)
+   partition_cnt = int(parts.partition_cnt.iloc[0])
+
+   # ----------------------------------------------------------------
+   # 4. Snapshots
+   # ----------------------------------------------------------------
+   snaps = pd.read_sql(f"""
+       SELECT COUNT(*) AS cnt
+       FROM {full_table}$snapshots
+   """, sr_conn)
+   snapshot_cnt = int(snaps.cnt.iloc[0])
+
+   # ----------------------------------------------------------------
+   # 5. Манифесты (metadata)
+   # ----------------------------------------------------------------
+   manifests = pd.read_sql(f"""
+       SELECT
+           COUNT(*)                AS manifest_cnt,
+           SUM(length)             AS manifest_total_bytes,
+           SUM(added_files_count)  AS added_files,
+           SUM(deleted_files_count)AS deleted_files,
+           SUM(existing_files_count) AS existing_files
+       FROM {full_table}$manifests
+   """, sr_conn)
+   manifest_cnt        = int(manifests.manifest_cnt.iloc[0])
+   manifest_bytes      = int(manifests.manifest_total_bytes.iloc[0] or 0)
+
+   # ----------------------------------------------------------------
+   # 6. Metadata JSON файлы — считаем через $history
+   #    (каждый snapshot = один metadata JSON)
+   # ----------------------------------------------------------------
+   meta_json = pd.read_sql(f"""
+       SELECT COUNT(DISTINCT snapshot_id) AS meta_json_cnt
+       FROM {full_table}$history
+   """, sr_conn)
+   meta_json_cnt = int(meta_json.meta_json_cnt.iloc[0])
+
+   sr_conn.close()
+
+   # ----------------------------------------------------------------
+   # 7. Пишем в Postgres
+   # ----------------------------------------------------------------
+   with PG.cursor() as cur:
+       cur.execute("""
+           INSERT INTO bench_metrics (
+               phase,
+               -- latency
+               p95_ms, p99_ms, avg_ms, qps,
+               -- files summary
+               total_files, total_size_bytes,
+               -- data files
+               data_files, data_size_bytes, data_avg_bytes, data_records,
+               -- delete files
+               del_files, eq_del_files,
+               -- partitions
+               partition_cnt,
+               -- snapshots
+               snapshot_cnt,
+               -- metadata
+               manifest_cnt, manifest_bytes, meta_json_cnt
+           ) VALUES (
+               %s,
+               %s, %s, %s, %s,
+               %s, %s,
+               %s, %s, %s, %s,
+               %s, %s,
+               %s,
+               %s,
+               %s, %s, %s
+           )
+       """, (
+           PHASE,
+           float(lat.p95.iloc[0]  or 0),
+           float(lat.p99.iloc[0]  or 0),
+           float(lat.avg_ms.iloc[0] or 0),
+           int(lat.qps.iloc[0]    or 0),
+           total_files, total_size_bytes,
+           data_files, data_size_bytes, data_avg_bytes, data_records,
+           del_files, eq_del_files,
+           partition_cnt,
+           snapshot_cnt,
+           manifest_cnt, manifest_bytes, meta_json_cnt,
+       ))
+       PG.commit()
+   print(f"[OK] {PHASE} | P95={lat.p95.iloc[0]:.0f}ms"
+         f" | files={total_files} | del={del_files}"
+         f" | parts={partition_cnt} | snaps={snapshot_cnt}")
+
+if __name__ == "__main__":
+   while True:
+       try:
+           collect()
+       except Exception as e:
+           print(f"[ERROR] {e}")
+       time.sleep(30)
+
+
+
+# dashboard.py
+import streamlit as st
+import pandas as pd
+import psycopg2
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import time
+
+PG_DSN = "postgresql://user:pass@localhost/bench"
+st.set_page_config(page_title="Iceberg Benchmark", layout="wide")
+st.title("StarRocks + Iceberg — Benchmark Dashboard")
+
+window   = st.sidebar.selectbox("Окно", ["15 минут", "1 час", "Всё"], index=1)
+auto     = st.sidebar.checkbox("Авто-обновление 15с", value=True)
+win_map  = {"15 минут": "15 minutes", "1 час": "1 hour", "Всё": "100 years"}
+
+PHASE_COLORS = {
+    "baseline":    "#888888",
+    "light_write": "#2ecc71",
+    "medium_write":"#f39c12",
+    "heavy_write": "#e74c3c",
+    "recovery":    "#3498db",
+    "unknown":     "#9b59b6",
+}
+
+@st.cache_data(ttl=15)
+def load(win):
+    conn = psycopg2.connect(PG_DSN)
+    df = pd.read_sql(f"""
+        SELECT * FROM bench_metrics
+        WHERE ts > NOW() - INTERVAL '{win_map[win]}'
+        ORDER BY ts
+    """, conn)
+    phases = pd.read_sql("SELECT * FROM bench_phases ORDER BY ts", conn)
+    conn.close()
+    return df, phases
+
+df, phases = load(window)
+
+if df.empty:
+    st.warning("Нет данных. Запусти collector.py")
+    st.stop()
+
+# ----------------------------------------------------------------
+# KPI плашки — последние значения
+# ----------------------------------------------------------------
+last = df.iloc[-1]
+first = df.iloc[0]
+
+st.subheader("Текущее состояние")
+c1,c2,c3,c4,c5,c6 = st.columns(6)
+c1.metric("P95 latency",    f"{last.p95_ms:.0f} ms",
+          f"{last.p95_ms - first.p95_ms:+.0f}")
+c2.metric("P99 latency",    f"{last.p99_ms:.0f} ms",
+          f"{last.p99_ms - first.p99_ms:+.0f}")
+c3.metric("Всего файлов",   int(last.total_files),
+          f"{last.total_files - first.total_files:+.0f}")
+c4.metric("Delete files",   int(last.del_files),
+          f"{last.del_files - first.del_files:+.0f}")
+c5.metric("Партиций",       int(last.partition_cnt))
+c6.metric("Snapshots",      int(last.snapshot_cnt),
+          f"{last.snapshot_cnt - first.snapshot_cnt:+.0f}")
+
+st.divider()
+
+# ----------------------------------------------------------------
+# Вспомогательная функция: добавить vline фаз
+# ----------------------------------------------------------------
+def add_phase_lines(fig, phases, rows_cols):
+    for _, row in phases.iterrows():
+        color = PHASE_COLORS.get(row.phase, "#000")
+        for r, c in rows_cols:
+            fig.add_vline(
+                x=row.ts, line_dash="dash",
+                line_color=color, line_width=1,
+                annotation_text=row.phase,
+                annotation_font_size=9,
+                row=r, col=c
+            )
+
+# ================================================================
+# График 1: Латентность + QPS
+# ================================================================
+st.subheader("Латентность запросов")
+fig1 = make_subplots(specs=[[{"secondary_y": True}]])
+
+for phase, grp in df.groupby("phase"):
+    c = PHASE_COLORS.get(phase, "#888")
+    fig1.add_trace(go.Scatter(
+        x=grp.ts, y=grp.p95_ms, name=f"{phase} P95",
+        line=dict(color=c, dash="dot")), secondary_y=False)
+    fig1.add_trace(go.Scatter(
+        x=grp.ts, y=grp.p99_ms, name=f"{phase} P99",
+        line=dict(color=c)), secondary_y=False)
+    fig1.add_trace(go.Scatter(
+        x=grp.ts, y=grp.qps, name=f"{phase} QPS",
+        line=dict(color=c, dash="longdash"), opacity=0.4),
+        secondary_y=True)
+
+for _, row in phases.iterrows():
+    fig1.add_vline(x=row.ts, line_dash="dash",
+                   line_color=PHASE_COLORS.get(row.phase,"#000"),
+                   annotation_text=row.phase, annotation_font_size=9)
+
+fig1.update_yaxes(title_text="Latency ms", secondary_y=False)
+fig1.update_yaxes(title_text="QPS",        secondary_y=True)
+fig1.update_layout(height=350)
+st.plotly_chart(fig1, use_container_width=True)
+
+# ================================================================
+# График 2: Файлы
+# ================================================================
+st.subheader("Файлы")
+fig2 = make_subplots(rows=1, cols=3,
+    subplot_titles=("Кол-во файлов", "Размер данных (GB)", "Средний размер data file (MB)"))
+
+for phase, grp in df.groupby("phase"):
+    c = PHASE_COLORS.get(phase, "#888")
+    fig2.add_trace(go.Scatter(x=grp.ts, y=grp.data_files,
+        name=f"{phase} data", line=dict(color=c)), row=1, col=1)
+    fig2.add_trace(go.Scatter(x=grp.ts, y=grp.del_files,
+        name=f"{phase} del", line=dict(color=c, dash="dot")), row=1, col=1)
+    fig2.add_trace(go.Scatter(x=grp.ts, y=grp.eq_del_files,
+        name=f"{phase} eq_del", line=dict(color=c, dash="dash")), row=1, col=1)
+    fig2.add_trace(go.Scatter(x=grp.ts,
+        y=grp.data_size_bytes / 1e9,
+        name=phase, line=dict(color=c), showlegend=False), row=1, col=2)
+    fig2.add_trace(go.Scatter(x=grp.ts,
+        y=grp.data_avg_bytes / 1e6,
+        name=phase, line=dict(color=c), showlegend=False), row=1, col=3)
+
+add_phase_lines(fig2, phases, [(1,1),(1,2),(1,3)])
+fig2.update_layout(height=350)
+st.plotly_chart(fig2, use_container_width=True)
+
+# ================================================================
+# График 3: Партиции + Snapshots
+# ================================================================
+st.subheader("Партиции и снапшоты")
+fig3 = make_subplots(rows=1, cols=2,
+    subplot_titles=("Партиции", "Snapshots"))
+
+for phase, grp in df.groupby("phase"):
+    c = PHASE_COLORS.get(phase, "#888")
+    fig3.add_trace(go.Scatter(x=grp.ts, y=grp.partition_cnt,
+        name=phase, line=dict(color=c)), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=grp.ts, y=grp.snapshot_cnt,
+        name=phase, line=dict(color=c), showlegend=False), row=1, col=2)
+
+add_phase_lines(fig3, phases, [(1,1),(1,2)])
+fig3.update_layout(height=300)
+st.plotly_chart(fig3, use_container_width=True)
+
+# ================================================================
+# График 4: Metadata
+# ================================================================
+st.subheader("Metadata overhead")
+fig4 = make_subplots(rows=1, cols=3,
+    subplot_titles=("Манифестов", "Размер манифестов (MB)", "Metadata JSON файлов"))
+
+for phase, grp in df.groupby("phase"):
+    c = PHASE_COLORS.get(phase, "#888")
+    fig4.add_trace(go.Scatter(x=grp.ts, y=grp.manifest_cnt,
+        name=phase, line=dict(color=c)), row=1, col=1)
+    fig4.add_trace(go.Scatter(x=grp.ts,
+        y=grp.manifest_bytes / 1e6,
+        name=phase, line=dict(color=c), showlegend=False), row=1, col=2)
+    fig4.add_trace(go.Scatter(x=grp.ts, y=grp.meta_json_cnt,
+        name=phase, line=dict(color=c), showlegend=False), row=1, col=3)
+
+add_phase_lines(fig4, phases, [(1,1),(1,2),(1,3)])
+fig4.update_layout(height=300)
+st.plotly_chart(fig4, use_container_width=True)
+
+# ================================================================
+# Таблица сырых данных
+# ================================================================
+with st.expander("Сырые данные"):
+    st.dataframe(df.tail(50)[[
+        "ts","phase","p95_ms","p99_ms","qps",
+        "total_files","data_files","del_files","eq_del_files",
+        "data_size_bytes","partition_cnt","snapshot_cnt",
+        "manifest_cnt","meta_json_cnt"
+    ]].sort_values("ts", ascending=False))
+
+if auto:
+    time.sleep(15)
+    st.rerun()
+
+
+запуск
+# Фаза baseline — только чтение
+BENCH_PHASE=baseline python collector.py
+
+# Затем меняешь фазу рестартом
+BENCH_PHASE=heavy_write python collector.py
+
+# Зафиксировать смену фазы в БД
+psql bench -c "INSERT INTO bench_phases(phase,note) VALUES('heavy_write','50k/s upsert started')"
+
+
