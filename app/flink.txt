@@ -772,3 +772,53 @@ public class KafkaToIcebergDataStreamJob {
 
 
 
+
+<dependency>
+    <groupId>org.apache.iceberg</groupId>
+    <artifactId>iceberg-aws</artifactId>
+    <version>1.4.3</version>
+    <exclusions>
+        <!-- Glue не нужен — используем JDBC catalog -->
+        <exclusion>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>glue</artifactId>
+        </exclusion>
+        <!-- Остальные AWS сервисы тоже исключаем за ненадобностью -->
+        <exclusion>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>dynamodb</artifactId>
+        </exclusion>
+        <exclusion>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>kms</artifactId>
+        </exclusion>
+        <exclusion>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>lakeformation</artifactId>
+        </exclusion>
+    </exclusions>
+</dependency>
+
+<!-- S3 клиент оставляем явно -->
+<dependency>
+    <groupId>software.amazon.awssdk</groupId>
+    <artifactId>s3</artifactId>
+    <version>2.20.68</version>
+</dependency>
+
+<dependency>
+    <groupId>software.amazon.awssdk</groupId>
+    <artifactId>url-connection-client</artifactId>
+    <version>2.20.68</version>
+</dependency>
+
+
+<!-- Убираем iceberg-aws отдельно, оставляем только runtime bundle -->
+<dependency>
+    <groupId>org.apache.iceberg</groupId>
+    <artifactId>iceberg-flink-runtime-1.17</artifactId>
+    <version>1.4.3</version>
+</dependency>
+
+
+
