@@ -822,3 +822,169 @@ public class KafkaToIcebergDataStreamJob {
 
 
 
+
+CREATE CATALOG iceberg_ods WITH (
+    'type'         = 'iceberg',
+    'catalog-impl' = 'org.apache.iceberg.jdbc.JdbcCatalog',
+    'uri'          = 'jdbc:postgresql://dwh-dbp30-ld2:5432/iceberg_catalog_ods?user=iceberg.catalog&password=P8in04I6xnxJRK',
+    'io-impl'      = 'org.apache.iceberg.aws.s3.S3FileIO',
+    'warehouse'    = 's3://starrocks-ods/warehouse',
+    's3.endpoint'  = 'http://s3-hua5510-yr.hq.bc/',
+    's3.access-key-id'     = 'CT3OMI400WYYL64NQ6ZM',
+    's3.secret-access-key' = '/CM/3eqrR7u6ZQ8pdX654qI8MIDW5ad8cj/ABdKa',
+    's3.path-style-access' = 'true',
+    's3.ssl.enabled'       = 'false',
+    's3.region'            = 'us-east-1'
+);
+
+USE CATALOG iceberg_ods;
+USE test_db;
+
+-- DROP TABLE IF EXISTS ANALOGS_BY_PROMOTED_AGG_DAILY;
+
+CREATE TABLE ANALOGS_BY_PROMOTED_AGG_DAILY (
+    ssohash                 STRING,
+    user_id_hash            STRING,
+    product_id              STRING,
+    event_timestamp         TIMESTAMP(6),
+    event_name              STRING,
+    is_promoted             STRING,
+    platform                STRING,
+    category_id             STRING,
+    category_level_1        STRING,
+    category_level_2        STRING,
+    category_level_3        STRING,
+    category_level_4        STRING,
+    category_level_5        STRING,
+    brand                   STRING,
+    rating                  STRING,
+    product_name            STRING,
+    shop_test_group         STRING,
+    shop_city               STRING,
+    price                   STRING,
+    block_name              STRING,
+    page_category           STRING,
+    ads_unique_id           STRING,
+    ads_supplier_id         STRING,
+    listitems_product_id    STRING,
+    app_id                  STRING,
+    sso_hash                STRING,
+    dt                      DATE,
+    -- identity fields записываются в schema.json
+    PRIMARY KEY (user_id_hash, product_id, event_timestamp) NOT ENFORCED
+) PARTITIONED BY (dt)
+WITH (
+    'format-version'                     = '2',
+    'write.upsert.enabled'               = 'true',
+    'write.merge.mode'                   = 'merge-on-read',
+    'write.target-file-size-bytes'       = '536870912',
+    'write.format.default'               = 'parquet',
+    'write.parquet.compression-codec'    = 'zstd'
+);
+
+
+
+import org.apache.iceberg.*;
+import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.flink.CatalogLoader;
+import org.apache.iceberg.types.Types;
+
+import java.util.HashMap;
+import java.util.Map;
+
+public class CreateIcebergTable {
+
+    public static void main(String[] args) {
+
+        // --- Catalog properties (те же что в job) ---
+        Map<String, String> catalogProps = new HashMap<>();
+        catalogProps.put("catalog-impl", "org.apache.iceberg.jdbc.JdbcCatalog");
+        catalogProps.put("uri",
+            "jdbc:postgresql://dwh-dbp30-ld2:5432/iceberg_catalog_ods" +
+            "?user=iceberg.catalog&password=P8in04I6xnxJRK");
+        catalogProps.put("io-impl",              "org.apache.iceberg.aws.s3.S3FileIO");
+        catalogProps.put("warehouse",            "s3://starrocks-ods/warehouse");
+        catalogProps.put("s3.endpoint",          "http://s3-hua5510-yr.hq.bc/");
+        catalogProps.put("s3.access-key-id",     "CT3OMI400WYYL64NQ6ZM");
+        catalogProps.put("s3.secret-access-key", "/CM/3eqrR7u6ZQ8pdX654qI8MIDW5ad8cj/ABdKa");
+        catalogProps.put("s3.path-style-access", "true");
+        catalogProps.put("s3.ssl.enabled",       "false");
+        catalogProps.put("s3.region",            "us-east-1");
+
+        CatalogLoader catalogLoader = CatalogLoader.custom(
+            "iceberg_ods",
+            catalogProps,
+            new org.apache.hadoop.conf.Configuration(),
+            "org.apache.iceberg.jdbc.JdbcCatalog"
+        );
+
+        var catalog = catalogLoader.loadCatalog();
+
+        // --- Schema с identity fields ---
+        Schema schema = new Schema(
+            // identity fields (PK) — указываем их ID явно
+            Types.NestedField.required(1,  "user_id_hash",   Types.StringType.get()),
+            Types.NestedField.required(2,  "product_id",     Types.StringType.get()),
+            Types.NestedField.required(3,  "event_timestamp",Types.TimestampType.withoutZone()),
+
+            // остальные колонки — optional
+            Types.NestedField.optional(4,  "ssohash",                Types.StringType.get()),
+            Types.NestedField.optional(5,  "event_name",             Types.StringType.get()),
+            Types.NestedField.optional(6,  "is_promoted",            Types.StringType.get()),
+            Types.NestedField.optional(7,  "platform",               Types.StringType.get()),
+            Types.NestedField.optional(8,  "category_id",            Types.StringType.get()),
+            Types.NestedField.optional(9,  "category_level_1",       Types.StringType.get()),
+            Types.NestedField.optional(10, "category_level_2",       Types.StringType.get()),
+            Types.NestedField.optional(11, "category_level_3",       Types.StringType.get()),
+            Types.NestedField.optional(12, "category_level_4",       Types.StringType.get()),
+            Types.NestedField.optional(13, "category_level_5",       Types.StringType.get()),
+            Types.NestedField.optional(14, "brand",                  Types.StringType.get()),
+            Types.NestedField.optional(15, "rating",                 Types.StringType.get()),
+            Types.NestedField.optional(16, "product_name",           Types.StringType.get()),
+            Types.NestedField.optional(17, "shop_test_group",        Types.StringType.get()),
+            Types.NestedField.optional(18, "shop_city",              Types.StringType.get()),
+            Types.NestedField.optional(19, "price",                  Types.StringType.get()),
+            Types.NestedField.optional(20, "block_name",             Types.StringType.get()),
+            Types.NestedField.optional(21, "page_category",          Types.StringType.get()),
+            Types.NestedField.optional(22, "ads_unique_id",          Types.StringType.get()),
+            Types.NestedField.optional(23, "ads_supplier_id",        Types.StringType.get()),
+            Types.NestedField.optional(24, "listitems_product_id",   Types.StringType.get()),
+            Types.NestedField.optional(25, "app_id",                 Types.StringType.get()),
+            Types.NestedField.optional(26, "sso_hash",               Types.StringType.get()),
+            Types.NestedField.optional(27, "dt",                     Types.DateType.get()),
+
+            // identity field IDs — вот где они реально прописываются в schema.json
+            java.util.Set.of(1, 2, 3)   // ← это и есть identifier-field-ids
+        );
+
+        PartitionSpec spec = PartitionSpec.builderFor(schema)
+            .identity("dt")
+            .build();
+
+        Map<String, String> tableProps = new HashMap<>();
+        tableProps.put("format-version",                  "2");
+        tableProps.put("write.upsert.enabled",            "true");
+        tableProps.put("write.merge.mode",                "merge-on-read");
+        tableProps.put("write.target-file-size-bytes",    "536870912");
+        tableProps.put("write.format.default",            "parquet");
+        tableProps.put("write.parquet.compression-codec", "zstd");
+
+        TableIdentifier tableId = TableIdentifier.of("test_db",
+            "ANALOGS_BY_PROMOTED_AGG_DAILY");
+
+        // Удалить старую таблицу если нужно
+        if (catalog.tableExists(tableId)) {
+            catalog.dropTable(tableId, false); // false = не удалять данные на S3
+        }
+
+        Table table = catalog.createTable(tableId, schema, spec, tableProps);
+
+        System.out.println("Table created: " + table.name());
+        System.out.println("Schema: " + table.schema());
+        System.out.println("Identifier fields: " + table.schema().identifierFieldIds());
+        // Должно вывести: Identifier fields: [1, 2, 3]
+    }
+}
+
+
+
