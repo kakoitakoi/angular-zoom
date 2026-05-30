@@ -1,3 +1,5 @@
+https://iceberg.apache.org/docs/latest/flink-maintenance/?h=rewritedatafiles#quick-start
+
 import org.apache.iceberg.*;
 import org.apache.iceberg.actions.*;
 import org.apache.iceberg.catalog.TableIdentifier;
