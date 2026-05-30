@@ -149,3 +149,74 @@ if __name__ == "__main__":
     asyncio.run(run_client())
 
 
+
+
+
+
+CREATE TABLE bench_metrics (
+    ts          TIMESTAMPTZ DEFAULT NOW(),
+    phase       TEXT,          -- 'baseline', 'light', 'heavy' и т.д.
+    p95_ms      FLOAT,
+    p99_ms      FLOAT,
+    del_files   INT,
+    snapshots   INT,
+    write_tps   FLOAT
+);
+
+-- Аннотации фаз — отдельно
+CREATE TABLE bench_phases (
+    ts          TIMESTAMPTZ DEFAULT NOW(),
+    phase       TEXT,
+    note        TEXT
+);
+
+
+# collector.py
+import psycopg2, pymysql, time, os
+
+PG = psycopg2.connect("postgresql://user:pass@localhost/bench")
+SR = dict(host="localhost", port=9030, user="root", password="")
+
+PHASE = os.getenv("BENCH_PHASE", "unknown")  # задаёшь через env при запуске
+
+def collect():
+    sr = pymysql.connect(**SR)
+    
+    lat = pd.read_sql("""
+        SELECT PERCENTILE_APPROX(query_time_ms, 0.95) p95,
+               PERCENTILE_APPROX(query_time_ms, 0.99) p99
+        FROM starrocks_audit_db__.starrocks_audit_tbl__
+        WHERE query_time > NOW() - INTERVAL 2 MINUTE
+    """, sr)
+
+    del_f = pd.read_sql("""
+        SELECT COUNT(*) cnt FROM iceberg_catalog.db.table$files
+        WHERE file_content = 1
+    """, sr)
+
+    snaps = pd.read_sql("""
+        SELECT COUNT(*) cnt FROM iceberg_catalog.db.table$snapshots
+    """, sr)
+
+    with PG.cursor() as cur:
+        cur.execute("""
+            INSERT INTO bench_metrics (phase, p95_ms, p99_ms, del_files, snapshots)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (
+            PHASE,
+            lat["p95"].iloc[0],
+            lat["p99"].iloc[0],
+            del_f["cnt"].iloc[0],
+            snaps["cnt"].iloc[0],
+        ))
+        PG.commit()
+    sr.close()
+
+while True:
+    try:
+        collect()
+    except Exception as e:
+        print(f"[ERROR] {e}")
+    time.sleep(30)
+
+
