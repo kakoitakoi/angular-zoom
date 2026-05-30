@@ -1,0 +1,242 @@
+import org.apache.iceberg.*;
+import org.apache.iceberg.actions.*;
+import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.flink.CatalogLoader;
+import org.apache.iceberg.jdbc.JdbcCatalog;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.Executors;
+
+public class IcebergMaintenanceJob {
+
+   static final String DB    = "test_db";
+   static final String TABLE = "ANALOGS_BY_PROMOTED_AGG_DAILY";
+
+   public static void main(String[] args) throws Exception {
+
+       Table table = loadTable();
+
+       // Запускаем все операции последовательно
+       step1_rewriteDataFiles(table);
+       step2_rewriteManifests(table);
+       step3_expireSnapshots(table);
+       step4_removeOrphanFiles(table);
+
+       System.out.println("=== Maintenance complete ===");
+   }
+
+   // ================================================================
+   // 1. COMPACTION — главная операция
+   //    Сливает data files + delete files в чистые data files
+   // ================================================================
+   static void step1_rewriteDataFiles(Table table) {
+       System.out.println("[1/4] Rewriting data files (compaction)...");
+
+       SparkActions — нет Flink аналога для полного API,
+       используем Iceberg Java API напрямую через BaseRewriteDataFilesAction
+       // Iceberg 1.4+ — используем RewriteDataFiles через catalog actions
+       RewriteDataFiles action = org.apache.iceberg.actions.RewriteDataFiles
+           .builderFor(table)
+           // Стратегия: binpack — упаковывает мелкие файлы в крупные
+           // Альтернатива: sort — дополнительно сортирует данные (дороже)
+           .binPack()
+           .targetFileSize(512 * 1024 * 1024L)        // целевой размер 512MB
+           .minFileSize(128 * 1024 * 1024L)            // файлы < 128MB → переписать
+           .maxFileSize(768 * 1024 * 1024L)            // файлы > 768MB → переписать
+           // Переписать файл если к нему есть >= 2 delete файлов
+           .option(RewriteDataFiles.DELETE_FILE_THRESHOLD, "2")
+           // Максимальный параллелизм переписи
+           .option(RewriteDataFiles.MAX_CONCURRENT_FILE_GROUP_REWRITES, "4")
+           // Только свежие партиции — не трогаем архив
+           .filter(Expressions.greaterThanOrEqual("dt", "2026-01-01"))
+           .build();
+
+       RewriteDataFiles.Result result = action.execute();
+
+       System.out.printf(
+           "  rewritten files : %d%n" +
+           "  added files     : %d%n" +
+           "  rewritten bytes : %,d%n",
+           result.rewrittenDataFilesCount(),
+           result.addedDataFilesCount(),
+           result.rewrittenBytesCount()
+       );
+   }
+
+   // ================================================================
+   // 2. REWRITE MANIFESTS
+   //    Оптимизирует manifest файлы → ускоряет планирование запросов
+   //    Запускать после compaction, когда изменилось много файлов
+   // ================================================================
+   static void step2_rewriteManifests(Table table) {
+       System.out.println("[2/4] Rewriting manifests...");
+
+       RewriteManifests action = org.apache.iceberg.actions.RewriteManifests
+           .builderFor(table)
+           // Переписывать manifest если он меньше 8MB
+           // (много мелких манифестов = долгое планирование)
+           .targetManifestSizeBytes(8 * 1024 * 1024L)
+           // Не переписывать манифесты с долей совпадения > 90%
+           // (уже достаточно хорошие)
+           .option(RewriteManifests.MIN_MANIFESTS_COUNT_TO_MERGE, "4")
+           .build();
+
+       RewriteManifests.Result result = action.execute();
+
+       System.out.printf(
+           "  rewritten manifests : %d%n" +
+           "  added manifests     : %d%n",
+           result.rewrittenManifestsCount(),
+           result.addedManifestsCount()
+       );
+   }
+
+   // ================================================================
+   // 3. EXPIRE SNAPSHOTS
+   //    Удаляет старые снапшоты и связанные metadata файлы
+   //    Без этого metadata JSON файлов накапливается бесконечно
+   // ================================================================
+   static void step3_expireSnapshots(Table table) {
+       System.out.println("[3/4] Expiring snapshots...");
+
+       long cutoffMs = System.currentTimeMillis()
+           - 24 * 60 * 60 * 1000L;    // старше 24 часов
+
+       // Счётчики для логирования
+       long[] deletedFiles = {0};
+
+       table.expireSnapshots()
+           .expireOlderThan(cutoffMs)
+           .retainLast(5)              // всегда оставлять минимум 5 снапшотов
+                                       // (нужно для time travel и параллельных читателей)
+           .cleanExpiredFiles(true)    // удалять файлы, не только записи в metadata
+           .deleteWith(path -> {
+               // кастомный обработчик удаления — можно логировать или
+               // отправлять в очередь для отложенного удаления
+               table.io().deleteFile(path);
+               deletedFiles[0]++;
+           })
+           .commit();
+
+       System.out.printf(
+           "  deleted files : %d%n" +
+           "  cutoff        : %s%n",
+           deletedFiles[0],
+           new java.util.Date(cutoffMs)
+       );
+   }
+
+   // ================================================================
+   // 4. REMOVE ORPHAN FILES
+   //    Удаляет файлы на S3 которые не referenced ни одним снапшотом
+   //    Появляются при: падении job-а, частичных коммитах, багах
+   //    ОСТОРОЖНО: запускать не раньше чем через 24ч после последней записи
+   // ================================================================
+   static void step4_removeOrphanFiles(Table table) {
+       System.out.println("[4/4] Removing orphan files...");
+
+       // Файл считается orphan если он старше olderThan
+       // ВАЖНО: должно быть больше максимального времени uncommitted транзакции
+       long olderThanMs = System.currentTimeMillis()
+           - 24 * 60 * 60 * 1000L;    // 24 часа — безопасный минимум
+
+       long[] deletedFiles = {0};
+
+       RemoveOrphanFiles action = org.apache.iceberg.actions.RemoveOrphanFiles
+           .builderFor(table)
+           .olderThan(olderThanMs)
+           // Явно указываем location — защита от случайного удаления
+           .location(table.location())
+           .deleteWith(path -> {
+               System.out.println("  orphan: " + path);
+               table.io().deleteFile(path);
+               deletedFiles[0]++;
+           })
+           .build();
+
+       RemoveOrphanFiles.Result result = action.execute();
+
+       System.out.printf(
+           "  deleted orphan files : %d%n",
+           deletedFiles[0]
+       );
+   }
+
+   // ================================================================
+   // Загрузка таблицы через JDBC каталог
+   // ================================================================
+   static Table loadTable() {
+       Map<String, String> props = new HashMap<>();
+       props.put("catalog-impl", "org.apache.iceberg.jdbc.JdbcCatalog");
+       props.put("uri",
+           "jdbc:postgresql://dwh-dbp30-ld2:5432/iceberg_catalog_ods" +
+           "?user=iceberg.catalog&password=P8in04I6xnxJRK");
+       props.put("io-impl",               "org.apache.iceberg.aws.s3.S3FileIO");
+       props.put("warehouse",             "s3://starrocks-ods/warehouse");
+       props.put("s3.endpoint",           "http://s3-hua5510-yr.hq.bc/");
+       props.put("s3.access-key-id",      "CT3OMI400WYYL64NQ6ZM");
+       props.put("s3.secret-access-key",  "/CM/3eqrR7u6ZQ8pdX654qI8MIDW5ad8cj/ABdKa");
+       props.put("s3.path-style-access",  "true");
+       props.put("s3.ssl.enabled",        "false");
+       props.put("s3.checksum-enabled",   "false");
+       props.put("s3.region",             "us-east-1");
+       props.put("client.region",         "us-east-1");
+
+       org.apache.hadoop.conf.Configuration hadoopConf =
+           new org.apache.hadoop.conf.Configuration();
+
+       JdbcCatalog catalog = new JdbcCatalog();
+       catalog.setConf(hadoopConf);
+       catalog.initialize("iceberg_ods", props);
+
+       return catalog.loadTable(TableIdentifier.of(DB, TABLE));
+   }
+}
+
+
+
+
+public class MaintenanceScheduler {
+
+    public static void main(String[] args) throws Exception {
+
+        // Интервал из аргумента или дефолт 1 час
+        long intervalMs = args.length > 0
+            ? Long.parseLong(args[0]) * 1000L
+            : 60 * 60 * 1000L;
+
+        System.out.printf("Maintenance scheduler started, interval=%dms%n",
+            intervalMs);
+
+        while (true) {
+            System.out.println("\n=== Starting maintenance cycle: "
+                + new java.util.Date() + " ===");
+            try {
+                Table table = IcebergMaintenanceJob.loadTable();
+
+                // Compaction — всегда
+                IcebergMaintenanceJob.step1_rewriteDataFiles(table);
+
+                // Manifests — после compaction
+                IcebergMaintenanceJob.step2_rewriteManifests(table);
+
+                // Expire snapshots — всегда
+                IcebergMaintenanceJob.step3_expireSnapshots(table);
+
+                // Orphan files — раз в сутки, не каждый цикл
+                long hour = java.time.LocalTime.now().getHour();
+                if (hour == 3) {    // только в 3 ночи
+                    IcebergMaintenanceJob.step4_removeOrphanFiles(table);
+                }
+
+            } catch (Exception e) {
+                System.err.println("[ERROR] Maintenance failed: " + e.getMessage());
+                e.printStackTrace();
+                // не останавливаем цикл — следующая итерация попробует снова
+            }
+
+            Thread.sleep(intervalMs);
+        }
+    }
+}
