@@ -1,11 +1,10 @@
 """
 GitLab MCP Server на базе FastMCP (streamable-HTTP transport).
+Полностью асинхронный: async def инструменты + httpx.AsyncClient.
 
 Авторизация — per-request через HTTP-заголовки:
     X-GitLab-Url   — базовый URL корпоративного GitLab (без trailing slash)
     X-GitLab-Token — Personal Access Token пользователя (scope: api)
-
-Каждый агент/пользователь передаёт свои заголовки — сервер не хранит токены.
 
 Запуск:
     pip install fastmcp httpx
@@ -35,63 +34,60 @@ MCP_PORT = int(os.environ.get("MCP_PORT", "8000"))
 # Извлечение учётных данных из заголовков входящего запроса
 # ---------------------------------------------------------------------------
 
-def _gitlab_credentials(ctx: Context) -> tuple[str, str]:
+def _credentials(ctx: Context) -> tuple[str, str]:
     """
     Читает X-GitLab-Url и X-GitLab-Token из HTTP-заголовков текущего запроса.
 
-    FastMCP пробрасывает заголовки через ctx.request_context.request.headers
-    (стандартный Starlette Request).
-
     Returns:
-        (api_base, token) — базовый URL API и токен пользователя.
+        (api_base, token)
 
     Raises:
-        ToolError — если один из заголовков отсутствует.
+        ToolError — если заголовок отсутствует.
     """
     headers = ctx.request_context.request.headers
 
-    gitlab_url = headers.get("x-gitlab-url", "").rstrip("/")
-    token      = headers.get("x-gitlab-token", "")
+    url   = headers.get("x-gitlab-url", "").rstrip("/")
+    token = headers.get("x-gitlab-token", "")
 
-    if not gitlab_url:
+    if not url:
         raise ToolError("Заголовок X-GitLab-Url обязателен.")
     if not token:
         raise ToolError("Заголовок X-GitLab-Token обязателен.")
 
-    return f"{gitlab_url}/api/v4", token
+    return f"{url}/api/v4", token
 
 
-# ---------------------------------------------------------------------------
-# Вспомогательные HTTP-функции (принимают api_base и token явно)
-# ---------------------------------------------------------------------------
-
-def _headers(token: str) -> dict:
+def _http_headers(token: str) -> dict:
     return {"PRIVATE-TOKEN": token, "Content-Type": "application/json"}
 
 
-def _get(api_base: str, token: str, path: str, params: dict | None = None) -> Any:
-    with httpx.Client(headers=_headers(token), timeout=30.0) as c:
-        r = c.get(f"{api_base}{path}", params=params)
+# ---------------------------------------------------------------------------
+# Асинхронные HTTP-хелперы
+# ---------------------------------------------------------------------------
+
+async def _get(api_base: str, token: str, path: str, params: dict | None = None) -> Any:
+    async with httpx.AsyncClient(headers=_http_headers(token), timeout=30.0) as c:
+        r = await c.get(f"{api_base}{path}", params=params)
         r.raise_for_status()
         return r.json()
 
 
-def _post(api_base: str, token: str, path: str, json: dict) -> Any:
-    with httpx.Client(headers=_headers(token), timeout=30.0) as c:
-        r = c.post(f"{api_base}{path}", json=json)
+async def _post(api_base: str, token: str, path: str, json: dict) -> Any:
+    async with httpx.AsyncClient(headers=_http_headers(token), timeout=30.0) as c:
+        r = await c.post(f"{api_base}{path}", json=json)
         r.raise_for_status()
         return r.json()
 
 
-def _put(api_base: str, token: str, path: str, json: dict) -> Any:
-    with httpx.Client(headers=_headers(token), timeout=30.0) as c:
-        r = c.put(f"{api_base}{path}", json=json)
+async def _put(api_base: str, token: str, path: str, json: dict) -> Any:
+    async with httpx.AsyncClient(headers=_http_headers(token), timeout=30.0) as c:
+        r = await c.put(f"{api_base}{path}", json=json)
         r.raise_for_status()
         return r.json()
 
 
 def _encode_id(project_id: str) -> str:
-    """namespace/repo → namespace%2Frepo (для URL-пути)."""
+    """namespace/repo → namespace%2Frepo."""
     return project_id.replace("/", "%2F")
 
 
@@ -102,7 +98,7 @@ def _encode_id(project_id: str) -> str:
 mcp = FastMCP(
     name="gitlab",
     description=(
-        "Инструменты для работы с корпоративным GitLab (API v4). "
+        "Асинхронные инструменты для работы с корпоративным GitLab (API v4). "
         "Требует заголовки X-GitLab-Url и X-GitLab-Token в каждом запросе."
     ),
 )
@@ -112,7 +108,7 @@ mcp = FastMCP(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def get_file_content(
+async def get_file_content(
     project_id: str,
     path: str,
     ref: str = "main",
@@ -127,13 +123,15 @@ def get_file_content(
         path:       Путь к файлу или директории.
         ref:        Ветка, тег или SHA (default: main).
     """
-    api_base, token = _gitlab_credentials(ctx)
+    api_base, token = _credentials(ctx)
     pid = _encode_id(project_id)
 
-    # Сначала пробуем как файл
+    # Пробуем как файл
     try:
         encoded_path = path.replace("/", "%2F")
-        data = _get(api_base, token, f"/projects/{pid}/repository/files/{encoded_path}", {"ref": ref})
+        data = await _get(api_base, token,
+                          f"/projects/{pid}/repository/files/{encoded_path}",
+                          {"ref": ref})
         content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
         return {
             "type": "file",
@@ -148,10 +146,10 @@ def get_file_content(
         if e.response.status_code != 404:
             raise
 
-    # Если 404 — пробуем как директорию
-    items = _get(api_base, token,
-                 f"/projects/{pid}/repository/tree",
-                 {"path": path, "ref": ref, "per_page": 100})
+    # Fallback: директория
+    items = await _get(api_base, token,
+                       f"/projects/{pid}/repository/tree",
+                       {"path": path, "ref": ref, "per_page": 100})
     return {"type": "directory", "path": path, "ref": ref, "items": items}
 
 
@@ -160,7 +158,7 @@ def get_file_content(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def get_repository_tree(
+async def get_repository_tree(
     project_id: str,
     path: str = "",
     ref: str = "main",
@@ -168,7 +166,7 @@ def get_repository_tree(
     ctx: Context = None,
 ) -> list[dict]:
     """
-    Возвращает дерево файлов и директорий репозитория (все страницы).
+    Возвращает дерево файлов и директорий репозитория (все страницы пагинации).
 
     Args:
         project_id: ID или «namespace/repo» проекта.
@@ -176,19 +174,18 @@ def get_repository_tree(
         ref:        Ветка/тег/SHA (default: main).
         recursive:  Обходить подпапки рекурсивно (default: True).
     """
-    api_base, token = _gitlab_credentials(ctx)
+    api_base, token = _credentials(ctx)
     pid = _encode_id(project_id)
 
     params: dict = {"ref": ref, "recursive": recursive, "per_page": 100}
     if path:
         params["path"] = path
 
-    # Собираем все страницы
     results: list[dict] = []
     page = 1
     while True:
         params["page"] = page
-        batch = _get(api_base, token, f"/projects/{pid}/repository/tree", params)
+        batch = await _get(api_base, token, f"/projects/{pid}/repository/tree", params)
         if not batch:
             break
         results.extend(batch)
@@ -204,7 +201,7 @@ def get_repository_tree(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def create_or_update_file(
+async def create_or_update_file(
     project_id: str,
     file_path: str,
     content: str,
@@ -223,9 +220,9 @@ def create_or_update_file(
         content:        Новое содержимое файла (plain text, UTF-8).
         commit_message: Сообщение коммита.
         branch:         Целевая ветка (default: main).
-        start_branch:   Если указана — создаётся новая ветка от start_branch.
+        start_branch:   Создать новую ветку от этой базы (опционально).
     """
-    api_base, token = _gitlab_credentials(ctx)
+    api_base, token = _credentials(ctx)
     pid = _encode_id(project_id)
     encoded_fp = file_path.replace("/", "%2F")
 
@@ -238,16 +235,22 @@ def create_or_update_file(
     if start_branch:
         payload["start_branch"] = start_branch
 
-    # Проверяем существование файла → выбираем метод
+    # Проверяем существование → выбираем метод
     try:
-        _get(api_base, token, f"/projects/{pid}/repository/files/{encoded_fp}", {"ref": branch})
+        await _get(api_base, token,
+                   f"/projects/{pid}/repository/files/{encoded_fp}",
+                   {"ref": branch})
         method = "update"
-        result = _put(api_base, token, f"/projects/{pid}/repository/files/{encoded_fp}", payload)
+        result = await _put(api_base, token,
+                            f"/projects/{pid}/repository/files/{encoded_fp}",
+                            payload)
     except httpx.HTTPStatusError as e:
         if e.response.status_code != 404:
             raise
         method = "create"
-        result = _post(api_base, token, f"/projects/{pid}/repository/files/{encoded_fp}", payload)
+        result = await _post(api_base, token,
+                             f"/projects/{pid}/repository/files/{encoded_fp}",
+                             payload)
 
     return {"action": method, **result}
 
@@ -257,7 +260,7 @@ def create_or_update_file(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def create_merge_request(
+async def create_merge_request(
     project_id: str,
     source_branch: str,
     target_branch: str,
@@ -279,10 +282,10 @@ def create_merge_request(
         remove_source_branch: Удалить source_branch после мёрджа.
         squash:               Схлопнуть коммиты в один.
     """
-    api_base, token = _gitlab_credentials(ctx)
+    api_base, token = _credentials(ctx)
     pid = _encode_id(project_id)
 
-    return _post(api_base, token, f"/projects/{pid}/merge_requests", {
+    return await _post(api_base, token, f"/projects/{pid}/merge_requests", {
         "source_branch": source_branch,
         "target_branch": target_branch,
         "title": title,
@@ -297,7 +300,7 @@ def create_merge_request(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def merge_merge_request(
+async def merge_merge_request(
     project_id: str,
     merge_request_iid: int,
     merge_commit_message: str | None = None,
@@ -315,7 +318,7 @@ def merge_merge_request(
         squash:                      Схлопнуть коммиты.
         should_remove_source_branch: Удалить source-ветку после мёрджа.
     """
-    api_base, token = _gitlab_credentials(ctx)
+    api_base, token = _credentials(ctx)
     pid = _encode_id(project_id)
 
     payload: dict = {
@@ -325,7 +328,9 @@ def merge_merge_request(
     if merge_commit_message:
         payload["merge_commit_message"] = merge_commit_message
 
-    return _put(api_base, token, f"/projects/{pid}/merge_requests/{merge_request_iid}/merge", payload)
+    return await _put(api_base, token,
+                      f"/projects/{pid}/merge_requests/{merge_request_iid}/merge",
+                      payload)
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +338,7 @@ def merge_merge_request(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_commits(
+async def list_commits(
     project_id: str,
     ref_name: str = "main",
     since: str | None = None,
@@ -353,15 +358,15 @@ def list_commits(
         path:       Фильтр по пути файла/директории (опционально).
         per_page:   Кол-во коммитов (max 100, default 20).
     """
-    api_base, token = _gitlab_credentials(ctx)
+    api_base, token = _credentials(ctx)
     pid = _encode_id(project_id)
 
     params: dict = {"ref_name": ref_name, "per_page": min(per_page, 100)}
-    if since:  params["since"] = since
-    if until:  params["until"] = until
-    if path:   params["path"]  = path
+    if since: params["since"] = since
+    if until: params["until"] = until
+    if path:  params["path"]  = path
 
-    return _get(api_base, token, f"/projects/{pid}/repository/commits", params)
+    return await _get(api_base, token, f"/projects/{pid}/repository/commits", params)
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +374,7 @@ def list_commits(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def get_commit_details(
+async def get_commit_details(
     project_id: str,
     sha: str,
     stats: bool = True,
@@ -383,9 +388,11 @@ def get_commit_details(
         sha:        Полный или сокращённый SHA коммита.
         stats:      Включить статистику добавленных/удалённых строк.
     """
-    api_base, token = _gitlab_credentials(ctx)
+    api_base, token = _credentials(ctx)
     pid = _encode_id(project_id)
-    return _get(api_base, token, f"/projects/{pid}/repository/commits/{sha}", {"stats": stats})
+    return await _get(api_base, token,
+                      f"/projects/{pid}/repository/commits/{sha}",
+                      {"stats": stats})
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +400,7 @@ def get_commit_details(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def get_commit_diff(
+async def get_commit_diff(
     project_id: str,
     sha: str,
     ctx: Context = None,
@@ -406,9 +413,10 @@ def get_commit_diff(
         project_id: ID или «namespace/repo» проекта.
         sha:        SHA коммита.
     """
-    api_base, token = _gitlab_credentials(ctx)
+    api_base, token = _credentials(ctx)
     pid = _encode_id(project_id)
-    return _get(api_base, token, f"/projects/{pid}/repository/commits/{sha}/diff")
+    return await _get(api_base, token,
+                      f"/projects/{pid}/repository/commits/{sha}/diff")
 
 
 # ---------------------------------------------------------------------------
@@ -416,7 +424,7 @@ def get_commit_diff(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_branches(
+async def list_branches(
     project_id: str,
     search: str | None = None,
     ctx: Context = None,
@@ -428,14 +436,14 @@ def list_branches(
         project_id: ID или «namespace/repo» проекта.
         search:     Строка поиска по имени ветки (опционально).
     """
-    api_base, token = _gitlab_credentials(ctx)
+    api_base, token = _credentials(ctx)
     pid = _encode_id(project_id)
 
     params: dict = {"per_page": 100}
     if search:
         params["search"] = search
 
-    return _get(api_base, token, f"/projects/{pid}/repository/branches", params)
+    return await _get(api_base, token, f"/projects/{pid}/repository/branches", params)
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +451,7 @@ def list_branches(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def search_code(
+async def search_code(
     project_id: str,
     query: str,
     ref: str = "main",
@@ -457,10 +465,10 @@ def search_code(
         query:      Поисковый запрос.
         ref:        Ветка/тег для поиска (default: main).
     """
-    api_base, token = _gitlab_credentials(ctx)
+    api_base, token = _credentials(ctx)
     pid = _encode_id(project_id)
 
-    return _get(api_base, token, f"/projects/{pid}/search", {
+    return await _get(api_base, token, f"/projects/{pid}/search", {
         "scope": "blobs",
         "search": query,
         "ref": ref,
