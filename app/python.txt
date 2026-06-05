@@ -13,6 +13,19 @@ GitLab MCP Server на базе FastMCP (streamable-HTTP transport).
 Опциональные переменные окружения:
     MCP_HOST — хост HTTP-сервера (default: 0.0.0.0)
     MCP_PORT — порт           (default: 8000)
+
+Инструменты (11):
+    1.  get_file_content       — содержимое файла или листинг директории
+    2.  get_repository_tree    — дерево файлов/папок (рекурсивно, все страницы)
+    3.  create_or_update_file  — создать/обновить один файл (один коммит)
+    4.  commit_multiple_files  — атомарный коммит нескольких файлов (create/update/delete/move)
+    5.  create_merge_request   — открыть MR
+    6.  merge_merge_request    — принять (смёрджить) MR
+    7.  list_commits           — список коммитов ветки
+    8.  get_commit_details     — метаданные коммита
+    9.  get_commit_diff        — diff коммита
+    10. list_branches          — список веток
+    11. search_code            — полнотекстовый поиск по коду
 """
 
 import base64
