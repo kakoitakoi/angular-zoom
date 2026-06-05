@@ -2382,3 +2382,438 @@ def main():
 if __name__ == "__main__":
     main()
 
+
+
+"""
+GitLab MCP Server на базе FastMCP (streamable-HTTP transport).
+
+Запуск:
+    pip install fastmcp httpx
+    GITLAB_URL=https://gitlab.example.com GITLAB_TOKEN=glpat-xxx python gitlab_mcp_server.py
+
+Переменные окружения:
+    GITLAB_URL   — базовый URL корпоративного GitLab (без trailing slash)
+    GITLAB_TOKEN — Personal Access Token или Project Access Token (api scope)
+    MCP_HOST     — хост для HTTP-сервера (default: 0.0.0.0)
+    MCP_PORT     — порт (default: 8000)
+"""
+
+import base64
+import os
+from typing import Any
+
+import httpx
+from fastmcp import FastMCP
+
+# ---------------------------------------------------------------------------
+# Конфигурация
+# ---------------------------------------------------------------------------
+
+GITLAB_URL = os.environ["GITLAB_URL"].rstrip("/")
+GITLAB_TOKEN = os.environ["GITLAB_TOKEN"]
+API_BASE = f"{GITLAB_URL}/api/v4"
+
+MCP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
+MCP_PORT = int(os.environ.get("MCP_PORT", "8000"))
+
+# Заголовки для всех запросов к GitLab API
+_HEADERS = {
+    "PRIVATE-TOKEN": GITLAB_TOKEN,
+    "Content-Type": "application/json",
+}
+
+# ---------------------------------------------------------------------------
+# Вспомогательный HTTP-клиент
+# ---------------------------------------------------------------------------
+
+def _client() -> httpx.Client:
+    """Создаёт синхронный httpx-клиент с таймаутом 30 с."""
+    return httpx.Client(headers=_HEADERS, timeout=30.0)
+
+
+def _get(path: str, params: dict | None = None) -> Any:
+    """GET-запрос к GitLab API. Возвращает распарсенный JSON или строку ошибки."""
+    with _client() as c:
+        r = c.get(f"{API_BASE}{path}", params=params)
+        r.raise_for_status()
+        return r.json()
+
+
+def _post(path: str, json: dict) -> Any:
+    with _client() as c:
+        r = c.post(f"{API_BASE}{path}", json=json)
+        r.raise_for_status()
+        return r.json()
+
+
+def _put(path: str, json: dict) -> Any:
+    with _client() as c:
+        r = c.put(f"{API_BASE}{path}", json=json)
+        r.raise_for_status()
+        return r.json()
+
+
+def _encode_path(project_id: str) -> str:
+    """URL-encode namespace/project → namespace%2Fproject."""
+    return project_id.replace("/", "%2F")
+
+# ---------------------------------------------------------------------------
+# FastMCP приложение
+# ---------------------------------------------------------------------------
+
+mcp = FastMCP(
+    name="gitlab",
+    description="Инструменты для работы с корпоративным GitLab (API v4).",
+)
+
+# ---------------------------------------------------------------------------
+# Tool 1 — Содержимое файла или листинг директории
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_file_content(
+    project_id: str,
+    path: str,
+    ref: str = "main",
+) -> dict:
+    """
+    Возвращает содержимое файла (декодированное из base64) или список
+    элементов директории для указанного пути в репозитории.
+
+    Args:
+        project_id: ID или «namespace/repo» проекта.
+        path:       Путь к файлу или директории относительно корня репо.
+        ref:        Ветка, тег или SHA коммита (default: main).
+    """
+    pid = _encode_path(project_id)
+
+    # Пробуем получить как файл
+    try:
+        encoded_file_path = path.replace("/", "%2F")
+        data = _get(f"/projects/{pid}/repository/files/{encoded_file_path}", {"ref": ref})
+        # Декодируем base64-содержимое
+        content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+        return {
+            "type": "file",
+            "file_name": data["file_name"],
+            "file_path": data["file_path"],
+            "size": data["size"],
+            "encoding": data["encoding"],
+            "ref": data["ref"],
+            "blob_id": data["blob_id"],
+            "last_commit_id": data["last_commit_id"],
+            "content": content,
+        }
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code != 404:
+            raise
+    # Если файл не найден — пробуем как директорию
+    items = _get(f"/projects/{pid}/repository/tree", {"path": path, "ref": ref, "per_page": 100})
+    return {"type": "directory", "path": path, "ref": ref, "items": items}
+
+
+# ---------------------------------------------------------------------------
+# Tool 2 — Полное дерево файлов и папок
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_repository_tree(
+    project_id: str,
+    path: str = "",
+    ref: str = "main",
+    recursive: bool = True,
+) -> list[dict]:
+    """
+    Возвращает дерево файлов и директорий репозитория.
+
+    Args:
+        project_id: ID или «namespace/repo» проекта.
+        path:       Стартовый путь (пустая строка = корень).
+        ref:        Ветка/тег/SHA (default: main).
+        recursive:  Обходить подпапки рекурсивно (default: True).
+    """
+    pid = _encode_path(project_id)
+    params: dict = {"ref": ref, "recursive": recursive, "per_page": 100}
+    if path:
+        params["path"] = path
+
+    # GitLab возвращает пагинацию — собираем все страницы
+    results: list[dict] = []
+    page = 1
+    while True:
+        params["page"] = page
+        batch = _get(f"/projects/{pid}/repository/tree", params)
+        if not batch:
+            break
+        results.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Tool 3 — Создать или обновить файл (один коммит)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def create_or_update_file(
+    project_id: str,
+    file_path: str,
+    content: str,
+    commit_message: str,
+    branch: str = "main",
+    create_new_branch: bool = False,
+    start_branch: str | None = None,
+) -> dict:
+    """
+    Создаёт новый файл или обновляет существующий, формируя коммит напрямую
+    в указанную ветку.
+
+    Args:
+        project_id:        ID или «namespace/repo» проекта.
+        file_path:         Путь к файлу в репозитории.
+        content:           Новое содержимое файла (plain text, UTF-8).
+        commit_message:    Сообщение коммита.
+        branch:            Целевая ветка (default: main).
+        create_new_branch: Создать ветку автоматически, если она не существует.
+        start_branch:      Базовая ветка для новой ветки (если create_new_branch=True).
+    """
+    pid = _encode_path(project_id)
+    encoded_fp = file_path.replace("/", "%2F")
+
+    payload: dict = {
+        "branch": branch,
+        "content": content,
+        "commit_message": commit_message,
+        "encoding": "text",
+    }
+    if create_new_branch and start_branch:
+        payload["start_branch"] = start_branch
+
+    # Определяем: файл уже существует → PUT (update), нет → POST (create)
+    try:
+        _get(f"/projects/{pid}/repository/files/{encoded_fp}", {"ref": branch})
+        method = "update"
+        result = _put(f"/projects/{pid}/repository/files/{encoded_fp}", payload)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code != 404:
+            raise
+        method = "create"
+        result = _post(f"/projects/{pid}/repository/files/{encoded_fp}", payload)
+
+    return {"action": method, **result}
+
+
+# ---------------------------------------------------------------------------
+# Tool 4 — Создать Merge Request
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def create_merge_request(
+    project_id: str,
+    source_branch: str,
+    target_branch: str,
+    title: str,
+    description: str = "",
+    remove_source_branch: bool = False,
+    squash: bool = False,
+) -> dict:
+    """
+    Открывает новый Merge Request из source_branch в target_branch.
+
+    Args:
+        project_id:            ID или «namespace/repo» проекта.
+        source_branch:         Ветка с изменениями.
+        target_branch:         Целевая ветка (куда мёрджим).
+        title:                 Заголовок MR.
+        description:           Описание MR (markdown).
+        remove_source_branch:  Удалить source_branch после мёрджа.
+        squash:                Схлопнуть коммиты в один при мёрдже.
+    """
+    pid = _encode_path(project_id)
+    return _post(
+        f"/projects/{pid}/merge_requests",
+        {
+            "source_branch": source_branch,
+            "target_branch": target_branch,
+            "title": title,
+            "description": description,
+            "remove_source_branch": remove_source_branch,
+            "squash": squash,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool 5 — Принять (смёрджить) Merge Request
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def merge_merge_request(
+    project_id: str,
+    merge_request_iid: int,
+    merge_commit_message: str | None = None,
+    squash: bool = False,
+    should_remove_source_branch: bool = False,
+) -> dict:
+    """
+    Принимает открытый Merge Request (выполняет мёрдж).
+
+    Args:
+        project_id:                  ID или «namespace/repo» проекта.
+        merge_request_iid:           Внутренний IID мёрдж-реквеста (не глобальный ID).
+        merge_commit_message:        Кастомное сообщение merge-коммита.
+        squash:                      Схлопнуть коммиты при мёрдже.
+        should_remove_source_branch: Удалить source-ветку после мёрджа.
+    """
+    pid = _encode_path(project_id)
+    payload: dict = {
+        "squash": squash,
+        "should_remove_source_branch": should_remove_source_branch,
+    }
+    if merge_commit_message:
+        payload["merge_commit_message"] = merge_commit_message
+
+    return _put(f"/projects/{pid}/merge_requests/{merge_request_iid}/merge", payload)
+
+
+# ---------------------------------------------------------------------------
+# Tool 6 — Список коммитов ветки
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def list_commits(
+    project_id: str,
+    ref_name: str = "main",
+    since: str | None = None,
+    until: str | None = None,
+    path: str | None = None,
+    per_page: int = 20,
+) -> list[dict]:
+    """
+    Возвращает список коммитов репозитория.
+
+    Args:
+        project_id: ID или «namespace/repo» проекта.
+        ref_name:   Ветка/тег/SHA (default: main).
+        since:      ISO 8601 дата начала диапазона (опционально).
+        until:      ISO 8601 дата конца диапазона (опционально).
+        path:       Фильтр по пути файла/директории (опционально).
+        per_page:   Кол-во коммитов в ответе (max 100, default 20).
+    """
+    pid = _encode_path(project_id)
+    params: dict = {"ref_name": ref_name, "per_page": min(per_page, 100)}
+    if since:
+        params["since"] = since
+    if until:
+        params["until"] = until
+    if path:
+        params["path"] = path
+
+    return _get(f"/projects/{pid}/repository/commits", params)
+
+
+# ---------------------------------------------------------------------------
+# Tool 7 — Детали конкретного коммита
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_commit_details(
+    project_id: str,
+    sha: str,
+    stats: bool = True,
+) -> dict:
+    """
+    Возвращает полные метаданные коммита: автор, дата, сообщение, статистика.
+
+    Args:
+        project_id: ID или «namespace/repo» проекта.
+        sha:        Полный или сокращённый SHA коммита.
+        stats:      Включить статистику изменений (добавлено/удалено строк).
+    """
+    pid = _encode_path(project_id)
+    return _get(f"/projects/{pid}/repository/commits/{sha}", {"stats": stats})
+
+
+# ---------------------------------------------------------------------------
+# Tool 8 — Diff коммита
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_commit_diff(
+    project_id: str,
+    sha: str,
+) -> list[dict]:
+    """
+    Возвращает список изменений (diff) для конкретного коммита.
+    Каждый элемент списка описывает один изменённый файл: old_path, new_path,
+    diff (unified patch), флаги new_file / renamed_file / deleted_file.
+
+    Args:
+        project_id: ID или «namespace/repo» проекта.
+        sha:        SHA коммита.
+    """
+    pid = _encode_path(project_id)
+    return _get(f"/projects/{pid}/repository/commits/{sha}/diff")
+
+
+# ---------------------------------------------------------------------------
+# Tool 9 — Список веток
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def list_branches(
+    project_id: str,
+    search: str | None = None,
+) -> list[dict]:
+    """
+    Возвращает список веток репозитория с информацией о последнем коммите.
+
+    Args:
+        project_id: ID или «namespace/repo» проекта.
+        search:     Строка поиска по имени ветки (опционально).
+    """
+    pid = _encode_path(project_id)
+    params: dict = {"per_page": 100}
+    if search:
+        params["search"] = search
+
+    return _get(f"/projects/{pid}/repository/branches", params)
+
+
+# ---------------------------------------------------------------------------
+# Tool 10 — Поиск по коду
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def search_code(
+    project_id: str,
+    query: str,
+    ref: str = "main",
+) -> list[dict]:
+    """
+    Полнотекстовый поиск по содержимому файлов в репозитории.
+    Возвращает список совпадений с именем файла, путём и фрагментами.
+
+    Args:
+        project_id: ID или «namespace/repo» проекта.
+        query:      Строка поиска (поддерживаются операторы GitLab Search).
+        ref:        Ветка/тег для поиска (default: main).
+    """
+    pid = _encode_path(project_id)
+    return _get(
+        f"/projects/{pid}/search",
+        {"scope": "blobs", "search": query, "ref": ref, "per_page": 20},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Точка входа
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    # streamable-http — стандартный транспорт для production MCP-серверов
+    mcp.run(transport="streamable-http", host=MCP_HOST, port=MCP_PORT)
+
