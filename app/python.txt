@@ -10,17 +10,21 @@ GitLab MCP Server на базе FastMCP (streamable-HTTP transport).
     pip install fastmcp httpx
     python gitlab_mcp_server.py
 
-Опциональные переменные окружения:
-    MCP_HOST — хост HTTP-сервера (default: 0.0.0.0)
-    MCP_PORT — порт           (default: 8000)
+Переменные окружения (все опциональны):
+    MCP_HOST              — хост HTTP-сервера          (default: 0.0.0.0)
+    MCP_PORT              — порт                        (default: 8000)
+    PROTECTED_BRANCHES    — ветки через запятую         (default: main,master,production)
+    PROTECTED_PATHS       — пути через запятую          (default: .gitlab-ci.yml,Dockerfile)
+    ALLOWED_BRANCH_PREFIX — префиксы через запятую      (default: feature/,fix/,agent/,chore/)
+    MAX_FILE_SIZE_KB      — макс. размер файла в KB      (default: 1024)
 
 Инструменты (11):
     1.  get_file_content       — содержимое файла или листинг директории
     2.  get_repository_tree    — дерево файлов/папок (рекурсивно, все страницы)
     3.  create_or_update_file  — создать/обновить один файл (один коммит)
-    4.  commit_multiple_files  — атомарный коммит нескольких файлов (create/update/delete/move)
+    4.  commit_multiple_files  — атомарный коммит нескольких файлов
     5.  create_merge_request   — открыть MR
-    6.  merge_merge_request    — принять (смёрджить) MR
+    6.  merge_merge_request    — принять (смёрджить) MR (с проверкой готовности)
     7.  list_commits           — список коммитов ветки
     8.  get_commit_details     — метаданные коммита
     9.  get_commit_diff        — diff коммита
@@ -29,6 +33,7 @@ GitLab MCP Server на базе FastMCP (streamable-HTTP transport).
 """
 
 import base64
+import logging
 import os
 from typing import Any
 
@@ -37,11 +42,107 @@ from fastmcp import FastMCP, Context
 from fastmcp.exceptions import ToolError
 
 # ---------------------------------------------------------------------------
-# Конфигурация сервера
+# Логирование — отключаем debug-уровень чтобы токены не попадали в логи
+# ---------------------------------------------------------------------------
+
+# Uvicorn по умолчанию логирует все заголовки на уровне DEBUG.
+# Принудительно поднимаем порог до WARNING для access-лога и httpx.
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+logging.getLogger("uvicorn").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)      # httpx логирует заголовки на DEBUG
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("gitlab-mcp")
+
+# ---------------------------------------------------------------------------
+# Конфигурация безопасности (переопределяется через env)
 # ---------------------------------------------------------------------------
 
 MCP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8000"))
+
+# Ветки, в которые запрещена прямая запись — только через MR
+PROTECTED_BRANCHES: frozenset[str] = frozenset(
+    b.strip() for b in
+    os.environ.get("PROTECTED_BRANCHES", "main,master,production").split(",")
+    if b.strip()
+)
+
+# Файлы/пути, которые нельзя удалять через инструменты
+PROTECTED_PATHS: frozenset[str] = frozenset(
+    p.strip() for p in
+    os.environ.get(
+        "PROTECTED_PATHS",
+        ".gitlab-ci.yml,Dockerfile,.env.example,pyproject.toml,pom.xml"
+    ).split(",")
+    if p.strip()
+)
+
+# Допустимые префиксы имён веток при создании (пустой список = любые)
+_raw_prefixes = os.environ.get("ALLOWED_BRANCH_PREFIX", "feature/,fix/,agent/,chore/,docs/")
+ALLOWED_BRANCH_PREFIXES: list[str] = [p.strip() for p in _raw_prefixes.split(",") if p.strip()]
+
+# Максимальный размер содержимого файла
+MAX_FILE_SIZE_BYTES: int = int(os.environ.get("MAX_FILE_SIZE_KB", "1024")) * 1024
+
+logger.info("Protected branches : %s", PROTECTED_BRANCHES)
+logger.info("Protected paths    : %s", PROTECTED_PATHS)
+logger.info("Allowed prefixes   : %s", ALLOWED_BRANCH_PREFIXES)
+logger.info("Max file size      : %d KB", MAX_FILE_SIZE_BYTES // 1024)
+
+# ---------------------------------------------------------------------------
+# Гарды безопасности — вызываются из инструментов перед записью
+# ---------------------------------------------------------------------------
+
+def _guard_branch_write(branch: str) -> None:
+    """
+    Запрещает прямую запись в защищённые ветки.
+    Агент должен создать feature-ветку и открыть MR.
+    """
+    if branch in PROTECTED_BRANCHES:
+        raise ToolError(
+            f"Прямая запись в ветку '{branch}' запрещена. "
+            f"Создай отдельную ветку и открой Merge Request. "
+            f"Защищённые ветки: {', '.join(sorted(PROTECTED_BRANCHES))}."
+        )
+
+
+def _guard_branch_name(branch: str) -> None:
+    """
+    Проверяет что имя новой ветки начинается с допустимого префикса.
+    Предотвращает засорение репозитория произвольными именами.
+    Пропускает проверку если ALLOWED_BRANCH_PREFIXES пуст.
+    """
+    if not ALLOWED_BRANCH_PREFIXES:
+        return
+    if not any(branch.startswith(p) for p in ALLOWED_BRANCH_PREFIXES):
+        raise ToolError(
+            f"Имя ветки '{branch}' не соответствует соглашению. "
+            f"Допустимые префиксы: {', '.join(ALLOWED_BRANCH_PREFIXES)}."
+        )
+
+
+def _guard_file_size(content: str) -> None:
+    """Запрещает коммит файлов больше MAX_FILE_SIZE_BYTES."""
+    size = len(content.encode("utf-8"))
+    if size > MAX_FILE_SIZE_BYTES:
+        raise ToolError(
+            f"Размер файла {size // 1024} KB превышает лимит "
+            f"{MAX_FILE_SIZE_BYTES // 1024} KB. "
+            "Большие файлы не должны храниться в git — используй artifact storage."
+        )
+
+
+def _guard_delete_path(file_path: str) -> None:
+    """Запрещает удаление критически важных файлов."""
+    # Проверяем и точное совпадение, и имя файла без пути
+    name = file_path.split("/")[-1]
+    if file_path in PROTECTED_PATHS or name in PROTECTED_PATHS:
+        raise ToolError(
+            f"Удаление файла '{file_path}' запрещено — он находится в списке защищённых путей."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Извлечение учётных данных из заголовков входящего запроса
@@ -50,6 +151,7 @@ MCP_PORT = int(os.environ.get("MCP_PORT", "8000"))
 def _credentials(ctx: Context) -> tuple[str, str]:
     """
     Читает X-GitLab-Url и X-GitLab-Token из HTTP-заголовков текущего запроса.
+    Токен намеренно нигде не логируется.
 
     Returns:
         (api_base, token)
@@ -131,6 +233,9 @@ async def get_file_content(
     Возвращает содержимое файла (декодированное из base64) или список
     элементов директории для указанного пути.
 
+    Возвращает поле last_commit_id — сохрани его если планируешь обновлять
+    файл через create_or_update_file (защита от конфликтов).
+
     Args:
         project_id: ID или «namespace/repo» проекта.
         path:       Путь к файлу или директории.
@@ -139,7 +244,6 @@ async def get_file_content(
     api_base, token = _credentials(ctx)
     pid = _encode_id(project_id)
 
-    # Пробуем как файл
     try:
         encoded_path = path.replace("/", "%2F")
         data = await _get(api_base, token,
@@ -152,6 +256,8 @@ async def get_file_content(
             "file_path": data["file_path"],
             "size": data["size"],
             "ref": data["ref"],
+            # last_commit_id нужен как last_commit_id при последующем update —
+            # GitLab откажет в записи если файл изменился с этого коммита
             "last_commit_id": data["last_commit_id"],
             "content": content,
         }
@@ -210,7 +316,7 @@ async def get_repository_tree(
 
 
 # ---------------------------------------------------------------------------
-# Tool 3 — Создать или обновить файл (один коммит)
+# Tool 3 — Создать или обновить один файл
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -219,7 +325,8 @@ async def create_or_update_file(
     file_path: str,
     content: str,
     commit_message: str,
-    branch: str = "main",
+    branch: str,
+    last_commit_id: str | None = None,
     start_branch: str | None = None,
     ctx: Context = None,
 ) -> dict:
@@ -227,14 +334,28 @@ async def create_or_update_file(
     Создаёт новый файл или обновляет существующий одним коммитом.
     Метод (POST/PUT) определяется автоматически.
 
+    Защиты:
+    - Запрещена запись в защищённые ветки (main, master, production).
+    - Имя ветки должно соответствовать соглашению (feature/, fix/, agent/ и т.д.).
+    - Размер файла ограничен MAX_FILE_SIZE_KB.
+    - last_commit_id предотвращает слепую перезапись чужих изменений.
+
     Args:
         project_id:     ID или «namespace/repo» проекта.
         file_path:      Путь к файлу в репозитории.
         content:        Новое содержимое файла (plain text, UTF-8).
         commit_message: Сообщение коммита.
-        branch:         Целевая ветка (default: main).
+        branch:         Целевая ветка. Не должна быть защищённой.
+        last_commit_id: SHA коммита файла полученного через get_file_content.
+                        Передавай при обновлении существующего файла —
+                        GitLab вернёт ошибку если файл изменился параллельно.
         start_branch:   Создать новую ветку от этой базы (опционально).
     """
+    # --- Гарды ---
+    _guard_branch_write(branch)
+    _guard_branch_name(branch)
+    _guard_file_size(content)
+
     api_base, token = _credentials(ctx)
     pid = _encode_id(project_id)
     encoded_fp = file_path.replace("/", "%2F")
@@ -248,12 +369,15 @@ async def create_or_update_file(
     if start_branch:
         payload["start_branch"] = start_branch
 
-    # Проверяем существование → выбираем метод
+    # Проверяем существование файла → выбираем метод
     try:
         await _get(api_base, token,
                    f"/projects/{pid}/repository/files/{encoded_fp}",
                    {"ref": branch})
         method = "update"
+        # Передаём last_commit_id если предоставлен — защита от конфликтов
+        if last_commit_id:
+            payload["last_commit_id"] = last_commit_id
         result = await _put(api_base, token,
                             f"/projects/{pid}/repository/files/{encoded_fp}",
                             payload)
@@ -269,7 +393,90 @@ async def create_or_update_file(
 
 
 # ---------------------------------------------------------------------------
-# Tool 4 — Создать Merge Request
+# Tool 4 — Атомарный коммит нескольких файлов
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def commit_multiple_files(
+    project_id: str,
+    branch: str,
+    commit_message: str,
+    actions: list[dict],
+    start_branch: str | None = None,
+    ctx: Context = None,
+) -> dict:
+    """
+    Создаёт один атомарный коммит с произвольным набором изменений файлов.
+    Используй когда нужно изменить несколько файлов за раз.
+
+    Защиты:
+    - Запрещена запись в защищённые ветки.
+    - Имя ветки должно соответствовать соглашению.
+    - Размер каждого файла ограничен MAX_FILE_SIZE_KB.
+    - Запрещено удаление защищённых файлов (.gitlab-ci.yml, Dockerfile и др.).
+
+    Поддерживаемые action:
+        "create"  — создать новый файл         (требует: content)
+        "update"  — обновить существующий       (требует: content)
+        "delete"  — удалить файл
+        "move"    — переместить/переименовать   (требует: previous_path)
+        "chmod"   — изменить права              (требует: execute_filemode)
+
+    Рекомендуется передавать last_commit_id для action=update — защита от
+    параллельных изменений того же файла.
+
+    Args:
+        project_id:     ID или «namespace/repo» проекта.
+        branch:         Целевая ветка. Не должна быть защищённой.
+        commit_message: Сообщение коммита.
+        actions:        Список операций над файлами.
+        start_branch:   Создать новую ветку от этой базы (опционально).
+    """
+    # --- Гарды уровня ветки ---
+    _guard_branch_write(branch)
+    _guard_branch_name(branch)
+
+    if not actions:
+        raise ToolError("Список actions не может быть пустым.")
+
+    # --- Валидация и гарды каждого action ---
+    for i, action in enumerate(actions):
+        act = action.get("action")
+        fp  = action.get("file_path")
+
+        if not act:
+            raise ToolError(f"actions[{i}]: отсутствует поле 'action'.")
+        if not fp:
+            raise ToolError(f"actions[{i}]: отсутствует поле 'file_path'.")
+
+        if act in ("create", "update") and "content" not in action:
+            raise ToolError(f"actions[{i}]: action='{act}' требует поле 'content'.")
+        if act == "move" and "previous_path" not in action:
+            raise ToolError(f"actions[{i}]: action='move' требует поле 'previous_path'.")
+
+        # Запрет удаления защищённых файлов
+        if act == "delete":
+            _guard_delete_path(fp)
+
+        # Ограничение размера для файлов с содержимым
+        if act in ("create", "update", "move") and "content" in action:
+            _guard_file_size(action["content"])
+
+    payload: dict = {
+        "branch": branch,
+        "commit_message": commit_message,
+        "actions": actions,
+    }
+    if start_branch:
+        payload["start_branch"] = start_branch
+
+    api_base, token = _credentials(ctx)
+    pid = _encode_id(project_id)
+    return await _post(api_base, token, f"/projects/{pid}/repository/commits", payload)
+
+
+# ---------------------------------------------------------------------------
+# Tool 5 — Создать Merge Request
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -309,7 +516,7 @@ async def create_merge_request(
 
 
 # ---------------------------------------------------------------------------
-# Tool 5 — Принять (смёрджить) Merge Request
+# Tool 6 — Принять (смёрджить) Merge Request
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -324,6 +531,13 @@ async def merge_merge_request(
     """
     Принимает открытый Merge Request.
 
+    Перед мёрджем проверяет:
+    - MR существует и открыт (state == opened)
+    - CI/CD пайплайн прошёл (merge_status == can_be_merged)
+    - Нет блокирующих обсуждений
+
+    Если условия не выполнены — возвращает ToolError с причиной.
+
     Args:
         project_id:                  ID или «namespace/repo» проекта.
         merge_request_iid:           Внутренний IID MR (не глобальный ID).
@@ -333,6 +547,33 @@ async def merge_merge_request(
     """
     api_base, token = _credentials(ctx)
     pid = _encode_id(project_id)
+
+    # Получаем актуальное состояние MR перед мёрджем
+    mr = await _get(api_base, token, f"/projects/{pid}/merge_requests/{merge_request_iid}")
+
+    # Проверка 1: MR должен быть открыт
+    if mr.get("state") != "opened":
+        raise ToolError(
+            f"MR !{merge_request_iid} нельзя смёрджить: "
+            f"текущий статус '{mr.get('state')}' (ожидается 'opened')."
+        )
+
+    # Проверка 2: CI/CD должен быть пройден
+    merge_status = mr.get("merge_status", "")
+    detailed_status = mr.get("detailed_merge_status", "")
+    if merge_status != "can_be_merged":
+        raise ToolError(
+            f"MR !{merge_request_iid} не готов к мёрджу. "
+            f"merge_status='{merge_status}', detailed='{detailed_status}'. "
+            "Дождись прохождения CI/CD пайплайна и разрешения всех обсуждений."
+        )
+
+    # Проверка 3: нет блокирующих (unresolved) тредов
+    if mr.get("blocking_discussions_resolved") is False:
+        raise ToolError(
+            f"MR !{merge_request_iid} содержит неразрешённые обсуждения. "
+            "Разреши все треды перед мёрджем."
+        )
 
     payload: dict = {
         "squash": squash,
@@ -347,7 +588,7 @@ async def merge_merge_request(
 
 
 # ---------------------------------------------------------------------------
-# Tool 6 — Список коммитов
+# Tool 7 — Список коммитов
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -383,7 +624,7 @@ async def list_commits(
 
 
 # ---------------------------------------------------------------------------
-# Tool 7 — Детали коммита
+# Tool 8 — Детали коммита
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -409,7 +650,7 @@ async def get_commit_details(
 
 
 # ---------------------------------------------------------------------------
-# Tool 8 — Diff коммита
+# Tool 9 — Diff коммита
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -433,7 +674,7 @@ async def get_commit_diff(
 
 
 # ---------------------------------------------------------------------------
-# Tool 9 — Список веток
+# Tool 10 — Список веток
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -460,7 +701,7 @@ async def list_branches(
 
 
 # ---------------------------------------------------------------------------
-# Tool 10 — Поиск по коду
+# Tool 11 — Поиск по коду
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
