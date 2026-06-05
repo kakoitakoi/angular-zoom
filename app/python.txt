@@ -62,6 +62,11 @@ logger = logging.getLogger("gitlab-mcp")
 MCP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8000"))
 
+# Проверка SSL-сертификата GitLab.
+# Отключай только для корпоративных инстансов с самоподписанным сертификатом.
+# Установи SSL_VERIFY=false чтобы отключить.
+SSL_VERIFY: bool = os.environ.get("SSL_VERIFY", "true").lower() not in ("false", "0", "no")
+
 # Ветки, в которые запрещена прямая запись — только через MR
 PROTECTED_BRANCHES: frozenset[str] = frozenset(
     b.strip() for b in
@@ -90,6 +95,9 @@ logger.info("Protected branches : %s", PROTECTED_BRANCHES)
 logger.info("Protected paths    : %s", PROTECTED_PATHS)
 logger.info("Allowed prefixes   : %s", ALLOWED_BRANCH_PREFIXES)
 logger.info("Max file size      : %d KB", MAX_FILE_SIZE_BYTES // 1024)
+logger.info("SSL verify         : %s", SSL_VERIFY)
+if not SSL_VERIFY:
+    logger.warning("SSL verification DISABLED — допустимо только для корпоративного GitLab с самоподписанным сертификатом")
 
 # ---------------------------------------------------------------------------
 # Гарды безопасности — вызываются из инструментов перед записью
