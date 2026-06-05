@@ -1,2401 +1,19 @@
-
-"""
-MCP HTTP Server — async, FastMCP, транспорт streamable-http
-Запуск: python mcp_doris_server.py
-Зависимости: pip install "mcp[cli]" aiomysql
-Эндпоинт: http://localhost:8000/mcp
-"""
-
-import os
-import aiomysql
-from mcp.server.fastmcp import FastMCP
-
-# ── Конфигурация Doris ────────────────────────────────────────────────────────
-DORIS_HOST     = os.getenv("DORIS_HOST",     "localhost")
-DORIS_PORT     = int(os.getenv("DORIS_PORT", "9030"))
-DORIS_USER     = os.getenv("DORIS_USER",     "root")
-DORIS_PASSWORD = os.getenv("DORIS_PASSWORD", "")
-DORIS_DB       = os.getenv("DORIS_DB",       "test_db")
-# ─────────────────────────────────────────────────────────────────────────────
-
-mcp = FastMCP(
-    name="doris-query-server",
-    # stateless_http=True  # раскомментировать если нужен stateless режим
-)
-
-
-async def _execute(sql: str) -> dict:
-    """Открывает соединение, выполняет запрос, возвращает результат."""
-    conn = await aiomysql.connect(
-        host=DORIS_HOST,
-        port=DORIS_PORT,
-        user=DORIS_USER,
-        password=DORIS_PASSWORD,
-        db=DORIS_DB,
-        charset="utf8mb4",
-        connect_timeout=10,
-        cursorclass=aiomysql.DictCursor,
-    )
-    try:
-        async with conn.cursor() as cursor:
-            await cursor.execute(sql)
-            rows = await cursor.fetchall()          # list[dict]
-            columns = [d[0] for d in cursor.description] if cursor.description else []
-    finally:
-        conn.close()
-
-    # Приводим не-JSON-сериализуемые типы (Decimal, date, …) к str
-    safe_rows = [
-        {k: (str(v) if v is not None else None) for k, v in row.items()}
-        for row in rows
-    ]
-    return {"columns": columns, "rows": safe_rows, "row_count": len(safe_rows)}
-
-
-@mcp.tool()
-async def query_doris(sql: str) -> dict:
-    """
-    Выполняет SELECT-запрос в Apache Doris и возвращает результат.
-
-    Args:
-        sql: SQL-запрос (только SELECT; остальные операторы отклоняются).
-
-    Returns:
-        columns   — список названий колонок
-        rows      — список строк (каждая строка — dict {колонка: значение})
-        row_count — количество строк
-    """
-    if not sql.strip().upper().startswith("SELECT"):
-        return {"error": "Разрешены только SELECT-запросы."}
-
-    try:
-        return await _execute(sql)
-    except aiomysql.MySQLError as e:
-        return {"error": f"Ошибка Doris: {e}"}
-    except Exception as e:
-        return {"error": f"Неожиданная ошибка: {e}"}
-
-
-if __name__ == "__main__":
-    # transport="streamable-http" → эндпоинт http://localhost:8000/mcp
-    mcp.run(transport="streamable-http")
-
-
-"""
-MCP HTTP Client — тестирует инструмент query_doris через streamable-http
-Запуск: python mcp_doris_client.py
-Зависимости: pip install "mcp[cli]"
-"""
-
-import asyncio
-import json
-from mcp.client.streamable_http import streamablehttp_client
-from mcp import ClientSession
-
-SERVER_URL = "http://localhost:8000/mcp"
-
-TEST_QUERIES = [
-    "SELECT 1 AS ping",
-    "SELECT NOW() AS server_time",
-    "SELECT DATABASE() AS current_db",
-    "SELECT * FROM information_schema.tables LIMIT 5",
-]
-
-
-async def run_client() -> None:
-    print(f"Подключаемся к MCP-серверу: {SERVER_URL}")
-    print("=" * 60)
-
-    async with streamablehttp_client(SERVER_URL) as (read, write, _):
-        async with ClientSession(read, write) as session:
-
-            await session.initialize()
-            print("✅ Сессия инициализирована\n")
-
-            # Список доступных инструментов
-            tools = (await session.list_tools()).tools
-            print("Доступные инструменты:")
-            for t in tools:
-                print(f"  • {t.name}: {t.description}")
-            print()
-
-            # Прогоняем тестовые запросы
-            for sql in TEST_QUERIES:
-                print(f"─── SQL: {sql}")
-                result = await session.call_tool("query_doris", {"sql": sql})
-
-                for block in result.content:
-                    if block.type == "text":
-                        try:
-                            data = json.loads(block.text)
-                        except json.JSONDecodeError:
-                            print(f"  Raw: {block.text}")
-                            continue
-
-                        if "error" in data:
-                            print(f"  ⚠️  {data['error']}")
-                        else:
-                            print(f"  Колонки : {data['columns']}")
-                            print(f"  Строк   : {data['row_count']}")
-                            for row in data["rows"]:
-                                print(f"            {row}")
-                print()
-
-    print("=" * 60)
-    print("Клиент завершил работу.")
-
-
-if __name__ == "__main__":
-    asyncio.run(run_client())
-
-
-
-
-
-
-CREATE TABLE bench_metrics (
-    ts          TIMESTAMPTZ DEFAULT NOW(),
-    phase       TEXT,          -- 'baseline', 'light', 'heavy' и т.д.
-    p95_ms      FLOAT,
-    p99_ms      FLOAT,
-    del_files   INT,
-    snapshots   INT,
-    write_tps   FLOAT
-);
-
--- Аннотации фаз — отдельно
-CREATE TABLE bench_phases (
-    ts          TIMESTAMPTZ DEFAULT NOW(),
-    phase       TEXT,
-    note        TEXT
-);
-
-
-# collector.py
-import psycopg2, pymysql, time, os
-
-PG = psycopg2.connect("postgresql://user:pass@localhost/bench")
-SR = dict(host="localhost", port=9030, user="root", password="")
-
-PHASE = os.getenv("BENCH_PHASE", "unknown")  # задаёшь через env при запуске
-
-def collect():
-    sr = pymysql.connect(**SR)
-    
-    lat = pd.read_sql("""
-        SELECT PERCENTILE_APPROX(query_time_ms, 0.95) p95,
-               PERCENTILE_APPROX(query_time_ms, 0.99) p99
-        FROM starrocks_audit_db__.starrocks_audit_tbl__
-        WHERE query_time > NOW() - INTERVAL 2 MINUTE
-    """, sr)
-
-    del_f = pd.read_sql("""
-        SELECT COUNT(*) cnt FROM iceberg_catalog.db.table$files
-        WHERE file_content = 1
-    """, sr)
-
-    snaps = pd.read_sql("""
-        SELECT COUNT(*) cnt FROM iceberg_catalog.db.table$snapshots
-    """, sr)
-
-    with PG.cursor() as cur:
-        cur.execute("""
-            INSERT INTO bench_metrics (phase, p95_ms, p99_ms, del_files, snapshots)
-            VALUES (%s, %s, %s, %s, %s)
-        """, (
-            PHASE,
-            lat["p95"].iloc[0],
-            lat["p99"].iloc[0],
-            del_f["cnt"].iloc[0],
-            snaps["cnt"].iloc[0],
-        ))
-        PG.commit()
-    sr.close()
-
-while True:
-    try:
-        collect()
-    except Exception as e:
-        print(f"[ERROR] {e}")
-    time.sleep(30)
-
-
-
-
-
-
-
-CREATE TABLE bench_metrics (
-    id                  SERIAL PRIMARY KEY,
-    ts                  TIMESTAMPTZ DEFAULT NOW(),
-    phase               TEXT,
-
-    -- Латентность
-    p95_ms              FLOAT,
-    p99_ms              FLOAT,
-    avg_ms              FLOAT,
-    qps                 INT,
-
-    -- Файлы суммарно
-    total_files         INT,
-    total_size_bytes    BIGINT,
-
-    -- Data files
-    data_files          INT,
-    data_size_bytes     BIGINT,
-    data_avg_bytes      BIGINT,
-    data_records        BIGINT,
-
-    -- Delete files
-    del_files           INT,       -- positional deletes
-    eq_del_files        INT,       -- equality deletes (upsert)
-
-    -- Партиции
-    partition_cnt       INT,
-
-    -- Snapshots
-    snapshot_cnt        INT,
-
-    -- Metadata
-    manifest_cnt        INT,
-    manifest_bytes      BIGINT,
-    meta_json_cnt       INT
-);
-
-CREATE TABLE bench_phases (
-    ts      TIMESTAMPTZ DEFAULT NOW(),
-    phase   TEXT,
-    note    TEXT
-);
-
--- Индекс для быстрой выборки по времени в дашборде
-CREATE INDEX idx_bench_metrics_ts ON bench_metrics (ts);
-
-
-
-# collector.py
-import psycopg2
-import pymysql
-import pandas as pd
-import time
-import os
-
-PG = psycopg2.connect("postgresql://user:pass@localhost/bench")
-SR = dict(host="localhost", port=9030, user="root", password="")
-
-PHASE = os.getenv("BENCH_PHASE", "unknown")
-CATALOG = os.getenv("ICEBERG_CATALOG", "iceberg_ods")
-DB      = os.getenv("ICEBERG_DB",      "test_db")
-TABLE   = os.getenv("ICEBERG_TABLE",   "ANALOGS_BY_PROMOTED_AGG_DAILY")
-
-def q(sql):
-   conn = pymysql.connect(**SR)
-   df = pd.read_sql(sql, conn)
-   conn.close()
-   return df
-
-def collect():
-   sr_conn = pymysql.connect(**SR)
-   full_table = f"{CATALOG}.{DB}.{TABLE}"
-
-   # ----------------------------------------------------------------
-   # 1. Латентность запросов из audit log
-   # ----------------------------------------------------------------
-   lat = pd.read_sql(f"""
-       SELECT
-           PERCENTILE_APPROX(query_time_ms, 0.95) AS p95,
-           PERCENTILE_APPROX(query_time_ms, 0.99) AS p99,
-           AVG(query_time_ms)                      AS avg_ms,
-           COUNT(*)                                AS qps
-       FROM starrocks_audit_db__.starrocks_audit_tbl__
-       WHERE query_time > NOW() - INTERVAL 2 MINUTE
-         AND stmt LIKE '%{TABLE}%'
-   """, sr_conn)
-
-   # ----------------------------------------------------------------
-   # 2. Файлы: data / delete / общее
-   # ----------------------------------------------------------------
-   files = pd.read_sql(f"""
-       SELECT
-           file_content,
-           COUNT(*)                        AS cnt,
-           SUM(file_size_in_bytes)         AS total_bytes,
-           AVG(file_size_in_bytes)         AS avg_bytes,
-           SUM(record_count)               AS total_records
-       FROM {full_table}$files
-       GROUP BY file_content
-   """, sr_conn)
-   # file_content: 0=data, 1=position_deletes, 2=equality_deletes
-
-   data_row  = files[files.file_content == 0].iloc[0] if not files[files.file_content == 0].empty else None
-   del_row   = files[files.file_content == 1].iloc[0] if not files[files.file_content == 1].empty else None
-   eq_row    = files[files.file_content == 2].iloc[0] if not files[files.file_content == 2].empty else None
-
-   total_files      = int(files.cnt.sum())
-   total_size_bytes = int(files.total_bytes.sum())
-
-   data_files       = int(data_row.cnt)          if data_row is not None else 0
-   data_size_bytes  = int(data_row.total_bytes)  if data_row is not None else 0
-   data_avg_bytes   = int(data_row.avg_bytes)    if data_row is not None else 0
-   data_records     = int(data_row.total_records)if data_row is not None else 0
-   del_files        = int(del_row.cnt)           if del_row  is not None else 0
-   eq_del_files     = int(eq_row.cnt)            if eq_row   is not None else 0
-
-   # ----------------------------------------------------------------
-   # 3. Партиции
-   # ----------------------------------------------------------------
-   parts = pd.read_sql(f"""
-       SELECT COUNT(DISTINCT partition) AS partition_cnt
-       FROM {full_table}$partitions
-   """, sr_conn)
-   partition_cnt = int(parts.partition_cnt.iloc[0])
-
-   # ----------------------------------------------------------------
-   # 4. Snapshots
-   # ----------------------------------------------------------------
-   snaps = pd.read_sql(f"""
-       SELECT COUNT(*) AS cnt
-       FROM {full_table}$snapshots
-   """, sr_conn)
-   snapshot_cnt = int(snaps.cnt.iloc[0])
-
-   # ----------------------------------------------------------------
-   # 5. Манифесты (metadata)
-   # ----------------------------------------------------------------
-   manifests = pd.read_sql(f"""
-       SELECT
-           COUNT(*)                AS manifest_cnt,
-           SUM(length)             AS manifest_total_bytes,
-           SUM(added_files_count)  AS added_files,
-           SUM(deleted_files_count)AS deleted_files,
-           SUM(existing_files_count) AS existing_files
-       FROM {full_table}$manifests
-   """, sr_conn)
-   manifest_cnt        = int(manifests.manifest_cnt.iloc[0])
-   manifest_bytes      = int(manifests.manifest_total_bytes.iloc[0] or 0)
-
-   # ----------------------------------------------------------------
-   # 6. Metadata JSON файлы — считаем через $history
-   #    (каждый snapshot = один metadata JSON)
-   # ----------------------------------------------------------------
-   meta_json = pd.read_sql(f"""
-       SELECT COUNT(DISTINCT snapshot_id) AS meta_json_cnt
-       FROM {full_table}$history
-   """, sr_conn)
-   meta_json_cnt = int(meta_json.meta_json_cnt.iloc[0])
-
-   sr_conn.close()
-
-   # ----------------------------------------------------------------
-   # 7. Пишем в Postgres
-   # ----------------------------------------------------------------
-   with PG.cursor() as cur:
-       cur.execute("""
-           INSERT INTO bench_metrics (
-               phase,
-               -- latency
-               p95_ms, p99_ms, avg_ms, qps,
-               -- files summary
-               total_files, total_size_bytes,
-               -- data files
-               data_files, data_size_bytes, data_avg_bytes, data_records,
-               -- delete files
-               del_files, eq_del_files,
-               -- partitions
-               partition_cnt,
-               -- snapshots
-               snapshot_cnt,
-               -- metadata
-               manifest_cnt, manifest_bytes, meta_json_cnt
-           ) VALUES (
-               %s,
-               %s, %s, %s, %s,
-               %s, %s,
-               %s, %s, %s, %s,
-               %s, %s,
-               %s,
-               %s,
-               %s, %s, %s
-           )
-       """, (
-           PHASE,
-           float(lat.p95.iloc[0]  or 0),
-           float(lat.p99.iloc[0]  or 0),
-           float(lat.avg_ms.iloc[0] or 0),
-           int(lat.qps.iloc[0]    or 0),
-           total_files, total_size_bytes,
-           data_files, data_size_bytes, data_avg_bytes, data_records,
-           del_files, eq_del_files,
-           partition_cnt,
-           snapshot_cnt,
-           manifest_cnt, manifest_bytes, meta_json_cnt,
-       ))
-       PG.commit()
-   print(f"[OK] {PHASE} | P95={lat.p95.iloc[0]:.0f}ms"
-         f" | files={total_files} | del={del_files}"
-         f" | parts={partition_cnt} | snaps={snapshot_cnt}")
-
-if __name__ == "__main__":
-   while True:
-       try:
-           collect()
-       except Exception as e:
-           print(f"[ERROR] {e}")
-       time.sleep(30)
-
-
-
-# dashboard.py
-import streamlit as st
-import pandas as pd
-import psycopg2
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import time
-
-PG_DSN = "postgresql://user:pass@localhost/bench"
-st.set_page_config(page_title="Iceberg Benchmark", layout="wide")
-st.title("StarRocks + Iceberg — Benchmark Dashboard")
-
-window   = st.sidebar.selectbox("Окно", ["15 минут", "1 час", "Всё"], index=1)
-auto     = st.sidebar.checkbox("Авто-обновление 15с", value=True)
-win_map  = {"15 минут": "15 minutes", "1 час": "1 hour", "Всё": "100 years"}
-
-PHASE_COLORS = {
-    "baseline":    "#888888",
-    "light_write": "#2ecc71",
-    "medium_write":"#f39c12",
-    "heavy_write": "#e74c3c",
-    "recovery":    "#3498db",
-    "unknown":     "#9b59b6",
-}
-
-@st.cache_data(ttl=15)
-def load(win):
-    conn = psycopg2.connect(PG_DSN)
-    df = pd.read_sql(f"""
-        SELECT * FROM bench_metrics
-        WHERE ts > NOW() - INTERVAL '{win_map[win]}'
-        ORDER BY ts
-    """, conn)
-    phases = pd.read_sql("SELECT * FROM bench_phases ORDER BY ts", conn)
-    conn.close()
-    return df, phases
-
-df, phases = load(window)
-
-if df.empty:
-    st.warning("Нет данных. Запусти collector.py")
-    st.stop()
-
-# ----------------------------------------------------------------
-# KPI плашки — последние значения
-# ----------------------------------------------------------------
-last = df.iloc[-1]
-first = df.iloc[0]
-
-st.subheader("Текущее состояние")
-c1,c2,c3,c4,c5,c6 = st.columns(6)
-c1.metric("P95 latency",    f"{last.p95_ms:.0f} ms",
-          f"{last.p95_ms - first.p95_ms:+.0f}")
-c2.metric("P99 latency",    f"{last.p99_ms:.0f} ms",
-          f"{last.p99_ms - first.p99_ms:+.0f}")
-c3.metric("Всего файлов",   int(last.total_files),
-          f"{last.total_files - first.total_files:+.0f}")
-c4.metric("Delete files",   int(last.del_files),
-          f"{last.del_files - first.del_files:+.0f}")
-c5.metric("Партиций",       int(last.partition_cnt))
-c6.metric("Snapshots",      int(last.snapshot_cnt),
-          f"{last.snapshot_cnt - first.snapshot_cnt:+.0f}")
-
-st.divider()
-
-# ----------------------------------------------------------------
-# Вспомогательная функция: добавить vline фаз
-# ----------------------------------------------------------------
-def add_phase_lines(fig, phases, rows_cols):
-    for _, row in phases.iterrows():
-        color = PHASE_COLORS.get(row.phase, "#000")
-        for r, c in rows_cols:
-            fig.add_vline(
-                x=row.ts, line_dash="dash",
-                line_color=color, line_width=1,
-                annotation_text=row.phase,
-                annotation_font_size=9,
-                row=r, col=c
-            )
-
-# ================================================================
-# График 1: Латентность + QPS
-# ================================================================
-st.subheader("Латентность запросов")
-fig1 = make_subplots(specs=[[{"secondary_y": True}]])
-
-for phase, grp in df.groupby("phase"):
-    c = PHASE_COLORS.get(phase, "#888")
-    fig1.add_trace(go.Scatter(
-        x=grp.ts, y=grp.p95_ms, name=f"{phase} P95",
-        line=dict(color=c, dash="dot")), secondary_y=False)
-    fig1.add_trace(go.Scatter(
-        x=grp.ts, y=grp.p99_ms, name=f"{phase} P99",
-        line=dict(color=c)), secondary_y=False)
-    fig1.add_trace(go.Scatter(
-        x=grp.ts, y=grp.qps, name=f"{phase} QPS",
-        line=dict(color=c, dash="longdash"), opacity=0.4),
-        secondary_y=True)
-
-for _, row in phases.iterrows():
-    fig1.add_vline(x=row.ts, line_dash="dash",
-                   line_color=PHASE_COLORS.get(row.phase,"#000"),
-                   annotation_text=row.phase, annotation_font_size=9)
-
-fig1.update_yaxes(title_text="Latency ms", secondary_y=False)
-fig1.update_yaxes(title_text="QPS",        secondary_y=True)
-fig1.update_layout(height=350)
-st.plotly_chart(fig1, use_container_width=True)
-
-# ================================================================
-# График 2: Файлы
-# ================================================================
-st.subheader("Файлы")
-fig2 = make_subplots(rows=1, cols=3,
-    subplot_titles=("Кол-во файлов", "Размер данных (GB)", "Средний размер data file (MB)"))
-
-for phase, grp in df.groupby("phase"):
-    c = PHASE_COLORS.get(phase, "#888")
-    fig2.add_trace(go.Scatter(x=grp.ts, y=grp.data_files,
-        name=f"{phase} data", line=dict(color=c)), row=1, col=1)
-    fig2.add_trace(go.Scatter(x=grp.ts, y=grp.del_files,
-        name=f"{phase} del", line=dict(color=c, dash="dot")), row=1, col=1)
-    fig2.add_trace(go.Scatter(x=grp.ts, y=grp.eq_del_files,
-        name=f"{phase} eq_del", line=dict(color=c, dash="dash")), row=1, col=1)
-    fig2.add_trace(go.Scatter(x=grp.ts,
-        y=grp.data_size_bytes / 1e9,
-        name=phase, line=dict(color=c), showlegend=False), row=1, col=2)
-    fig2.add_trace(go.Scatter(x=grp.ts,
-        y=grp.data_avg_bytes / 1e6,
-        name=phase, line=dict(color=c), showlegend=False), row=1, col=3)
-
-add_phase_lines(fig2, phases, [(1,1),(1,2),(1,3)])
-fig2.update_layout(height=350)
-st.plotly_chart(fig2, use_container_width=True)
-
-# ================================================================
-# График 3: Партиции + Snapshots
-# ================================================================
-st.subheader("Партиции и снапшоты")
-fig3 = make_subplots(rows=1, cols=2,
-    subplot_titles=("Партиции", "Snapshots"))
-
-for phase, grp in df.groupby("phase"):
-    c = PHASE_COLORS.get(phase, "#888")
-    fig3.add_trace(go.Scatter(x=grp.ts, y=grp.partition_cnt,
-        name=phase, line=dict(color=c)), row=1, col=1)
-    fig3.add_trace(go.Scatter(x=grp.ts, y=grp.snapshot_cnt,
-        name=phase, line=dict(color=c), showlegend=False), row=1, col=2)
-
-add_phase_lines(fig3, phases, [(1,1),(1,2)])
-fig3.update_layout(height=300)
-st.plotly_chart(fig3, use_container_width=True)
-
-# ================================================================
-# График 4: Metadata
-# ================================================================
-st.subheader("Metadata overhead")
-fig4 = make_subplots(rows=1, cols=3,
-    subplot_titles=("Манифестов", "Размер манифестов (MB)", "Metadata JSON файлов"))
-
-for phase, grp in df.groupby("phase"):
-    c = PHASE_COLORS.get(phase, "#888")
-    fig4.add_trace(go.Scatter(x=grp.ts, y=grp.manifest_cnt,
-        name=phase, line=dict(color=c)), row=1, col=1)
-    fig4.add_trace(go.Scatter(x=grp.ts,
-        y=grp.manifest_bytes / 1e6,
-        name=phase, line=dict(color=c), showlegend=False), row=1, col=2)
-    fig4.add_trace(go.Scatter(x=grp.ts, y=grp.meta_json_cnt,
-        name=phase, line=dict(color=c), showlegend=False), row=1, col=3)
-
-add_phase_lines(fig4, phases, [(1,1),(1,2),(1,3)])
-fig4.update_layout(height=300)
-st.plotly_chart(fig4, use_container_width=True)
-
-# ================================================================
-# Таблица сырых данных
-# ================================================================
-with st.expander("Сырые данные"):
-    st.dataframe(df.tail(50)[[
-        "ts","phase","p95_ms","p99_ms","qps",
-        "total_files","data_files","del_files","eq_del_files",
-        "data_size_bytes","partition_cnt","snapshot_cnt",
-        "manifest_cnt","meta_json_cnt"
-    ]].sort_values("ts", ascending=False))
-
-if auto:
-    time.sleep(15)
-    st.rerun()
-
-
-запуск
-# Фаза baseline — только чтение
-BENCH_PHASE=baseline python collector.py
-
-# Затем меняешь фазу рестартом
-BENCH_PHASE=heavy_write python collector.py
-
-# Зафиксировать смену фазы в БД
-psql bench -c "INSERT INTO bench_phases(phase,note) VALUES('heavy_write','50k/s upsert started')"
-
-
-
-
-
-"""
-Iceberg S3 Storage Auditor
---------------------------
-Читает метаданные Iceberg напрямую из S3 (без Spark/catalog),
-парсит manifest lists → manifests → data/delete entries,
-и сопоставляет их с реальными объектами в бакете.
-
-Результат: 100% достоверная картина — какие файлы живые,
-какие orphan, сколько места можно высвободить.
-
-Требования: pip install boto3
-"""
-
-import json
-import struct
-import io
-import os
-import re
-import sys
-import gzip
-import zlib
-import argparse
-from dataclasses import dataclass, field
-from collections import defaultdict
-from typing import Optional
-from datetime import datetime, timezone
-
-import boto3
-from botocore.exceptions import ClientError
-
-
-# ─────────────────────────── Avro minimal reader ────────────────────────────
-# Iceberg manifest files — это Avro. Тащить fastavro не хочется,
-# поэтому реализуем минимальный reader для нужных полей.
-
-AVRO_MAGIC = b"Obj\x01"
-
-
-def _read_long(buf: io.BytesIO) -> int:
-    """ZigZag + VarInt decode."""
-    b, n, shift = 0, 0, 0
-    while True:
-        byte = buf.read(1)
-        if not byte:
-            raise EOFError("unexpected EOF in avro long")
-        byte = byte[0]
-        n |= (byte & 0x7F) << shift
-        shift += 7
-        if not (byte & 0x80):
-            break
-    return (n >> 1) ^ -(n & 1)
-
-
-def _read_bytes(buf: io.BytesIO) -> bytes:
-    n = _read_long(buf)
-    return buf.read(n)
-
-
-def _read_string(buf: io.BytesIO) -> str:
-    return _read_bytes(buf).decode("utf-8", errors="replace")
-
-
-def _skip_value(buf: io.BytesIO, schema, named_types: dict):
-    """Пропускаем значение по схеме Avro."""
-    if isinstance(schema, list):
-        idx = _read_long(buf)
-        _skip_value(buf, schema[idx], named_types)
-        return
-    if isinstance(schema, dict):
-        t = schema.get("type")
-        if t == "record":
-            for f in schema["fields"]:
-                _skip_value(buf, f["type"], named_types)
-            return
-        if t == "array":
-            while True:
-                cnt = _read_long(buf)
-                if cnt == 0:
-                    break
-                if cnt < 0:
-                    _read_long(buf)
-                    cnt = -cnt
-                for _ in range(cnt):
-                    _skip_value(buf, schema["items"], named_types)
-            return
-        if t == "map":
-            while True:
-                cnt = _read_long(buf)
-                if cnt == 0:
-                    break
-                if cnt < 0:
-                    _read_long(buf)
-                    cnt = -cnt
-                for _ in range(cnt):
-                    _read_string(buf)
-                    _skip_value(buf, schema["values"], named_types)
-            return
-        if t in ("bytes", "fixed"):
-            if t == "fixed":
-                buf.read(schema["size"])
-            else:
-                _read_bytes(buf)
-            return
-        if t == "string":
-            _read_string(buf)
-            return
-        if t in ("int", "long"):
-            _read_long(buf)
-            return
-        if t in ("float",):
-            buf.read(4)
-            return
-        if t in ("double",):
-            buf.read(8)
-            return
-        if t in ("boolean",):
-            buf.read(1)
-            return
-        if t == "null":
-            return
-        if t == "enum":
-            _read_long(buf)
-            return
-        # named type ref
-        if isinstance(t, str) and t in named_types:
-            _skip_value(buf, named_types[t], named_types)
-            return
-    if isinstance(schema, str):
-        if schema in named_types:
-            _skip_value(buf, named_types[schema], named_types)
-            return
-        if schema == "string":
-            _read_string(buf)
-        elif schema in ("int", "long"):
-            _read_long(buf)
-        elif schema == "float":
-            buf.read(4)
-        elif schema == "double":
-            buf.read(8)
-        elif schema == "bytes":
-            _read_bytes(buf)
-        elif schema == "boolean":
-            buf.read(1)
-        elif schema == "null":
-            pass
-
-
-def _collect_named(schema, named_types: dict):
-    if isinstance(schema, list):
-        for s in schema:
-            _collect_named(s, named_types)
-    elif isinstance(schema, dict):
-        if schema.get("type") == "record":
-            named_types[schema["name"]] = schema
-            for f in schema.get("fields", []):
-                _collect_named(f["type"], named_types)
-        elif schema.get("type") in ("array", "map"):
-            _collect_named(schema.get("items", schema.get("values", {})), named_types)
-
-
-def _read_record_field(buf: io.BytesIO, field_schema, named_types: dict, want: set):
-    """Читаем одно поле записи. Возвращаем значение если имя в want, иначе None."""
-    name = field_schema["name"]
-    ftype = field_schema["type"]
-    if name not in want:
-        _skip_value(buf, ftype, named_types)
-        return name, None
-
-    # читаем реально
-    return name, _read_typed(buf, ftype, named_types)
-
-
-def _read_typed(buf: io.BytesIO, schema, named_types: dict):
-    if isinstance(schema, list):
-        idx = _read_long(buf)
-        actual = schema[idx]
-        if actual == "null":
-            return None
-        return _read_typed(buf, actual, named_types)
-    if isinstance(schema, str):
-        if schema in named_types:
-            return _read_typed(buf, named_types[schema], named_types)
-        if schema == "string":
-            return _read_string(buf)
-        if schema in ("int", "long"):
-            return _read_long(buf)
-        if schema == "float":
-            return struct.unpack(">f", buf.read(4))[0]
-        if schema == "double":
-            return struct.unpack(">d", buf.read(8))[0]
-        if schema == "bytes":
-            return _read_bytes(buf)
-        if schema == "boolean":
-            return bool(buf.read(1)[0])
-        if schema == "null":
-            return None
-        return None
-    if isinstance(schema, dict):
-        t = schema.get("type")
-        if t == "record":
-            result = {}
-            for f in schema["fields"]:
-                result[f["name"]] = _read_typed(buf, f["type"], named_types)
-            return result
-        if t == "string":
-            return _read_string(buf)
-        if t in ("int", "long"):
-            return _read_long(buf)
-        if t == "float":
-            return struct.unpack(">f", buf.read(4))[0]
-        if t == "double":
-            return struct.unpack(">d", buf.read(8))[0]
-        if t in ("bytes",):
-            return _read_bytes(buf)
-        if t == "fixed":
-            return buf.read(schema["size"])
-        if t == "boolean":
-            return bool(buf.read(1)[0])
-        if t == "null":
-            return None
-        if t == "enum":
-            idx = _read_long(buf)
-            return schema["symbols"][idx]
-        if t == "array":
-            items = []
-            while True:
-                cnt = _read_long(buf)
-                if cnt == 0:
-                    break
-                if cnt < 0:
-                    _read_long(buf)
-                    cnt = -cnt
-                for _ in range(cnt):
-                    items.append(_read_typed(buf, schema["items"], named_types))
-            return items
-        if t == "map":
-            result = {}
-            while True:
-                cnt = _read_long(buf)
-                if cnt == 0:
-                    break
-                if cnt < 0:
-                    _read_long(buf)
-                    cnt = -cnt
-                for _ in range(cnt):
-                    k = _read_string(buf)
-                    result[k] = _read_typed(buf, schema["values"], named_types)
-            return result
-        if isinstance(t, str) and t in named_types:
-            return _read_typed(buf, named_types[t], named_types)
-    return None
-
-
-def parse_avro_manifest(data: bytes, want_fields: set) -> list[dict]:
-    """
-    Минимальный Avro-парсер: читает только нужные поля (want_fields)
-    из каждой записи, остальное пропускает.
-    """
-    buf = io.BytesIO(data)
-    magic = buf.read(4)
-    if magic != AVRO_MAGIC:
-        raise ValueError("Not an Avro file")
-
-    # Читаем мета-блок
-    meta = {}
-    while True:
-        cnt = _read_long(buf)
-        if cnt == 0:
-            break
-        if cnt < 0:
-            _read_long(buf)
-            cnt = -cnt
-        for _ in range(cnt):
-            k = _read_string(buf)
-            v = _read_bytes(buf)
-            meta[k] = v
-
-    codec = meta.get("avro.codec", b"null").decode()
-    schema_str = meta.get("avro.schema", b"{}").decode()
-    schema = json.loads(schema_str)
-    sync_marker = buf.read(16)
-
-    named_types: dict = {}
-    _collect_named(schema, named_types)
-
-    records = []
-    while True:
-        try:
-            obj_count = _read_long(buf)
-        except EOFError:
-            break
-        if obj_count == 0:
-            break
-        block_size = _read_long(buf)
-        block_data = buf.read(block_size)
-        block_sync = buf.read(16)
-        if block_sync != sync_marker:
-            raise ValueError("Avro sync marker mismatch")
-
-        if codec == "deflate":
-            block_data = zlib.decompress(block_data, -15)
-        elif codec == "null":
-            pass
-        else:
-            raise ValueError(f"Unsupported avro codec: {codec}")
-
-        bbuf = io.BytesIO(block_data)
-        for _ in range(obj_count):
-            rec = {}
-            if isinstance(schema, dict) and schema.get("type") == "record":
-                for f in schema["fields"]:
-                    name, val = _read_record_field(bbuf, f, named_types, want_fields)
-                    if val is not None or name in want_fields:
-                        rec[name] = val
-            records.append(rec)
-
-    return records
-
-
-# ──────────────────────────── S3 helpers ────────────────────────────────────
-
-def s3_url_to_parts(url: str) -> tuple[str, str]:
-    """s3://bucket/prefix/key → (bucket, prefix/key)"""
-    url = url.strip()
-    if url.startswith("s3://") or url.startswith("s3a://"):
-        without = re.sub(r"^s3a?://", "", url)
-        parts = without.split("/", 1)
-        bucket = parts[0]
-        key = parts[1] if len(parts) > 1 else ""
-        return bucket, key
-    raise ValueError(f"Not an s3/s3a URL: {url}")
-
-
-def get_s3_client(endpoint_url: Optional[str], profile: Optional[str]) -> boto3.client:
-    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
-    kwargs = {"service_name": "s3"}
-    if endpoint_url:
-        kwargs["endpoint_url"] = endpoint_url
-    return session.client(**kwargs)
-
-
-def s3_get_object_bytes(s3, bucket: str, key: str) -> bytes:
-    resp = s3.get_object(Bucket=bucket, Key=key)
-    return resp["Body"].read()
-
-
-def s3_list_all_objects(s3, bucket: str, prefix: str) -> dict[str, int]:
-    """Возвращает {key: size_bytes} для всех объектов под prefix."""
-    result = {}
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            result[obj["Key"]] = obj["Size"]
-    return result
-
-
-# ──────────────────────────── Iceberg metadata ──────────────────────────────
-
-def find_metadata_json(s3, bucket: str, metadata_prefix: str) -> str:
-    """
-    Находим последний version-hint.text или последний v*.metadata.json
-    """
-    # Пробуем version-hint.text
-    hint_key = metadata_prefix.rstrip("/") + "/version-hint.text"
-    try:
-        data = s3_get_object_bytes(s3, bucket, hint_key)
-        version = int(data.strip())
-        meta_key = metadata_prefix.rstrip("/") + f"/v{version}.metadata.json"
-        print(f"  [hint] version={version} → {meta_key}")
-        return meta_key
-    except (ClientError, ValueError):
-        pass
-
-    # Ищем последний v*.metadata.json по имени
-    paginator = s3.get_paginator("list_objects_v2")
-    candidates = []
-    for page in paginator.paginate(Bucket=bucket, Prefix=metadata_prefix.rstrip("/") + "/"):
-        for obj in page.get("Contents", []):
-            k = obj["Key"]
-            if re.search(r"v\d+\.metadata\.json$", k):
-                candidates.append((k, obj["LastModified"]))
-
-    if not candidates:
-        raise FileNotFoundError(f"No metadata.json found under s3://{bucket}/{metadata_prefix}")
-
-    candidates.sort(key=lambda x: x[1])
-    chosen = candidates[-1][0]
-    print(f"  [scan] latest metadata → {chosen}")
-    return chosen
-
-
-@dataclass
-class IcebergFile:
-    path: str
-    size: int
-    file_type: str   # DATA or EQUALITY_DELETES / POSITION_DELETES
-    status: str      # ADDED / EXISTING / DELETED
-    snapshot_id: Optional[int] = None
-
-
-@dataclass
-class SnapshotInfo:
-    snapshot_id: int
-    parent_snapshot_id: Optional[int]
-    timestamp_ms: int
-    operation: str
-    manifest_list_path: str
-
-
-@dataclass
-class AuditResult:
-    table_name: str
-    table_location: str
-    current_snapshot_id: Optional[int]
-    format_version: int
-    snapshots: list[SnapshotInfo]
-
-    # Файлы, видимые в ТЕКУЩЕМ снапшоте (live)
-    live_data_files: dict[str, IcebergFile] = field(default_factory=dict)
-    live_delete_files: dict[str, IcebergFile] = field(default_factory=dict)
-
-    # Файлы из всех снапшотов (включая исторические)
-    all_referenced_files: dict[str, IcebergFile] = field(default_factory=dict)
-
-    # Metadata-файлы (manifest lists, manifests, metadata.json)
-    metadata_files: set[str] = field(default_factory=set)
-
-    # Реальные объекты в S3 (все под table_location)
-    s3_all_objects: dict[str, int] = field(default_factory=dict)
-
-
-# ────────────────────────────── Core parser ─────────────────────────────────
-
-class IcebergAuditor:
-
-    def __init__(self, s3, bucket: str):
-        self.s3 = s3
-        self.bucket = bucket
-
-    def _get_json(self, key: str) -> dict:
-        data = s3_get_object_bytes(self.s3, self.bucket, key)
-        return json.loads(data)
-
-    def _key_from_path(self, path: str) -> str:
-        _, key = s3_url_to_parts(path)
-        return key
-
-    def audit_table(self, table_prefix: str) -> AuditResult:
-        """
-        table_prefix — путь в S3 до корня таблицы,
-        например: 'warehouse/db/my_table'
-        """
-        metadata_prefix = table_prefix.rstrip("/") + "/metadata"
-
-        print(f"\n{'='*60}")
-        print(f"Auditing s3://{self.bucket}/{table_prefix}")
-        print(f"{'='*60}")
-
-        # 1. Находим metadata.json
-        meta_key = find_metadata_json(self.s3, self.bucket, metadata_prefix)
-        meta = self._get_json(meta_key)
-
-        format_version = meta.get("format-version", 1)
-        table_uuid = meta.get("table-uuid", "unknown")
-        location = meta.get("location", f"s3://{self.bucket}/{table_prefix}")
-        current_snapshot_id = meta.get("current-snapshot-id")
-
-        print(f"  format-version : {format_version}")
-        print(f"  table-uuid     : {table_uuid}")
-        print(f"  location       : {location}")
-        print(f"  current snap   : {current_snapshot_id}")
-
-        result = AuditResult(
-            table_name=table_prefix.split("/")[-1],
-            table_location=location,
-            current_snapshot_id=current_snapshot_id,
-            format_version=format_version,
-            snapshots=[],
-        )
-
-        # Регистрируем metadata.json как metadata-файл
-        result.metadata_files.add(meta_key)
-
-        # 2. Собираем все снапшоты
-        snapshots_raw = meta.get("snapshots", [])
-        snap_map: dict[int, dict] = {s["snapshot-id"]: s for s in snapshots_raw}
-
-        for s in snapshots_raw:
-            si = SnapshotInfo(
-                snapshot_id=s["snapshot-id"],
-                parent_snapshot_id=s.get("parent-snapshot-id"),
-                timestamp_ms=s.get("timestamp-ms", 0),
-                operation=s.get("summary", {}).get("operation", "unknown"),
-                manifest_list_path=s.get("manifest-list", ""),
-            )
-            result.snapshots.append(si)
-
-        print(f"  snapshots total: {len(result.snapshots)}")
-
-        # 3. Читаем все manifest lists → manifests → files
-        for si in result.snapshots:
-            if not si.manifest_list_path:
-                continue
-            is_current = (si.snapshot_id == current_snapshot_id)
-            self._process_manifest_list(si, result, is_current)
-
-        # 4. Листаем S3 (все объекты под table_prefix)
-        print(f"\n  Listing all S3 objects under prefix...")
-        result.s3_all_objects = s3_list_all_objects(
-            self.s3, self.bucket, table_prefix.rstrip("/") + "/"
-        )
-        print(f"  S3 objects found: {len(result.s3_all_objects)}")
-
-        return result
-
-    def _process_manifest_list(self, si: SnapshotInfo, result: AuditResult, is_current: bool):
-        try:
-            ml_key = self._key_from_path(si.manifest_list_path)
-            ml_data = s3_get_object_bytes(self.s3, self.bucket, ml_key)
-            result.metadata_files.add(ml_key)
-        except ClientError as e:
-            print(f"  [WARN] Cannot read manifest list {si.manifest_list_path}: {e}")
-            return
-
-        # Manifest list — тоже Avro
-        try:
-            entries = parse_avro_manifest(
-                ml_data,
-                want_fields={"manifest_path", "manifest_length", "content"}
-            )
-        except Exception as e:
-            print(f"  [WARN] Failed to parse manifest list {ml_key}: {e}")
-            return
-
-        for entry in entries:
-            mpath = entry.get("manifest_path", "")
-            if not mpath:
-                continue
-            content = entry.get("content", 0)  # 0=DATA, 1=DELETES
-            self._process_manifest(mpath, content, result, is_current, si.snapshot_id)
-
-    def _process_manifest(
-        self,
-        manifest_path: str,
-        content_type: int,
-        result: AuditResult,
-        is_current: bool,
-        snapshot_id: int,
-    ):
-        try:
-            m_key = self._key_from_path(manifest_path)
-            m_data = s3_get_object_bytes(self.s3, self.bucket, m_key)
-            result.metadata_files.add(m_key)
-        except ClientError as e:
-            print(f"  [WARN] Cannot read manifest {manifest_path}: {e}")
-            return
-
-        try:
-            entries = parse_avro_manifest(
-                m_data,
-                want_fields={"data_file", "status", "file_path", "file_size_in_bytes", "content"}
-            )
-        except Exception as e:
-            print(f"  [WARN] Failed to parse manifest {m_key}: {e}")
-            return
-
-        # STATUS: 0=EXISTING, 1=ADDED, 2=DELETED
-        STATUS_MAP = {0: "EXISTING", 1: "ADDED", 2: "DELETED"}
-        CONTENT_MAP = {0: "DATA", 1: "POSITION_DELETES", 2: "EQUALITY_DELETES"}
-
-        for entry in entries:
-            status_code = entry.get("status", 0)
-            status = STATUS_MAP.get(status_code, "UNKNOWN")
-
-            data_file = entry.get("data_file")
-            if not data_file or not isinstance(data_file, dict):
-                continue
-
-            fpath = data_file.get("file_path", "")
-            fsize = data_file.get("file_size_in_bytes", 0) or 0
-            fcontent = data_file.get("content", content_type)
-            ftype = CONTENT_MAP.get(fcontent, "DATA")
-
-            if not fpath:
-                continue
-
-            try:
-                fkey = self._key_from_path(fpath)
-            except ValueError:
-                fkey = fpath  # relative path
-
-            icefile = IcebergFile(
-                path=fkey,
-                size=fsize,
-                file_type=ftype,
-                status=status,
-                snapshot_id=snapshot_id,
-            )
-
-            # Регистрируем в all_referenced
-            result.all_referenced_files[fkey] = icefile
-
-            # В live только если текущий снапшот и не DELETED
-            if is_current and status != "DELETED":
-                if ftype == "DATA":
-                    result.live_data_files[fkey] = icefile
-                else:
-                    result.live_delete_files[fkey] = icefile
-
-
-# ──────────────────────────── Report ────────────────────────────────────────
-
-def fmt_size(b: int) -> str:
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if b < 1024:
-            return f"{b:.2f} {unit}"
-        b /= 1024
-    return f"{b:.2f} PB"
-
-
-def print_report(result: AuditResult):
-    sep = "─" * 70
-
-    print(f"\n{'═'*70}")
-    print(f"  ICEBERG S3 STORAGE AUDIT: {result.table_name}")
-    print(f"{'═'*70}")
-    print(f"  Table location  : {result.table_location}")
-    print(f"  Format version  : {result.format_version}")
-    print(f"  Current snapshot: {result.current_snapshot_id}")
-    print(f"  Total snapshots : {len(result.snapshots)}")
-
-    # ── Снапшоты ──
-    print(f"\n{sep}")
-    print("  SNAPSHOTS")
-    print(sep)
-    for si in sorted(result.snapshots, key=lambda x: x.timestamp_ms):
-        ts = datetime.fromtimestamp(si.timestamp_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        marker = " ◄ CURRENT" if si.snapshot_id == result.current_snapshot_id else ""
-        print(f"  [{ts}] snap={si.snapshot_id} op={si.operation}{marker}")
-
-    # ── Live файлы (текущий снапшот) ──
-    live_data_size = sum(f.size for f in result.live_data_files.values())
-    live_del_size = sum(f.size for f in result.live_delete_files.values())
-    live_total = live_data_size + live_del_size
-
-    print(f"\n{sep}")
-    print("  LIVE FILES (current snapshot)")
-    print(sep)
-    print(f"  Data files      : {len(result.live_data_files):>6}   {fmt_size(live_data_size):>12}")
-    print(f"  Delete files    : {len(result.live_delete_files):>6}   {fmt_size(live_del_size):>12}")
-    print(f"  {'':─<40}")
-    print(f"  LIVE TOTAL      : {len(result.live_data_files)+len(result.live_delete_files):>6}   {fmt_size(live_total):>12}")
-
-    # ── Все файлы данных (все снапшоты) ──
-    all_data_size = sum(f.size for f in result.all_referenced_files.values())
-    print(f"\n{sep}")
-    print("  ALL REFERENCED FILES (all snapshots, incl. historical)")
-    print(sep)
-    print(f"  Total files     : {len(result.all_referenced_files):>6}   {fmt_size(all_data_size):>12}")
-    historical_files = {
-        k: v for k, v in result.all_referenced_files.items()
-        if k not in result.live_data_files and k not in result.live_delete_files
-    }
-    hist_size = sum(f.size for f in historical_files.values())
-    print(f"  Historical only : {len(historical_files):>6}   {fmt_size(hist_size):>12}  ← reclaimable after expire_snapshots")
-
-    # ── Metadata-файлы ──
-    meta_size = sum(
-        result.s3_all_objects.get(k, 0) for k in result.metadata_files
-    )
-    print(f"\n{sep}")
-    print("  METADATA FILES")
-    print(sep)
-    print(f"  Count           : {len(result.metadata_files):>6}   {fmt_size(meta_size):>12}")
-    print(f"  (manifest lists, manifests, metadata.json)")
-
-    # ── Orphan files ──
-    # Известные Iceberg-файлы
-    known_keys = set(result.all_referenced_files.keys()) | result.metadata_files
-
-    # Все объекты в S3
-    s3_total_size = sum(result.s3_all_objects.values())
-    s3_data_keys = {
-        k for k in result.s3_all_objects
-        if k.endswith(".parquet") or k.endswith(".orc") or k.endswith(".avro")
-    }
-
-    orphan_files: dict[str, int] = {}
-    for k, sz in result.s3_all_objects.items():
-        if k not in known_keys:
-            orphan_files[k] = sz
-
-    orphan_size = sum(orphan_files.values())
-
-    print(f"\n{sep}")
-    print("  ORPHAN FILES (in S3 but not in any snapshot)")
-    print(sep)
-    print(f"  Count           : {len(orphan_files):>6}   {fmt_size(orphan_size):>12}  ← remove_orphan_files")
-
-    if orphan_files:
-        top = sorted(orphan_files.items(), key=lambda x: x[1], reverse=True)[:10]
-        print(f"\n  Top-10 by size:")
-        for k, sz in top:
-            print(f"    {fmt_size(sz):>10}  s3://{result.s3_all_objects and ''}{k}")
-
-    # ── Итоговая таблица ──
-    reclaimable = hist_size + orphan_size
-    print(f"\n{'═'*70}")
-    print("  SUMMARY")
-    print(f"{'═'*70}")
-    print(f"  Total S3 usage           : {fmt_size(s3_total_size):>12}")
-    print(f"  ├─ Live data             : {fmt_size(live_total):>12}  (cannot delete)")
-    print(f"  ├─ Metadata              : {fmt_size(meta_size):>12}  (cannot delete)")
-    print(f"  ├─ Historical snapshots  : {fmt_size(hist_size):>12}  → expire_snapshots + rewrite_data_files")
-    print(f"  └─ Orphan files          : {fmt_size(orphan_size):>12}  → remove_orphan_files")
-    print(f"  {'─'*45}")
-    print(f"  RECLAIMABLE TOTAL        : {fmt_size(reclaimable):>12}  ({100*reclaimable/s3_total_size:.1f}% of total)" if s3_total_size else "")
-    print(f"{'═'*70}\n")
-
-    # ── Рекомендации ──
-    print("  RECOMMENDED CLEANUP COMMANDS (Spark SQL):")
-    print()
-    if hist_size > 0:
-        print("  -- 1. Компактировать data files (убирает delete files, переписывает parquet)")
-        print(f"  CALL catalog.system.rewrite_data_files(table => 'db.{result.table_name}');")
-        print()
-        print("  -- 2. Истечь старые снапшоты")
-        print(f"  CALL catalog.system.expire_snapshots(")
-        print(f"      table => 'db.{result.table_name}',")
-        print(f"      older_than => now() - INTERVAL 1 DAYS,")
-        print(f"      retain_last => 1);")
-        print()
-    if orphan_size > 0:
-        print("  -- 3. Удалить orphan-файлы")
-        print(f"  CALL catalog.system.remove_orphan_files(")
-        print(f"      table => 'db.{result.table_name}',")
-        print(f"      older_than => now() - INTERVAL 1 DAYS);")
-        print()
-
-
-# ──────────────────────────── CLI ───────────────────────────────────────────
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Iceberg S3 Storage Auditor — 100%% достоверный анализ хранилища"
-    )
-    parser.add_argument(
-        "tables",
-        nargs="+",
-        metavar="s3://bucket/path/to/table",
-        help="S3 URI таблицы (можно несколько)",
-    )
-    parser.add_argument("--endpoint-url", help="S3-совместимый endpoint (MinIO, Ceph, etc.)")
-    parser.add_argument("--profile", help="AWS profile name")
-    parser.add_argument("--output-json", help="Сохранить сырые данные в JSON")
-
-    args = parser.parse_args()
-
-    s3 = get_s3_client(args.endpoint_url, args.profile)
-
-    all_results = []
-    for table_uri in args.tables:
-        try:
-            bucket, prefix = s3_url_to_parts(table_uri)
-            auditor = IcebergAuditor(s3, bucket)
-            result = auditor.audit_table(prefix)
-            print_report(result)
-            all_results.append(result)
-        except Exception as e:
-            print(f"\n[ERROR] {table_uri}: {e}", file=sys.stderr)
-            import traceback; traceback.print_exc()
-
-    # Итог по всем таблицам если больше одной
-    if len(all_results) > 1:
-        total_s3 = sum(sum(r.s3_all_objects.values()) for r in all_results)
-        total_live = sum(
-            sum(f.size for f in r.live_data_files.values()) +
-            sum(f.size for f in r.live_delete_files.values())
-            for r in all_results
-        )
-        print(f"\n{'═'*70}")
-        print(f"  GRAND TOTAL ({len(all_results)} tables)")
-        print(f"{'═'*70}")
-        print(f"  Total S3: {fmt_size(total_s3)}   Live: {fmt_size(total_live)}")
-
-    if args.output_json:
-        import dataclasses
-        def to_dict(obj):
-            if dataclasses.is_dataclass(obj):
-                return dataclasses.asdict(obj)
-            if isinstance(obj, set):
-                return list(obj)
-            return str(obj)
-        with open(args.output_json, "w") as f:
-            json.dump(
-                [dataclasses.asdict(r) for r in all_results],
-                f, indent=2, default=str
-            )
-        print(f"JSON saved to {args.output_json}")
-
-
-if __name__ == "__main__":
-    main()
-
-
-
-
-
-
-
-
-
-"""
-Iceberg S3 Storage Auditor
---------------------------
-Читает метаданные Iceberg напрямую из S3 (без Spark/catalog),
-парсит manifest lists → manifests → data/delete entries,
-и сопоставляет их с реальными объектами в бакете.
-
-Результат: 100% достоверная картина — какие файлы живые,
-какие orphan, сколько места можно высвободить.
-
-Требования: pip install boto3
-"""
-
-import json
-import struct
-import io
-import os
-import re
-import sys
-import gzip
-import zlib
-import argparse
-from dataclasses import dataclass, field
-from collections import defaultdict
-from typing import Optional
-from datetime import datetime, timezone
-
-import boto3
-from botocore.exceptions import ClientError
-
-
-# ─────────────────────────── Avro minimal reader ────────────────────────────
-# Iceberg manifest files — это Avro. Тащить fastavro не хочется,
-# поэтому реализуем минимальный reader для нужных полей.
-
-AVRO_MAGIC = b"Obj\x01"
-
-
-def _read_long(buf: io.BytesIO) -> int:
-    """ZigZag + VarInt decode."""
-    b, n, shift = 0, 0, 0
-    while True:
-        byte = buf.read(1)
-        if not byte:
-            raise EOFError("unexpected EOF in avro long")
-        byte = byte[0]
-        n |= (byte & 0x7F) << shift
-        shift += 7
-        if not (byte & 0x80):
-            break
-    return (n >> 1) ^ -(n & 1)
-
-
-def _read_bytes(buf: io.BytesIO) -> bytes:
-    n = _read_long(buf)
-    return buf.read(n)
-
-
-def _read_string(buf: io.BytesIO) -> str:
-    return _read_bytes(buf).decode("utf-8", errors="replace")
-
-
-def _skip_value(buf: io.BytesIO, schema, named_types: dict):
-    """Пропускаем значение по схеме Avro."""
-    if isinstance(schema, list):
-        idx = _read_long(buf)
-        _skip_value(buf, schema[idx], named_types)
-        return
-    if isinstance(schema, dict):
-        t = schema.get("type")
-        if t == "record":
-            for f in schema["fields"]:
-                _skip_value(buf, f["type"], named_types)
-            return
-        if t == "array":
-            while True:
-                cnt = _read_long(buf)
-                if cnt == 0:
-                    break
-                if cnt < 0:
-                    _read_long(buf)
-                    cnt = -cnt
-                for _ in range(cnt):
-                    _skip_value(buf, schema["items"], named_types)
-            return
-        if t == "map":
-            while True:
-                cnt = _read_long(buf)
-                if cnt == 0:
-                    break
-                if cnt < 0:
-                    _read_long(buf)
-                    cnt = -cnt
-                for _ in range(cnt):
-                    _read_string(buf)
-                    _skip_value(buf, schema["values"], named_types)
-            return
-        if t in ("bytes", "fixed"):
-            if t == "fixed":
-                buf.read(schema["size"])
-            else:
-                _read_bytes(buf)
-            return
-        if t == "string":
-            _read_string(buf)
-            return
-        if t in ("int", "long"):
-            _read_long(buf)
-            return
-        if t in ("float",):
-            buf.read(4)
-            return
-        if t in ("double",):
-            buf.read(8)
-            return
-        if t in ("boolean",):
-            buf.read(1)
-            return
-        if t == "null":
-            return
-        if t == "enum":
-            _read_long(buf)
-            return
-        # named type ref
-        if isinstance(t, str) and t in named_types:
-            _skip_value(buf, named_types[t], named_types)
-            return
-    if isinstance(schema, str):
-        if schema in named_types:
-            _skip_value(buf, named_types[schema], named_types)
-            return
-        if schema == "string":
-            _read_string(buf)
-        elif schema in ("int", "long"):
-            _read_long(buf)
-        elif schema == "float":
-            buf.read(4)
-        elif schema == "double":
-            buf.read(8)
-        elif schema == "bytes":
-            _read_bytes(buf)
-        elif schema == "boolean":
-            buf.read(1)
-        elif schema == "null":
-            pass
-
-
-def _collect_named(schema, named_types: dict):
-    if isinstance(schema, list):
-        for s in schema:
-            _collect_named(s, named_types)
-    elif isinstance(schema, dict):
-        if schema.get("type") == "record":
-            named_types[schema["name"]] = schema
-            for f in schema.get("fields", []):
-                _collect_named(f["type"], named_types)
-        elif schema.get("type") in ("array", "map"):
-            _collect_named(schema.get("items", schema.get("values", {})), named_types)
-
-
-def _read_record_field(buf: io.BytesIO, field_schema, named_types: dict, want: set):
-    """Читаем одно поле записи. Возвращаем значение если имя в want, иначе None."""
-    name = field_schema["name"]
-    ftype = field_schema["type"]
-    if name not in want:
-        _skip_value(buf, ftype, named_types)
-        return name, None
-
-    # читаем реально
-    return name, _read_typed(buf, ftype, named_types)
-
-
-def _read_typed(buf: io.BytesIO, schema, named_types: dict):
-    if isinstance(schema, list):
-        idx = _read_long(buf)
-        actual = schema[idx]
-        if actual == "null":
-            return None
-        return _read_typed(buf, actual, named_types)
-    if isinstance(schema, str):
-        if schema in named_types:
-            return _read_typed(buf, named_types[schema], named_types)
-        if schema == "string":
-            return _read_string(buf)
-        if schema in ("int", "long"):
-            return _read_long(buf)
-        if schema == "float":
-            return struct.unpack(">f", buf.read(4))[0]
-        if schema == "double":
-            return struct.unpack(">d", buf.read(8))[0]
-        if schema == "bytes":
-            return _read_bytes(buf)
-        if schema == "boolean":
-            return bool(buf.read(1)[0])
-        if schema == "null":
-            return None
-        return None
-    if isinstance(schema, dict):
-        t = schema.get("type")
-        if t == "record":
-            result = {}
-            for f in schema["fields"]:
-                result[f["name"]] = _read_typed(buf, f["type"], named_types)
-            return result
-        if t == "string":
-            return _read_string(buf)
-        if t in ("int", "long"):
-            return _read_long(buf)
-        if t == "float":
-            return struct.unpack(">f", buf.read(4))[0]
-        if t == "double":
-            return struct.unpack(">d", buf.read(8))[0]
-        if t in ("bytes",):
-            return _read_bytes(buf)
-        if t == "fixed":
-            return buf.read(schema["size"])
-        if t == "boolean":
-            return bool(buf.read(1)[0])
-        if t == "null":
-            return None
-        if t == "enum":
-            idx = _read_long(buf)
-            return schema["symbols"][idx]
-        if t == "array":
-            items = []
-            while True:
-                cnt = _read_long(buf)
-                if cnt == 0:
-                    break
-                if cnt < 0:
-                    _read_long(buf)
-                    cnt = -cnt
-                for _ in range(cnt):
-                    items.append(_read_typed(buf, schema["items"], named_types))
-            return items
-        if t == "map":
-            result = {}
-            while True:
-                cnt = _read_long(buf)
-                if cnt == 0:
-                    break
-                if cnt < 0:
-                    _read_long(buf)
-                    cnt = -cnt
-                for _ in range(cnt):
-                    k = _read_string(buf)
-                    result[k] = _read_typed(buf, schema["values"], named_types)
-            return result
-        if isinstance(t, str) and t in named_types:
-            return _read_typed(buf, named_types[t], named_types)
-    return None
-
-
-def parse_avro_manifest(data: bytes, want_fields: set) -> list[dict]:
-    """
-    Минимальный Avro-парсер: читает только нужные поля (want_fields)
-    из каждой записи, остальное пропускает.
-    """
-    buf = io.BytesIO(data)
-    magic = buf.read(4)
-    if magic != AVRO_MAGIC:
-        raise ValueError("Not an Avro file")
-
-    # Читаем мета-блок
-    meta = {}
-    while True:
-        cnt = _read_long(buf)
-        if cnt == 0:
-            break
-        if cnt < 0:
-            _read_long(buf)
-            cnt = -cnt
-        for _ in range(cnt):
-            k = _read_string(buf)
-            v = _read_bytes(buf)
-            meta[k] = v
-
-    codec = meta.get("avro.codec", b"null").decode()
-    schema_str = meta.get("avro.schema", b"{}").decode()
-    schema = json.loads(schema_str)
-    sync_marker = buf.read(16)
-
-    named_types: dict = {}
-    _collect_named(schema, named_types)
-
-    records = []
-    while True:
-        try:
-            obj_count = _read_long(buf)
-        except EOFError:
-            break
-        if obj_count == 0:
-            break
-        block_size = _read_long(buf)
-        block_data = buf.read(block_size)
-        block_sync = buf.read(16)
-        if block_sync != sync_marker:
-            raise ValueError("Avro sync marker mismatch")
-
-        if codec == "deflate":
-            block_data = zlib.decompress(block_data, -15)
-        elif codec == "snappy":
-            # python-snappy опционален; если не установлен — пробуем cramjam
-            try:
-                import snappy as _snappy
-                # python-snappy возвращает bytes напрямую
-                # Snappy в Avro: последние 4 байта — CRC32, остальное — snappy payload
-                block_data = _snappy.decompress(block_data[:-4])
-            except ImportError:
-                try:
-                    import cramjam as _cramjam
-                    block_data = bytes(_cramjam.snappy.decompress_raw(block_data[:-4]))
-                except ImportError:
-                    raise ImportError(
-                        "Avro codec 'snappy' требует: pip install python-snappy  "
-                        "или  pip install cramjam"
-                    )
-        elif codec == "null":
-            pass
-        else:
-            raise ValueError(f"Unsupported avro codec: {codec}")
-
-        bbuf = io.BytesIO(block_data)
-        for _ in range(obj_count):
-            rec = {}
-            if isinstance(schema, dict) and schema.get("type") == "record":
-                for f in schema["fields"]:
-                    name, val = _read_record_field(bbuf, f, named_types, want_fields)
-                    if val is not None or name in want_fields:
-                        rec[name] = val
-            records.append(rec)
-
-    return records
-
-
-# ──────────────────────────── S3 helpers ────────────────────────────────────
-
-def s3_url_to_parts(url: str) -> tuple[str, str]:
-    """s3://bucket/prefix/key → (bucket, prefix/key)"""
-    url = url.strip()
-    if url.startswith("s3://") or url.startswith("s3a://"):
-        without = re.sub(r"^s3a?://", "", url)
-        parts = without.split("/", 1)
-        bucket = parts[0]
-        key = parts[1] if len(parts) > 1 else ""
-        return bucket, key
-    raise ValueError(f"Not an s3/s3a URL: {url}")
-
-
-def get_s3_client(endpoint_url: Optional[str], profile: Optional[str]) -> boto3.client:
-    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
-    kwargs = {"service_name": "s3"}
-    if endpoint_url:
-        kwargs["endpoint_url"] = endpoint_url
-    return session.client(**kwargs)
-
-
-def s3_get_object_bytes(s3, bucket: str, key: str) -> bytes:
-    resp = s3.get_object(Bucket=bucket, Key=key)
-    return resp["Body"].read()
-
-
-def s3_list_all_objects(s3, bucket: str, prefix: str) -> dict[str, int]:
-    """Возвращает {key: size_bytes} для всех объектов под prefix."""
-    result = {}
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            result[obj["Key"]] = obj["Size"]
-    return result
-
-
-# ──────────────────────────── Iceberg metadata ──────────────────────────────
-
-def find_metadata_json(s3, bucket: str, metadata_prefix: str) -> tuple[str, dict]:
-    """
-    Ищем последний metadata.json файл. Поддерживаем все варианты именования:
-
-      Вариант A (классический):  v1.metadata.json, v2.metadata.json …
-                                  + version-hint.text с номером текущей версии
-
-      Вариант B (UUID-префикс):  <uuid>-v1.metadata.json
-                                  <uuid>-v2.metadata.json
-                                  <random-uuid>.metadata.json  (некоторые каталоги)
-
-    Возвращает (key, parsed_dict).
-
-    Стратегия:
-      1. version-hint.text → читаем номер, ищем v{n}.metadata.json
-      2. Листаем *.metadata.json, пробуем извлечь sequence number из имени файла
-         (паттерн *-v{N}.metadata.json). Если не получается — сортируем по LastModified.
-      3. Берём кандидата с максимальным sequence или самым свежим LastModified.
-      4. Финальная проверка: читаем файл и смотрим поле "last-sequence-number" /
-         "current-snapshot-id" чтобы убедиться что это валидный metadata.json
-         и не промежуточная копия.
-    """
-    prefix = metadata_prefix.rstrip("/") + "/"
-
-    # ── Шаг 1: version-hint.text ──────────────────────────────────────────
-    hint_key = prefix + "version-hint.text"
-    try:
-        data = s3_get_object_bytes(s3, bucket, hint_key)
-        version = int(data.strip())
-        # Классическое имя
-        for tmpl in [f"v{version}.metadata.json"]:
-            candidate = prefix + tmpl
-            try:
-                s3.head_object(Bucket=bucket, Key=candidate)
-                print(f"  [hint] version={version} → {candidate}")
-                raw = s3_get_object_bytes(s3, bucket, candidate)
-                return candidate, json.loads(raw)
-            except ClientError:
-                pass
-        # UUID-префикс: ищем файл с суффиксом -v{version}.metadata.json
-        paginator = s3.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                k = obj["Key"]
-                if re.search(rf"-v{version}\.metadata\.json$", k):
-                    print(f"  [hint+uuid] version={version} → {k}")
-                    raw = s3_get_object_bytes(s3, bucket, k)
-                    return k, json.loads(raw)
-    except (ClientError, ValueError):
-        pass
-
-    # ── Шаг 2: сканируем все *.metadata.json ──────────────────────────────
-    paginator = s3.get_paginator("list_objects_v2")
-    candidates: list[tuple[str, int, object]] = []
-    # (key, extracted_seq_or_-1, LastModified)
-
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            k = obj["Key"]
-            fname = k.rsplit("/", 1)[-1]
-            if not fname.endswith(".metadata.json"):
-                continue
-
-            # Пробуем вытащить sequence number из имени файла
-            # Паттерны:
-            #   v42.metadata.json                → seq=42
-            #   <uuid>-v42.metadata.json         → seq=42
-            #   00042-<uuid>.metadata.json        → seq=42  (некоторые версии Flink writer)
-            seq = -1
-            m = re.search(r"-v(\d+)\.metadata\.json$", fname)
-            if m:
-                seq = int(m.group(1))
-            else:
-                m = re.match(r"v(\d+)\.metadata\.json$", fname)
-                if m:
-                    seq = int(m.group(1))
-                else:
-                    m = re.match(r"^(\d+)-", fname)
-                    if m:
-                        seq = int(m.group(1))
-
-            candidates.append((k, seq, obj["LastModified"]))
-
-    if not candidates:
-        raise FileNotFoundError(
-            f"No *.metadata.json found under s3://{bucket}/{prefix}\n"
-            f"Проверь путь к таблице — он должен указывать на корень таблицы, "
-            f"а не на /metadata/ или /data/ поддиректорию."
-        )
-
-    # ── Шаг 3: выбираем лучшего кандидата ─────────────────────────────────
-    has_seq = [c for c in candidates if c[1] >= 0]
-    if has_seq:
-        best = max(has_seq, key=lambda c: c[1])
-        print(f"  [scan] {len(candidates)} metadata files found, "
-              f"latest by seq={best[1]} → {best[0]}")
-    else:
-        best = max(candidates, key=lambda c: c[2])
-        print(f"  [scan] {len(candidates)} metadata files found (no seq in names), "
-              f"latest by mtime → {best[0]}")
-
-    chosen = best[0]
-    raw = s3_get_object_bytes(s3, bucket, chosen)
-    meta = json.loads(raw)
-
-    # ── Шаг 4: сверяем last-sequence-number с именами файлов ──────────────
-    if "format-version" not in meta:
-        raise ValueError(f"File {chosen} is not a valid Iceberg metadata JSON")
-
-    last_seq_in_file = meta.get("last-sequence-number", -1)
-    if has_seq and last_seq_in_file > 0:
-        exact = [c for c in has_seq if c[1] == last_seq_in_file]
-        if exact and exact[0][0] != chosen:
-            chosen = exact[0][0]
-            print(f"  [validate] corrected to last-sequence-number={last_seq_in_file} → {chosen}")
-            raw = s3_get_object_bytes(s3, bucket, chosen)
-            meta = json.loads(raw)
-
-    return chosen, meta
-
-
-@dataclass
-class IcebergFile:
-    path: str
-    size: int
-    file_type: str   # DATA or EQUALITY_DELETES / POSITION_DELETES
-    status: str      # ADDED / EXISTING / DELETED
-    snapshot_id: Optional[int] = None
-
-
-@dataclass
-class SnapshotInfo:
-    snapshot_id: int
-    parent_snapshot_id: Optional[int]
-    timestamp_ms: int
-    operation: str
-    manifest_list_path: str
-
-
-@dataclass
-class AuditResult:
-    table_name: str
-    table_location: str
-    current_snapshot_id: Optional[int]
-    format_version: int
-    snapshots: list[SnapshotInfo]
-
-    # Файлы, видимые в ТЕКУЩЕМ снапшоте (live)
-    live_data_files: dict[str, IcebergFile] = field(default_factory=dict)
-    live_delete_files: dict[str, IcebergFile] = field(default_factory=dict)
-
-    # Файлы из всех снапшотов (включая исторические)
-    all_referenced_files: dict[str, IcebergFile] = field(default_factory=dict)
-
-    # Metadata-файлы (manifest lists, manifests, metadata.json)
-    metadata_files: set[str] = field(default_factory=set)
-
-    # Реальные объекты в S3 (все под table_location)
-    s3_all_objects: dict[str, int] = field(default_factory=dict)
-
-
-# ────────────────────────────── Core parser ─────────────────────────────────
-
-class IcebergAuditor:
-
-    def __init__(self, s3, bucket: str):
-        self.s3 = s3
-        self.bucket = bucket
-
-    def _get_json(self, key: str) -> dict:
-        data = s3_get_object_bytes(self.s3, self.bucket, key)
-        return json.loads(data)
-
-    def _key_from_path(self, path: str) -> str:
-        _, key = s3_url_to_parts(path)
-        return key
-
-    def _list_metadata_json_keys(self, metadata_prefix: str) -> list[str]:
-        """Возвращает все *.metadata.json ключи под metadata_prefix."""
-        prefix = metadata_prefix.rstrip("/") + "/"
-        result = []
-        paginator = self.s3.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                k = obj["Key"]
-                if k.endswith(".metadata.json"):
-                    result.append(k)
-        return result
-
-    def audit_table(self, table_prefix: str) -> AuditResult:
-        """
-        table_prefix — путь в S3 до корня таблицы,
-        например: 'warehouse/db/my_table'
-        """
-        metadata_prefix = table_prefix.rstrip("/") + "/metadata"
-
-        print(f"\n{'='*60}")
-        print(f"Auditing s3://{self.bucket}/{table_prefix}")
-        print(f"{'='*60}")
-
-        # 1. Находим metadata.json (все *.metadata.json регистрируем как metadata-файлы)
-        all_meta_keys = self._list_metadata_json_keys(metadata_prefix)
-        meta_key, meta = find_metadata_json(self.s3, self.bucket, metadata_prefix)
-
-        format_version = meta.get("format-version", 1)
-        table_uuid = meta.get("table-uuid", "unknown")
-        location = meta.get("location", f"s3://{self.bucket}/{table_prefix}")
-        current_snapshot_id = meta.get("current-snapshot-id")
-
-        print(f"  format-version : {format_version}")
-        print(f"  table-uuid     : {table_uuid}")
-        print(f"  location       : {location}")
-        print(f"  current snap   : {current_snapshot_id}")
-
-        result = AuditResult(
-            table_name=table_prefix.split("/")[-1],
-            table_location=location,
-            current_snapshot_id=current_snapshot_id,
-            format_version=format_version,
-            snapshots=[],
-        )
-
-        # Регистрируем все *.metadata.json как metadata-файлы
-        result.metadata_files.update(all_meta_keys)
-        result.metadata_files.add(meta_key)
-
-        # 2. Собираем все снапшоты
-        snapshots_raw = meta.get("snapshots", [])
-        snap_map: dict[int, dict] = {s["snapshot-id"]: s for s in snapshots_raw}
-
-        for s in snapshots_raw:
-            si = SnapshotInfo(
-                snapshot_id=s["snapshot-id"],
-                parent_snapshot_id=s.get("parent-snapshot-id"),
-                timestamp_ms=s.get("timestamp-ms", 0),
-                operation=s.get("summary", {}).get("operation", "unknown"),
-                manifest_list_path=s.get("manifest-list", ""),
-            )
-            result.snapshots.append(si)
-
-        print(f"  snapshots total: {len(result.snapshots)}")
-
-        # 3. Читаем все manifest lists → manifests → files
-        for si in result.snapshots:
-            if not si.manifest_list_path:
-                continue
-            is_current = (si.snapshot_id == current_snapshot_id)
-            self._process_manifest_list(si, result, is_current)
-
-        # 4. Листаем S3 (все объекты под table_prefix)
-        print(f"\n  Listing all S3 objects under prefix...")
-        result.s3_all_objects = s3_list_all_objects(
-            self.s3, self.bucket, table_prefix.rstrip("/") + "/"
-        )
-        print(f"  S3 objects found: {len(result.s3_all_objects)}")
-
-        return result
-
-    def _process_manifest_list(self, si: SnapshotInfo, result: AuditResult, is_current: bool):
-        try:
-            ml_key = self._key_from_path(si.manifest_list_path)
-            ml_data = s3_get_object_bytes(self.s3, self.bucket, ml_key)
-            result.metadata_files.add(ml_key)
-        except ClientError as e:
-            print(f"  [WARN] Cannot read manifest list {si.manifest_list_path}: {e}")
-            return
-
-        # Manifest list — тоже Avro
-        try:
-            entries = parse_avro_manifest(
-                ml_data,
-                want_fields={"manifest_path", "manifest_length", "content"}
-            )
-        except Exception as e:
-            print(f"  [WARN] Failed to parse manifest list {ml_key}: {e}")
-            return
-
-        for entry in entries:
-            mpath = entry.get("manifest_path", "")
-            if not mpath:
-                continue
-            content = entry.get("content", 0)  # 0=DATA, 1=DELETES
-            self._process_manifest(mpath, content, result, is_current, si.snapshot_id)
-
-    def _process_manifest(
-        self,
-        manifest_path: str,
-        content_type: int,
-        result: AuditResult,
-        is_current: bool,
-        snapshot_id: int,
-    ):
-        try:
-            m_key = self._key_from_path(manifest_path)
-            m_data = s3_get_object_bytes(self.s3, self.bucket, m_key)
-            result.metadata_files.add(m_key)
-        except ClientError as e:
-            print(f"  [WARN] Cannot read manifest {manifest_path}: {e}")
-            return
-
-        try:
-            entries = parse_avro_manifest(
-                m_data,
-                want_fields={"data_file", "status", "file_path", "file_size_in_bytes", "content"}
-            )
-        except Exception as e:
-            print(f"  [WARN] Failed to parse manifest {m_key}: {e}")
-            return
-
-        # STATUS: 0=EXISTING, 1=ADDED, 2=DELETED
-        STATUS_MAP = {0: "EXISTING", 1: "ADDED", 2: "DELETED"}
-        CONTENT_MAP = {0: "DATA", 1: "POSITION_DELETES", 2: "EQUALITY_DELETES"}
-
-        for entry in entries:
-            status_code = entry.get("status", 0)
-            status = STATUS_MAP.get(status_code, "UNKNOWN")
-
-            data_file = entry.get("data_file")
-            if not data_file or not isinstance(data_file, dict):
-                continue
-
-            fpath = data_file.get("file_path", "")
-            fsize = data_file.get("file_size_in_bytes", 0) or 0
-            fcontent = data_file.get("content", content_type)
-            ftype = CONTENT_MAP.get(fcontent, "DATA")
-
-            if not fpath:
-                continue
-
-            try:
-                fkey = self._key_from_path(fpath)
-            except ValueError:
-                fkey = fpath  # relative path
-
-            icefile = IcebergFile(
-                path=fkey,
-                size=fsize,
-                file_type=ftype,
-                status=status,
-                snapshot_id=snapshot_id,
-            )
-
-            # Регистрируем в all_referenced
-            result.all_referenced_files[fkey] = icefile
-
-            # В live только если текущий снапшот и не DELETED
-            if is_current and status != "DELETED":
-                if ftype == "DATA":
-                    result.live_data_files[fkey] = icefile
-                else:
-                    result.live_delete_files[fkey] = icefile
-
-
-# ──────────────────────────── Report ────────────────────────────────────────
-
-def fmt_size(b: int) -> str:
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if b < 1024:
-            return f"{b:.2f} {unit}"
-        b /= 1024
-    return f"{b:.2f} PB"
-
-
-def print_report(result: AuditResult):
-    sep = "─" * 70
-
-    print(f"\n{'═'*70}")
-    print(f"  ICEBERG S3 STORAGE AUDIT: {result.table_name}")
-    print(f"{'═'*70}")
-    print(f"  Table location  : {result.table_location}")
-    print(f"  Format version  : {result.format_version}")
-    print(f"  Current snapshot: {result.current_snapshot_id}")
-    print(f"  Total snapshots : {len(result.snapshots)}")
-
-    # ── Снапшоты ──
-    print(f"\n{sep}")
-    print("  SNAPSHOTS")
-    print(sep)
-    for si in sorted(result.snapshots, key=lambda x: x.timestamp_ms):
-        ts = datetime.fromtimestamp(si.timestamp_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        marker = " ◄ CURRENT" if si.snapshot_id == result.current_snapshot_id else ""
-        print(f"  [{ts}] snap={si.snapshot_id} op={si.operation}{marker}")
-
-    # ── Live файлы (текущий снапшот) ──
-    live_data_size = sum(f.size for f in result.live_data_files.values())
-    live_del_size = sum(f.size for f in result.live_delete_files.values())
-    live_total = live_data_size + live_del_size
-
-    print(f"\n{sep}")
-    print("  LIVE FILES (current snapshot)")
-    print(sep)
-    print(f"  Data files      : {len(result.live_data_files):>6}   {fmt_size(live_data_size):>12}")
-    print(f"  Delete files    : {len(result.live_delete_files):>6}   {fmt_size(live_del_size):>12}")
-    print(f"  {'':─<40}")
-    print(f"  LIVE TOTAL      : {len(result.live_data_files)+len(result.live_delete_files):>6}   {fmt_size(live_total):>12}")
-
-    # ── Все файлы данных (все снапшоты) ──
-    all_data_size = sum(f.size for f in result.all_referenced_files.values())
-    print(f"\n{sep}")
-    print("  ALL REFERENCED FILES (all snapshots, incl. historical)")
-    print(sep)
-    print(f"  Total files     : {len(result.all_referenced_files):>6}   {fmt_size(all_data_size):>12}")
-    historical_files = {
-        k: v for k, v in result.all_referenced_files.items()
-        if k not in result.live_data_files and k not in result.live_delete_files
-    }
-    hist_size = sum(f.size for f in historical_files.values())
-    print(f"  Historical only : {len(historical_files):>6}   {fmt_size(hist_size):>12}  ← reclaimable after expire_snapshots")
-
-    # ── Metadata-файлы ──
-    meta_size = sum(
-        result.s3_all_objects.get(k, 0) for k in result.metadata_files
-    )
-    print(f"\n{sep}")
-    print("  METADATA FILES")
-    print(sep)
-    print(f"  Count           : {len(result.metadata_files):>6}   {fmt_size(meta_size):>12}")
-    print(f"  (manifest lists, manifests, metadata.json)")
-
-    # ── Orphan files ──
-    # Известные Iceberg-файлы
-    known_keys = set(result.all_referenced_files.keys()) | result.metadata_files
-
-    # Все объекты в S3
-    s3_total_size = sum(result.s3_all_objects.values())
-    s3_data_keys = {
-        k for k in result.s3_all_objects
-        if k.endswith(".parquet") or k.endswith(".orc") or k.endswith(".avro")
-    }
-
-    orphan_files: dict[str, int] = {}
-    for k, sz in result.s3_all_objects.items():
-        if k not in known_keys:
-            orphan_files[k] = sz
-
-    orphan_size = sum(orphan_files.values())
-
-    print(f"\n{sep}")
-    print("  ORPHAN FILES (in S3 but not in any snapshot)")
-    print(sep)
-    print(f"  Count           : {len(orphan_files):>6}   {fmt_size(orphan_size):>12}  ← remove_orphan_files")
-
-    if orphan_files:
-        top = sorted(orphan_files.items(), key=lambda x: x[1], reverse=True)[:10]
-        print(f"\n  Top-10 by size:")
-        for k, sz in top:
-            print(f"    {fmt_size(sz):>10}  s3://{result.s3_all_objects and ''}{k}")
-
-    # ── Итоговая таблица ──
-    reclaimable = hist_size + orphan_size
-    print(f"\n{'═'*70}")
-    print("  SUMMARY")
-    print(f"{'═'*70}")
-    print(f"  Total S3 usage           : {fmt_size(s3_total_size):>12}")
-    print(f"  ├─ Live data             : {fmt_size(live_total):>12}  (cannot delete)")
-    print(f"  ├─ Metadata              : {fmt_size(meta_size):>12}  (cannot delete)")
-    print(f"  ├─ Historical snapshots  : {fmt_size(hist_size):>12}  → expire_snapshots + rewrite_data_files")
-    print(f"  └─ Orphan files          : {fmt_size(orphan_size):>12}  → remove_orphan_files")
-    print(f"  {'─'*45}")
-    print(f"  RECLAIMABLE TOTAL        : {fmt_size(reclaimable):>12}  ({100*reclaimable/s3_total_size:.1f}% of total)" if s3_total_size else "")
-    print(f"{'═'*70}\n")
-
-    # ── Рекомендации ──
-    print("  RECOMMENDED CLEANUP COMMANDS (Spark SQL):")
-    print()
-    if hist_size > 0:
-        print("  -- 1. Компактировать data files (убирает delete files, переписывает parquet)")
-        print(f"  CALL catalog.system.rewrite_data_files(table => 'db.{result.table_name}');")
-        print()
-        print("  -- 2. Истечь старые снапшоты")
-        print(f"  CALL catalog.system.expire_snapshots(")
-        print(f"      table => 'db.{result.table_name}',")
-        print(f"      older_than => now() - INTERVAL 1 DAYS,")
-        print(f"      retain_last => 1);")
-        print()
-    if orphan_size > 0:
-        print("  -- 3. Удалить orphan-файлы")
-        print(f"  CALL catalog.system.remove_orphan_files(")
-        print(f"      table => 'db.{result.table_name}',")
-        print(f"      older_than => now() - INTERVAL 1 DAYS);")
-        print()
-
-
-# ──────────────────────────── CLI ───────────────────────────────────────────
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Iceberg S3 Storage Auditor — 100%% достоверный анализ хранилища"
-    )
-    parser.add_argument(
-        "tables",
-        nargs="+",
-        metavar="s3://bucket/path/to/table",
-        help="S3 URI таблицы (можно несколько)",
-    )
-    parser.add_argument("--endpoint-url", help="S3-совместимый endpoint (MinIO, Ceph, etc.)")
-    parser.add_argument("--profile", help="AWS profile name")
-    parser.add_argument("--output-json", help="Сохранить сырые данные в JSON")
-
-    args = parser.parse_args()
-
-    s3 = get_s3_client(args.endpoint_url, args.profile)
-
-    all_results = []
-    for table_uri in args.tables:
-        try:
-            bucket, prefix = s3_url_to_parts(table_uri)
-            auditor = IcebergAuditor(s3, bucket)
-            result = auditor.audit_table(prefix)
-            print_report(result)
-            all_results.append(result)
-        except Exception as e:
-            print(f"\n[ERROR] {table_uri}: {e}", file=sys.stderr)
-            import traceback; traceback.print_exc()
-
-    # Итог по всем таблицам если больше одной
-    if len(all_results) > 1:
-        total_s3 = sum(sum(r.s3_all_objects.values()) for r in all_results)
-        total_live = sum(
-            sum(f.size for f in r.live_data_files.values()) +
-            sum(f.size for f in r.live_delete_files.values())
-            for r in all_results
-        )
-        print(f"\n{'═'*70}")
-        print(f"  GRAND TOTAL ({len(all_results)} tables)")
-        print(f"{'═'*70}")
-        print(f"  Total S3: {fmt_size(total_s3)}   Live: {fmt_size(total_live)}")
-
-    if args.output_json:
-        import dataclasses
-        def to_dict(obj):
-            if dataclasses.is_dataclass(obj):
-                return dataclasses.asdict(obj)
-            if isinstance(obj, set):
-                return list(obj)
-            return str(obj)
-        with open(args.output_json, "w") as f:
-            json.dump(
-                [dataclasses.asdict(r) for r in all_results],
-                f, indent=2, default=str
-            )
-        print(f"JSON saved to {args.output_json}")
-
-
-if __name__ == "__main__":
-    main()
-
-
-
 """
 GitLab MCP Server на базе FastMCP (streamable-HTTP transport).
 
+Авторизация — per-request через HTTP-заголовки:
+    X-GitLab-Url   — базовый URL корпоративного GitLab (без trailing slash)
+    X-GitLab-Token — Personal Access Token пользователя (scope: api)
+
+Каждый агент/пользователь передаёт свои заголовки — сервер не хранит токены.
+
 Запуск:
     pip install fastmcp httpx
-    GITLAB_URL=https://gitlab.example.com GITLAB_TOKEN=glpat-xxx python gitlab_mcp_server.py
+    python gitlab_mcp_server.py
 
-Переменные окружения:
-    GITLAB_URL   — базовый URL корпоративного GitLab (без trailing slash)
-    GITLAB_TOKEN — Personal Access Token или Project Access Token (api scope)
-    MCP_HOST     — хост для HTTP-сервера (default: 0.0.0.0)
-    MCP_PORT     — порт (default: 8000)
+Опциональные переменные окружения:
+    MCP_HOST — хост HTTP-сервера (default: 0.0.0.0)
+    MCP_PORT — порт           (default: 8000)
 """
 
 import base64
@@ -2403,59 +21,79 @@ import os
 from typing import Any
 
 import httpx
-from fastmcp import FastMCP
+from fastmcp import FastMCP, Context
+from fastmcp.exceptions import ToolError
 
 # ---------------------------------------------------------------------------
-# Конфигурация
+# Конфигурация сервера
 # ---------------------------------------------------------------------------
-
-GITLAB_URL = os.environ["GITLAB_URL"].rstrip("/")
-GITLAB_TOKEN = os.environ["GITLAB_TOKEN"]
-API_BASE = f"{GITLAB_URL}/api/v4"
 
 MCP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8000"))
 
-# Заголовки для всех запросов к GitLab API
-_HEADERS = {
-    "PRIVATE-TOKEN": GITLAB_TOKEN,
-    "Content-Type": "application/json",
-}
-
 # ---------------------------------------------------------------------------
-# Вспомогательный HTTP-клиент
+# Извлечение учётных данных из заголовков входящего запроса
 # ---------------------------------------------------------------------------
 
-def _client() -> httpx.Client:
-    """Создаёт синхронный httpx-клиент с таймаутом 30 с."""
-    return httpx.Client(headers=_HEADERS, timeout=30.0)
+def _gitlab_credentials(ctx: Context) -> tuple[str, str]:
+    """
+    Читает X-GitLab-Url и X-GitLab-Token из HTTP-заголовков текущего запроса.
+
+    FastMCP пробрасывает заголовки через ctx.request_context.request.headers
+    (стандартный Starlette Request).
+
+    Returns:
+        (api_base, token) — базовый URL API и токен пользователя.
+
+    Raises:
+        ToolError — если один из заголовков отсутствует.
+    """
+    headers = ctx.request_context.request.headers
+
+    gitlab_url = headers.get("x-gitlab-url", "").rstrip("/")
+    token      = headers.get("x-gitlab-token", "")
+
+    if not gitlab_url:
+        raise ToolError("Заголовок X-GitLab-Url обязателен.")
+    if not token:
+        raise ToolError("Заголовок X-GitLab-Token обязателен.")
+
+    return f"{gitlab_url}/api/v4", token
 
 
-def _get(path: str, params: dict | None = None) -> Any:
-    """GET-запрос к GitLab API. Возвращает распарсенный JSON или строку ошибки."""
-    with _client() as c:
-        r = c.get(f"{API_BASE}{path}", params=params)
+# ---------------------------------------------------------------------------
+# Вспомогательные HTTP-функции (принимают api_base и token явно)
+# ---------------------------------------------------------------------------
+
+def _headers(token: str) -> dict:
+    return {"PRIVATE-TOKEN": token, "Content-Type": "application/json"}
+
+
+def _get(api_base: str, token: str, path: str, params: dict | None = None) -> Any:
+    with httpx.Client(headers=_headers(token), timeout=30.0) as c:
+        r = c.get(f"{api_base}{path}", params=params)
         r.raise_for_status()
         return r.json()
 
 
-def _post(path: str, json: dict) -> Any:
-    with _client() as c:
-        r = c.post(f"{API_BASE}{path}", json=json)
+def _post(api_base: str, token: str, path: str, json: dict) -> Any:
+    with httpx.Client(headers=_headers(token), timeout=30.0) as c:
+        r = c.post(f"{api_base}{path}", json=json)
         r.raise_for_status()
         return r.json()
 
 
-def _put(path: str, json: dict) -> Any:
-    with _client() as c:
-        r = c.put(f"{API_BASE}{path}", json=json)
+def _put(api_base: str, token: str, path: str, json: dict) -> Any:
+    with httpx.Client(headers=_headers(token), timeout=30.0) as c:
+        r = c.put(f"{api_base}{path}", json=json)
         r.raise_for_status()
         return r.json()
 
 
-def _encode_path(project_id: str) -> str:
-    """URL-encode namespace/project → namespace%2Fproject."""
+def _encode_id(project_id: str) -> str:
+    """namespace/repo → namespace%2Frepo (для URL-пути)."""
     return project_id.replace("/", "%2F")
+
 
 # ---------------------------------------------------------------------------
 # FastMCP приложение
@@ -2463,7 +101,10 @@ def _encode_path(project_id: str) -> str:
 
 mcp = FastMCP(
     name="gitlab",
-    description="Инструменты для работы с корпоративным GitLab (API v4).",
+    description=(
+        "Инструменты для работы с корпоративным GitLab (API v4). "
+        "Требует заголовки X-GitLab-Url и X-GitLab-Token в каждом запросе."
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -2475,40 +116,42 @@ def get_file_content(
     project_id: str,
     path: str,
     ref: str = "main",
+    ctx: Context = None,
 ) -> dict:
     """
     Возвращает содержимое файла (декодированное из base64) или список
-    элементов директории для указанного пути в репозитории.
+    элементов директории для указанного пути.
 
     Args:
         project_id: ID или «namespace/repo» проекта.
-        path:       Путь к файлу или директории относительно корня репо.
-        ref:        Ветка, тег или SHA коммита (default: main).
+        path:       Путь к файлу или директории.
+        ref:        Ветка, тег или SHA (default: main).
     """
-    pid = _encode_path(project_id)
+    api_base, token = _gitlab_credentials(ctx)
+    pid = _encode_id(project_id)
 
-    # Пробуем получить как файл
+    # Сначала пробуем как файл
     try:
-        encoded_file_path = path.replace("/", "%2F")
-        data = _get(f"/projects/{pid}/repository/files/{encoded_file_path}", {"ref": ref})
-        # Декодируем base64-содержимое
+        encoded_path = path.replace("/", "%2F")
+        data = _get(api_base, token, f"/projects/{pid}/repository/files/{encoded_path}", {"ref": ref})
         content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
         return {
             "type": "file",
             "file_name": data["file_name"],
             "file_path": data["file_path"],
             "size": data["size"],
-            "encoding": data["encoding"],
             "ref": data["ref"],
-            "blob_id": data["blob_id"],
             "last_commit_id": data["last_commit_id"],
             "content": content,
         }
     except httpx.HTTPStatusError as e:
         if e.response.status_code != 404:
             raise
-    # Если файл не найден — пробуем как директорию
-    items = _get(f"/projects/{pid}/repository/tree", {"path": path, "ref": ref, "per_page": 100})
+
+    # Если 404 — пробуем как директорию
+    items = _get(api_base, token,
+                 f"/projects/{pid}/repository/tree",
+                 {"path": path, "ref": ref, "per_page": 100})
     return {"type": "directory", "path": path, "ref": ref, "items": items}
 
 
@@ -2522,9 +165,10 @@ def get_repository_tree(
     path: str = "",
     ref: str = "main",
     recursive: bool = True,
+    ctx: Context = None,
 ) -> list[dict]:
     """
-    Возвращает дерево файлов и директорий репозитория.
+    Возвращает дерево файлов и директорий репозитория (все страницы).
 
     Args:
         project_id: ID или «namespace/repo» проекта.
@@ -2532,17 +176,19 @@ def get_repository_tree(
         ref:        Ветка/тег/SHA (default: main).
         recursive:  Обходить подпапки рекурсивно (default: True).
     """
-    pid = _encode_path(project_id)
+    api_base, token = _gitlab_credentials(ctx)
+    pid = _encode_id(project_id)
+
     params: dict = {"ref": ref, "recursive": recursive, "per_page": 100}
     if path:
         params["path"] = path
 
-    # GitLab возвращает пагинацию — собираем все страницы
+    # Собираем все страницы
     results: list[dict] = []
     page = 1
     while True:
         params["page"] = page
-        batch = _get(f"/projects/{pid}/repository/tree", params)
+        batch = _get(api_base, token, f"/projects/{pid}/repository/tree", params)
         if not batch:
             break
         results.extend(batch)
@@ -2564,23 +210,23 @@ def create_or_update_file(
     content: str,
     commit_message: str,
     branch: str = "main",
-    create_new_branch: bool = False,
     start_branch: str | None = None,
+    ctx: Context = None,
 ) -> dict:
     """
-    Создаёт новый файл или обновляет существующий, формируя коммит напрямую
-    в указанную ветку.
+    Создаёт новый файл или обновляет существующий одним коммитом.
+    Метод (POST/PUT) определяется автоматически.
 
     Args:
-        project_id:        ID или «namespace/repo» проекта.
-        file_path:         Путь к файлу в репозитории.
-        content:           Новое содержимое файла (plain text, UTF-8).
-        commit_message:    Сообщение коммита.
-        branch:            Целевая ветка (default: main).
-        create_new_branch: Создать ветку автоматически, если она не существует.
-        start_branch:      Базовая ветка для новой ветки (если create_new_branch=True).
+        project_id:     ID или «namespace/repo» проекта.
+        file_path:      Путь к файлу в репозитории.
+        content:        Новое содержимое файла (plain text, UTF-8).
+        commit_message: Сообщение коммита.
+        branch:         Целевая ветка (default: main).
+        start_branch:   Если указана — создаётся новая ветка от start_branch.
     """
-    pid = _encode_path(project_id)
+    api_base, token = _gitlab_credentials(ctx)
+    pid = _encode_id(project_id)
     encoded_fp = file_path.replace("/", "%2F")
 
     payload: dict = {
@@ -2589,19 +235,19 @@ def create_or_update_file(
         "commit_message": commit_message,
         "encoding": "text",
     }
-    if create_new_branch and start_branch:
+    if start_branch:
         payload["start_branch"] = start_branch
 
-    # Определяем: файл уже существует → PUT (update), нет → POST (create)
+    # Проверяем существование файла → выбираем метод
     try:
-        _get(f"/projects/{pid}/repository/files/{encoded_fp}", {"ref": branch})
+        _get(api_base, token, f"/projects/{pid}/repository/files/{encoded_fp}", {"ref": branch})
         method = "update"
-        result = _put(f"/projects/{pid}/repository/files/{encoded_fp}", payload)
+        result = _put(api_base, token, f"/projects/{pid}/repository/files/{encoded_fp}", payload)
     except httpx.HTTPStatusError as e:
         if e.response.status_code != 404:
             raise
         method = "create"
-        result = _post(f"/projects/{pid}/repository/files/{encoded_fp}", payload)
+        result = _post(api_base, token, f"/projects/{pid}/repository/files/{encoded_fp}", payload)
 
     return {"action": method, **result}
 
@@ -2619,31 +265,31 @@ def create_merge_request(
     description: str = "",
     remove_source_branch: bool = False,
     squash: bool = False,
+    ctx: Context = None,
 ) -> dict:
     """
     Открывает новый Merge Request из source_branch в target_branch.
 
     Args:
-        project_id:            ID или «namespace/repo» проекта.
-        source_branch:         Ветка с изменениями.
-        target_branch:         Целевая ветка (куда мёрджим).
-        title:                 Заголовок MR.
-        description:           Описание MR (markdown).
-        remove_source_branch:  Удалить source_branch после мёрджа.
-        squash:                Схлопнуть коммиты в один при мёрдже.
+        project_id:           ID или «namespace/repo» проекта.
+        source_branch:        Ветка с изменениями.
+        target_branch:        Целевая ветка.
+        title:                Заголовок MR.
+        description:          Описание MR (markdown).
+        remove_source_branch: Удалить source_branch после мёрджа.
+        squash:               Схлопнуть коммиты в один.
     """
-    pid = _encode_path(project_id)
-    return _post(
-        f"/projects/{pid}/merge_requests",
-        {
-            "source_branch": source_branch,
-            "target_branch": target_branch,
-            "title": title,
-            "description": description,
-            "remove_source_branch": remove_source_branch,
-            "squash": squash,
-        },
-    )
+    api_base, token = _gitlab_credentials(ctx)
+    pid = _encode_id(project_id)
+
+    return _post(api_base, token, f"/projects/{pid}/merge_requests", {
+        "source_branch": source_branch,
+        "target_branch": target_branch,
+        "title": title,
+        "description": description,
+        "remove_source_branch": remove_source_branch,
+        "squash": squash,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -2657,18 +303,21 @@ def merge_merge_request(
     merge_commit_message: str | None = None,
     squash: bool = False,
     should_remove_source_branch: bool = False,
+    ctx: Context = None,
 ) -> dict:
     """
-    Принимает открытый Merge Request (выполняет мёрдж).
+    Принимает открытый Merge Request.
 
     Args:
         project_id:                  ID или «namespace/repo» проекта.
-        merge_request_iid:           Внутренний IID мёрдж-реквеста (не глобальный ID).
+        merge_request_iid:           Внутренний IID MR (не глобальный ID).
         merge_commit_message:        Кастомное сообщение merge-коммита.
-        squash:                      Схлопнуть коммиты при мёрдже.
+        squash:                      Схлопнуть коммиты.
         should_remove_source_branch: Удалить source-ветку после мёрджа.
     """
-    pid = _encode_path(project_id)
+    api_base, token = _gitlab_credentials(ctx)
+    pid = _encode_id(project_id)
+
     payload: dict = {
         "squash": squash,
         "should_remove_source_branch": should_remove_source_branch,
@@ -2676,11 +325,11 @@ def merge_merge_request(
     if merge_commit_message:
         payload["merge_commit_message"] = merge_commit_message
 
-    return _put(f"/projects/{pid}/merge_requests/{merge_request_iid}/merge", payload)
+    return _put(api_base, token, f"/projects/{pid}/merge_requests/{merge_request_iid}/merge", payload)
 
 
 # ---------------------------------------------------------------------------
-# Tool 6 — Список коммитов ветки
+# Tool 6 — Список коммитов
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -2691,6 +340,7 @@ def list_commits(
     until: str | None = None,
     path: str | None = None,
     per_page: int = 20,
+    ctx: Context = None,
 ) -> list[dict]:
     """
     Возвращает список коммитов репозитория.
@@ -2698,25 +348,24 @@ def list_commits(
     Args:
         project_id: ID или «namespace/repo» проекта.
         ref_name:   Ветка/тег/SHA (default: main).
-        since:      ISO 8601 дата начала диапазона (опционально).
-        until:      ISO 8601 дата конца диапазона (опционально).
+        since:      ISO 8601 дата начала (опционально).
+        until:      ISO 8601 дата конца (опционально).
         path:       Фильтр по пути файла/директории (опционально).
-        per_page:   Кол-во коммитов в ответе (max 100, default 20).
+        per_page:   Кол-во коммитов (max 100, default 20).
     """
-    pid = _encode_path(project_id)
-    params: dict = {"ref_name": ref_name, "per_page": min(per_page, 100)}
-    if since:
-        params["since"] = since
-    if until:
-        params["until"] = until
-    if path:
-        params["path"] = path
+    api_base, token = _gitlab_credentials(ctx)
+    pid = _encode_id(project_id)
 
-    return _get(f"/projects/{pid}/repository/commits", params)
+    params: dict = {"ref_name": ref_name, "per_page": min(per_page, 100)}
+    if since:  params["since"] = since
+    if until:  params["until"] = until
+    if path:   params["path"]  = path
+
+    return _get(api_base, token, f"/projects/{pid}/repository/commits", params)
 
 
 # ---------------------------------------------------------------------------
-# Tool 7 — Детали конкретного коммита
+# Tool 7 — Детали коммита
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -2724,17 +373,19 @@ def get_commit_details(
     project_id: str,
     sha: str,
     stats: bool = True,
+    ctx: Context = None,
 ) -> dict:
     """
-    Возвращает полные метаданные коммита: автор, дата, сообщение, статистика.
+    Возвращает метаданные коммита: автор, дата, сообщение, статистика строк.
 
     Args:
         project_id: ID или «namespace/repo» проекта.
         sha:        Полный или сокращённый SHA коммита.
-        stats:      Включить статистику изменений (добавлено/удалено строк).
+        stats:      Включить статистику добавленных/удалённых строк.
     """
-    pid = _encode_path(project_id)
-    return _get(f"/projects/{pid}/repository/commits/{sha}", {"stats": stats})
+    api_base, token = _gitlab_credentials(ctx)
+    pid = _encode_id(project_id)
+    return _get(api_base, token, f"/projects/{pid}/repository/commits/{sha}", {"stats": stats})
 
 
 # ---------------------------------------------------------------------------
@@ -2745,18 +396,19 @@ def get_commit_details(
 def get_commit_diff(
     project_id: str,
     sha: str,
+    ctx: Context = None,
 ) -> list[dict]:
     """
-    Возвращает список изменений (diff) для конкретного коммита.
-    Каждый элемент списка описывает один изменённый файл: old_path, new_path,
-    diff (unified patch), флаги new_file / renamed_file / deleted_file.
+    Возвращает список изменённых файлов с unified diff для коммита.
+    Каждый элемент: old_path, new_path, diff, флаги new_file/deleted_file/renamed_file.
 
     Args:
         project_id: ID или «namespace/repo» проекта.
         sha:        SHA коммита.
     """
-    pid = _encode_path(project_id)
-    return _get(f"/projects/{pid}/repository/commits/{sha}/diff")
+    api_base, token = _gitlab_credentials(ctx)
+    pid = _encode_id(project_id)
+    return _get(api_base, token, f"/projects/{pid}/repository/commits/{sha}/diff")
 
 
 # ---------------------------------------------------------------------------
@@ -2767,20 +419,23 @@ def get_commit_diff(
 def list_branches(
     project_id: str,
     search: str | None = None,
+    ctx: Context = None,
 ) -> list[dict]:
     """
-    Возвращает список веток репозитория с информацией о последнем коммите.
+    Возвращает список веток с информацией о последнем коммите каждой.
 
     Args:
         project_id: ID или «namespace/repo» проекта.
         search:     Строка поиска по имени ветки (опционально).
     """
-    pid = _encode_path(project_id)
+    api_base, token = _gitlab_credentials(ctx)
+    pid = _encode_id(project_id)
+
     params: dict = {"per_page": 100}
     if search:
         params["search"] = search
 
-    return _get(f"/projects/{pid}/repository/branches", params)
+    return _get(api_base, token, f"/projects/{pid}/repository/branches", params)
 
 
 # ---------------------------------------------------------------------------
@@ -2792,21 +447,25 @@ def search_code(
     project_id: str,
     query: str,
     ref: str = "main",
+    ctx: Context = None,
 ) -> list[dict]:
     """
-    Полнотекстовый поиск по содержимому файлов в репозитории.
-    Возвращает список совпадений с именем файла, путём и фрагментами.
+    Полнотекстовый поиск по содержимому файлов репозитория (scope: blobs).
 
     Args:
         project_id: ID или «namespace/repo» проекта.
-        query:      Строка поиска (поддерживаются операторы GitLab Search).
+        query:      Поисковый запрос.
         ref:        Ветка/тег для поиска (default: main).
     """
-    pid = _encode_path(project_id)
-    return _get(
-        f"/projects/{pid}/search",
-        {"scope": "blobs", "search": query, "ref": ref, "per_page": 20},
-    )
+    api_base, token = _gitlab_credentials(ctx)
+    pid = _encode_id(project_id)
+
+    return _get(api_base, token, f"/projects/{pid}/search", {
+        "scope": "blobs",
+        "search": query,
+        "ref": ref,
+        "per_page": 20,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -2814,6 +473,4 @@ def search_code(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # streamable-http — стандартный транспорт для production MCP-серверов
     mcp.run(transport="streamable-http", host=MCP_HOST, port=MCP_PORT)
-
