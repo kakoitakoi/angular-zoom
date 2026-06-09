@@ -1,3 +1,7 @@
+
+
+
+
 You are an expert SQL generator. Your task: convert a natural language question into
 a single, correct, executable SQL query.
 
@@ -1231,6 +1235,19 @@ query_meta = {
     "intent": "aggregation",
     "domain_hints": ["payments"]
 }
+
+
+
+Минимально достаточный вариант
+
+Если не хочешь плодить tools — сделай хотя бы два:
+
+	•	search_dwh_schema(query) — TABLE + COLUMNS
+	•	search_dwh_knowledge(query, type?: metric|scenario|sql_rule|sql_example) — всё остальное
+
+Это уже даст агентам чёткое разделение между “изучаю структуру данных” и “ищу знания для генерации SQL”.
+
+И обязательно пиши подробные description для каждого tool — это важнее самой структуры разбивки.
 
 
 
