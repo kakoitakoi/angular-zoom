@@ -1250,4 +1250,28 @@ query_meta = {
 И обязательно пиши подробные description для каждого tool — это важнее самой структуры разбивки.
 
 
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "kimi": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Kimi Corporate",
+      "options": {
+        "baseURL": "https://ВАШ_КОРПОРАТИВНЫЙ_URL/v1"
+      },
+      "models": {
+        "kimi-k2-5": {
+          "name": "Kimi-K2-5",
+          "limit": {
+            "context": 131072,
+            "output": 8192
+          }
+        }
+      }
+    }
+  },
+  "model": "kimi/kimi-k2-5"
+}
+
+
 
