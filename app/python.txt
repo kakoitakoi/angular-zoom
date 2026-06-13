@@ -744,3 +744,50 @@ async def search_code(
 
 if __name__ == "__main__":
     mcp.run(transport="streamable-http", host=MCP_HOST, port=MCP_PORT)
+
+
+@mcp.tool()
+async def find_jira_user(
+    query: str,
+    max_results: int = 10
+) -> list[dict]:
+    """
+    Найти пользователя Jira Server по имени, фамилии или их части.
+    
+    Args:
+        query: Имя, фамилия или их часть (например: "Иван", "Петров", "Иван Петров")
+        max_results: Максимальное количество результатов (default: 10)
+    
+    Returns:
+        Список пользователей с username, displayName, emailAddress
+    """
+    creds = _get_credentials()  # твоя функция получения креденшалов из хедеров
+    
+    response = requests.get(
+        f"{creds.base_url}/rest/api/2/user/search",
+        params={
+            "username": query,   # на Server параметр называется username, не query
+            "maxResults": max_results,
+        },
+        auth=HTTPBasicAuth(creds.username, creds.password),
+        verify=False,
+        timeout=10,
+    )
+    response.raise_for_status()
+    
+    users = response.json()
+    
+    if not users:
+        return [{"message": f"Пользователи по запросу '{query}' не найдены"}]
+    
+    return [
+        {
+            "username": u.get("name"),           # это и есть username для Server
+            "display_name": u.get("displayName"),
+            "email": u.get("emailAddress", ""),
+            "active": u.get("active", True),
+        }
+        for u in users
+        if u.get("active", True)  # фильтруем деактивированных, убери если нужны все
+    ]
+
