@@ -791,3 +791,91 @@ async def find_jira_user(
         if u.get("active", True)  # фильтруем деактивированных, убери если нужны все
     ]
 
+
+
+
+
+
+from fastmcp import FastMCP
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+import asyncpg  # или aiosqlite
+
+mcp = FastMCP("my-server")
+
+class TokenAuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # health-check пропускаем без токена
+        if request.url.path == "/health":
+            return await call_next(request)
+        
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+        
+        token = auth.removeprefix("Bearer ").strip()
+        
+        if not await is_valid_token(token):
+            return JSONResponse({"error": "Invalid token"}, status_code=401)
+        
+        return await call_next(request)
+
+async def is_valid_token(token: str) -> bool:
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        row = await conn.fetchrow(
+            "SELECT 1 FROM mcp_tokens WHERE token = $1 AND is_active = true",
+            token
+        )
+        return row is not None
+    finally:
+        await conn.close()
+
+# Регистрируем middleware
+mcp.app.add_middleware(TokenAuthMiddleware)
+
+
+CREATE TABLE mcp_tokens (
+    id          SERIAL PRIMARY KEY,
+    token       VARCHAR(64) UNIQUE NOT NULL,
+    description TEXT,          -- "gitlab-mcp для команды А"
+    is_active   BOOLEAN DEFAULT true,
+    created_at  TIMESTAMP DEFAULT NOW(),
+    last_used   TIMESTAMP
+);
+
+
+import secrets
+
+def generate_token() -> str:
+    return secrets.token_hex(32)  # 64-char hex строка
+
+# Добавить токен:
+# INSERT INTO mcp_tokens (token, description) VALUES ('...', 'team-A');
+
+# Отозвать:
+# UPDATE mcp_tokens SET is_active = false WHERE description = 'team-A';
+
+
+Обновление last_used — видишь кто активен:
+await conn.execute(
+    "UPDATE mcp_tokens SET last_used = NOW() WHERE token = $1", token
+)
+
+
+
+Кэш в памяти — чтобы не ходить в БД на каждый запрос:
+
+from cachetools import TTLCache
+_cache = TTLCache(maxsize=256, ttl=60)  # кэш на 60 сек
+
+async def is_valid_token(token: str) -> bool:
+    if token in _cache:
+        return _cache[token]
+    # ... запрос в БД ...
+    _cache[token] = result
+    return result
+
+
+
