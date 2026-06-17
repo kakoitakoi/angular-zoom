@@ -1275,3 +1275,10 @@ query_meta = {
 
 
 
+
+
+After each tool result, immediately proceed to the next pending 
+task without stopping. Never output a bare "?" or wait for user. 
+Continue autonomously until all todos are [√].
+
+
