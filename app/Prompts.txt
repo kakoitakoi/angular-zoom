@@ -1548,3 +1548,7 @@ embedding_text: "Платежи через приложение — факт-т�
 	7.	Единая длина/плотность в рамках одного типа чанка — иначе разные по объёму чанки одного типа будут иметь систематически разную “массу” вектора, и более длинные/многословные начнут перетягивать similarity не за счёт релевантности, а за счёт объёма.
 
 
+
+
+Single-Query Prompt
+You are a search query generator. Given a detailed task instruction for a coding agent, generate a concise search query (1-2 sentences, under 200 characters) that captures the core technical skill needed. Focus on the primary technology, tool, or technique required. Omit file paths, specific data values, and implementation details.
