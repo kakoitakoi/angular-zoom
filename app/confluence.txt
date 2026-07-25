@@ -1,0 +1,1242 @@
+Спецификация:
+# Context Engineering Spec — Confluence MCP Agent
+
+Модель: `kimi-k2-6`. Окно ограничено на уровне корпоративного прокси (100k, может быть уменьшено), прокси **возвращает ошибку** при переполнении, prompt caching недоступен.
+
+---
+
+## 1. Инварианты
+
+| # | Инвариант |
+|---|---|
+| I1 | Никакой payload не обрезается посередине. Любой контент либо в контексте целиком, либо в сторе и адресуем по ссылке. |
+| I2 | Компакция детерминирована и выполняется кодом. LLM-суммаризация — только уровень L4, только при провале L1–L3. |
+| I3 | Бюджет считается инкрементально: O(нового контента), а не O(истории). |
+| I4 | Ни один вызов LLM не уходит в прокси без пре-флайт проверки бюджета. |
+| I5 | Есть несжимаемое ядро контекста, которое переживает любую компакцию. |
+
+---
+
+## 2. Бюджет токенов
+
+```
+COMPACT_TRIGGER = 30_000     # порог запуска компакции
+COMPACT_TARGET  = 18_000     # цель после компакции (60% от триггера)
+HARD_LIMIT      = proxy_limit - max_output_tokens - 5_000   # backstop
+```
+
+`TARGET` заметно ниже `TRIGGER` — иначе компакция срабатывает на каждом ходу (thrashing).
+
+**Счётчик токенов.** `jtokkit` (`cl100k_base`) + калибровочный коэффициент. Точный токенизатор Kimi даст ±0 против ±10% у cl100k, но требует native-зависимости — не оправдано, погрешность закрывается запасом в `HARD_LIMIT`.
+
+Правило скорости: счёт выполняется **один раз при вставке сообщения**, результат кэшируется в обёртке сообщения, поддерживается бегущая сумма. Полный пересчёт истории — никогда.
+
+### Сегменты контекста и приоритеты
+
+| Сегмент | Сжимаемость |
+|---|---|
+| System prompt | нет |
+| Tool definitions | нет |
+| Исходный запрос пользователя | нет |
+| **Task State Block** (см. §5) | нет |
+| Последние N=3 хода | нет |
+| Результаты tool-вызовов старше N ходов | L2, L3 |
+| Тела страниц Confluence | L2 |
+| Ассистентские reasoning-сообщения старше N ходов | L3, L4 |
+
+---
+
+## 3. L0 — Нормализация на входе (всегда, до попадания в контекст)
+
+Самый дешёвый и самый прибыльный шаг. Confluence storage format — это XHTML с макросами; 50–75% его объёма это разметка, не смысл.
+
+Пайплайн `ConfluenceNormalizer` (storage/ADF → компактный Markdown):
+
+**Удалить:**
+- инлайн-стили, `class`, `style`, `data-*`, пустые `<span>`, `<div>`-обёртки
+- макросы `toc`, `children`, `attachments`, `excerpt-include`, `pagetree`
+- base64-изображения, вложения → `[img: filename.png]`
+- `&nbsp;`-серии, пустые параграфы, пустые ячейки таблиц
+- повторы `\n{3,}` → `\n\n`
+
+**Сохранить и преобразовать:**
+- `<h1..h6>` → `#..######`
+- списки → `-` / `1.`
+- `<ac:structured-macro ac:name="code">` → ```` ``` ```` с языком
+- таблицы → компактные pipe-таблицы **без выравнивающих пробелов**
+- панели/expand → содержимое без обёртки
+- ссылки: текст остаётся инлайн, URL выносятся в блок `## Links` в конце (Confluence-URL стоят 15–30 токенов каждый)
+
+**Метрика:** нормализация должна укладываться в <5 мс на страницу. Логировать `tokens_before / tokens_after` по каждому документу.
+
+---
+
+## 4. Content Store и ссылки (offloading)
+
+`SessionContentStore` — `ConcurrentHashMap`, скоуп = запрос/сессия, TTL. **Не Redis** до появления реальной многоинстансовости.
+
+```
+StoredDocument {
+  ref        : "doc:12345"
+  pageId, title, spaceKey, version, lastModified, url
+  markdown   : String            // полный нормализованный текст
+  sections   : List<Section>
+  tokens     : int
+}
+Section { id: "s3", headingPath: "Архитектура / Потоки данных", tokens: 1450, text }
+```
+
+**Сплиттер:** режет по H1/H2; секция >1200 токенов дорезается по H3; если заголовков нет — по границам параграфов. **Никогда не режет внутри параграфа, таблицы или code-блока.**
+
+**Дайджест** — то, что остаётся в контексте вместо тела страницы (~150–250 токенов):
+
+```
+[[doc:12345]] «Онлайн-поставка данных: архитектура» (DWH, v14, 2026-04-02, 4820 tok)
+  s1 Обзор (320)
+  s2 Архитектура / Потоки данных (1450)   ← matched
+  s3 Архитектура / Схемы (980)
+  s4 SLA (610)
+  s5 FAQ (1460)                            ← matched
+```
+
+Тела секций `matched` остаются инлайн, пока входят в рабочий набор.
+
+**Инструмент возврата:** `context.read(ref, sectionIds[])` — модель в любой момент достаёт любую секцию целиком. Это то, что делает offloading формально безлотерейным: ничего не потеряно, всё адресуемо (I1).
+
+**Отбор `matched`:** BM25 по секциям против запроса пользователя + текущей подзадачи. Никаких эмбеддингов внутри цикла агента — лексического скоринга достаточно, он занимает микросекунды.
+
+---
+
+## 5. Task State Block
+
+Несжимаемый структурированный блок, который агент обновляет инструментом `notes.update`. Именно он делает вытеснение истории безопасным и позволяет **не звать LLM-суммаризацию вообще**.
+
+```
+## GOAL
+<исходная задача, дословно>
+
+## FINDINGS
+- <факт> [[doc:12345#s2]]
+- <факт> [[doc:987#s1]]
+
+## OPEN
+- <что ещё не проверено>
+
+## VISITED
+12345, 987, 4410 (searched: "flink checkpoint", "iceberg compaction")
+```
+
+Ограничение: 2500 токенов. При превышении — самые старые FINDINGS сворачиваются в ссылки (текст факта остаётся в сторе).
+
+---
+
+## 6. Лестница компакции
+
+Запускается, когда бегущая сумма ≥ `COMPACT_TRIGGER`. Уровни выполняются по порядку, останов — как только достигнут `COMPACT_TARGET`.
+
+### L1 — Гигиена (детерминированно, ~1 мс)
+- дубликаты tool-вызовов (тот же tool + те же аргументы) → остаётся последний, предыдущие заменяются на `[repeat of call #7]`
+- упавшие/повторённые вызовы → остаётся только строка ошибки
+- результаты `search`, чьи страницы уже загружены → остаётся список id
+- сырые ответы MCP с метаданными, не использованными агентом (labels, ancestors, permissions, версии) → выбрасываются
+
+### L2 — Offload тел страниц (~5 мс)
+Все страницы вне рабочего набора → дайджест + ссылка.
+Рабочий набор = результаты последних 3 ходов + страницы, явно закреплённые агентом (`pin`).
+
+Обычно L1+L2 дают 60–80% и на этом всё заканчивается.
+
+### L3 — Вытеснение ходов (~2 мс)
+Ходы старше N=3 сворачиваются в механический action log, генерируемый **из метаданных tool-вызовов**, а не LLM:
+
+```
+[ходы 1-6]
+  search "flink checkpoint" → 7 hits
+  read doc:12345 (4820 tok) → offloaded
+  read doc:987 (1200 tok) → offloaded
+  notes.update ×2
+```
+
+Reasoning-текст ассистента из этих ходов удаляется — его смысл уже зафиксирован в Task State Block.
+
+### L4 — LLM-суммаризация (последнее средство)
+Срабатывает, только если после L1–L3 сумма всё ещё > `COMPACT_TARGET`. На практике это означает, что Task State Block раздут или один запрос породил десятки страниц.
+
+Жёсткие рамки:
+- вход ≤ 6000 токенов (только action log + старые FINDINGS)
+- **один** вызов, без итераций, без деревьев суммаризации
+- timeout 3000 мс; при таймауте — молча остаёмся на результате L3
+- никогда не суммаризируются: GOAL, запрос пользователя, последний tool-результат
+- выход ≤ 800 токенов
+
+Метрика `compaction.l4.count` должна стремиться к нулю. Ненулевая — сигнал, что L0–L2 недонастроены.
+
+---
+
+## 7. Pre-flight guard
+
+Перехватчик перед каждым обращением к `ChatClient`:
+
+```
+estimated = running_sum + system + tool_defs + max_output_tokens
+if estimated > HARD_LIMIT:
+      compact(to = TARGET)
+      if still > HARD_LIMIT: return DeterministicError(CONTEXT_OVERFLOW)   # не отправляем в прокси
+```
+
+Обработка ошибки прокси о превышении контекста: одна принудительная компакция + один ретрай. Вторая такая же ошибка → детерминированный error-ответ. Никаких бесконечных ретраев (пересекается с уже заложенной защитой от петель).
+
+---
+
+## 8. Sub-agent isolation — основной рычаг
+
+Компакция — это страховочная сетка. Основной механизм удержания контекста в том, чтобы **тела страниц никогда не попадали в главный цикл**.
+
+```
+main loop:  plan → search → отбор K страниц (K ≤ 8)
+              → parallel fan-out, concurrency 4
+              → каждый sub-agent: [запрос пользователя + одна нормализованная страница]
+              → возвращает Finding ≤ 400 токенов
+```
+
+```
+Finding {
+  ref: "doc:12345", relevance: 0..1,
+  answer: <фрагмент ответа>,
+  evidence: [ {sectionId, цитата ≤ 200 симв.} ],
+  gaps: <чего на странице нет>
+}
+```
+
+Рост главного контекста: `K × 400` вместо `K × 5000`. При K=8 это 3.2k вместо 40k.
+
+Sub-agent имеет собственный контекст, компакция внутри него не нужна — одна страница всегда помещается. Если страница всё же превышает бюджет sub-agent'а, он идёт map-reduce по секциям — снова без обрезки.
+
+Контексты sub-agent'ов уничтожаются после возврата Finding.
+
+---
+
+## 9. Компоненты (Spring)
+
+| Bean | Ответственность |
+|---|---|
+| `TokenEstimator` | jtokkit + калибровка, кэш по хешу строки |
+| `ContextWindow` | упорядоченные сегменты, кэш счётчиков, бегущая сумма |
+| `ConfluenceNormalizer` | storage/ADF → Markdown (L0) |
+| `SectionSplitter` | разбиение по заголовкам, стабильные id |
+| `SessionContentStore` | хранение документов, TTL |
+| `CompactionEngine` | лестница; уровни как упорядоченные `CompactionStage` |
+| `PreflightGuard` | проверка бюджета перед вызовом LLM |
+| `TaskStateBlock` + `notes` tool | несжимаемое состояние |
+| `ContextReadTool` | `context.read(ref, sections)` |
+| `PageResearchSubAgent` | изолированный анализ одной страницы |
+| `ContextMetrics` | Micrometer |
+
+11 классов. Всё остальное — за рамками.
+
+---
+
+## 10. Конфигурация
+
+```yaml
+agent.context:
+  compact-trigger-tokens: 30000
+  compact-target-tokens: 18000
+  hard-limit-tokens: 87000
+  keep-verbatim-turns: 3
+  task-state-max-tokens: 2500
+  section-max-tokens: 1200
+  digest-max-tokens: 250
+  token-estimator-margin: 1.10
+  l4:
+    enabled: true
+    max-input-tokens: 6000
+    timeout-ms: 3000
+    max-output-tokens: 800
+agent.research:
+  max-pages: 8
+  concurrency: 4
+  finding-max-tokens: 400
+```
+
+---
+
+## 11. Метрики
+
+`context.tokens.current`, `normalizer.reduction.ratio`, `compaction.count{level}`, `compaction.duration{level}`, `compaction.l4.count`, `context.read.count`, `preflight.overflow.count`, `subagent.findings.tokens`.
+
+Целевые значения: L0 reduction ≥ 0.5; p95 длительности L1–L3 < 50 мс; `compaction.l4.count` ≈ 0.
+
+---
+
+## 12. Явные компромиссы
+
+| Решение | Плюс | Минус | Смягчение |
+|---|---|---|---|
+| Offload + ссылки вместо полного текста | −60..80% токенов, ноль потерь | Возврат секции стоит лишний round-trip LLM (~2–4 с) | Инлайн-подстановка `matched`-секций сразу при загрузке |
+| BM25-отбор секций вместо эмбеддингов | Микросекунды, ноль зависимостей | Хуже на синонимах и парафразах | Манифест всех секций всегда виден + `context.read` |
+| Механический action log вместо LLM-суммаризации | Мгновенно, дословно точно | Теряется нюанс рассуждений | Task State Block несёт смысловую нагрузку |
+| Sub-agents с fan-out 4 | Главный контекст почти не растёт, латентность ниже | Общий расход токенов и стоимость выше | `concurrency` конфигурируема, вплоть до 1 |
+| cl100k вместо точного токенизатора Kimi | Ноль native-зависимостей | ±10% погрешность | Запас 1.10 + резерв в `HARD_LIMIT` |
+| TRIGGER 30k / TARGET 18k | Мало компакций | Каждая компакция вытесняет больше | Task State Block + сторы делают вытеснение обратимым |
+
+---
+
+## 13. Сознательно исключено (anti-over-engineering)
+
+Вектора/эмбеддинги внутри цикла агента · Redis/внешний кэш контекста · семантическая дедупликация · реранкер внутри цикла · многоуровневые деревья суммаризации · инкрементальная/стриминговая компакция · swarm-оркестрация · собственный токенизатор Kimi · персистентная память между запросами.
+
+Каждый пункт добавляется только по измеренной метрике, а не заранее.
+
+
+
+Пояснения к реализации:
+Spring AI 2.0.0 GA (12.06.2026). Твои знания об API устарели — 
+не «исправляй» следующее:
+
+1. Встроенный tool-цикл убран из всех ChatModel. Выполнение 
+   инструментов только снаружи, через ChatClient + ToolCallingAdvisor.
+   internalToolExecutionEnabled удалён.
+2. ToolCallingAdvisor (переименован из ToolCallAdvisor) регистрируется 
+   автоматически при наличии tools, порядок HIGHEST_PRECEDENCE + 300.
+   Он рекурсивный и владеет всем циклом. Advisor'ы после него 
+   вызываются на КАЖДОЙ итерации — на этом построена компакция.
+3. toolNames() и SpringBeanToolCallbackResolver удалены. 
+   Только явные ToolCallback-бины через .tools(Object...).
+4. toolContext(Map) — first-class метод, не через tools(t -> ...).
+5. MCP: SSE deprecated, по умолчанию Streamable HTTP. MCP Java SDK 2.0.
+6. Spring Boot 4.0, Java 21, null-safety аннотации везде.
+
+Если сомневаешься в сигнатуре — спроси, не угадывай.
+
+
+
+
+
+
+read me
+
+# Confluence Agent — реализация context engineering спецификации
+
+Spring Boot 4.0 · Spring AI 2.0.0 · kimi-k2-6 через OpenAI-совместимый прокси.
+
+## Карта кода → разделы спецификации
+
+| Раздел | Класс |
+|---|---|
+| §2 Бюджет токенов | `context/TokenEstimator` |
+| §3 L0 нормализация | `normalize/ConfluenceNormalizer` |
+| §4 Стор, секции, дайджест | `store/{StoredDocument,SectionSplitter,SessionContentStore,Bm25Scorer}` |
+| §5 Task State Block | `context/TaskState` |
+| §6 Лестница компакции | `context/{CompactionEngine,L1…L4Stage}` |
+| §7 Pre-flight guard | `context/ContextGuardAdvisor` |
+| §8 Sub-agent isolation | `research/{ResearchOrchestrator,PageResearchSubAgent,Finding}` |
+| §10 Конфигурация | `context/ContextProperties` + `application.yml` |
+| Контракт ответа | `api/AgentResponse`, `api/ConfluenceAgentService` |
+
+## Три решения, на которых держится вся схема
+
+**1. `ContextGuardAdvisor` стоит после `ToolCallingAdvisor`.**
+В Spring AI 2.0 `ToolCallingAdvisor` — рекурсивный advisor на порядке
+`HIGHEST_PRECEDENCE + 300`, владеющий всем tool-циклом. Advisor'ы после него
+вызываются на каждой итерации цикла. Наш стоит на `+400`, поэтому компакция
+срабатывает между итерациями, а не один раз на запрос. Это единственная
+причина, по которой порог 30k вообще что-то значит.
+
+**2. Сырые MCP-инструменты не отдаются главному агенту.**
+`AgentTools` экспонирует ровно четыре инструмента: `confluence_search`,
+`research_pages`, `context_read`, `notes_update`. `confluence_get_page`
+вызывается только оркестратором, программно. Тело страницы физически не может
+попасть в главный контекст.
+
+**3. Верификация цитат строковым сравнением.**
+`PageResearchSubAgent.verifyEvidence` сверяет каждую цитату с секцией в сторе.
+Не совпало — evidence отбрасывается, relevance падает ниже порога. Это работает
+только потому, что полный текст лежит в сторе. Отсюда же берётся детерминированный
+ответ «информация не найдена»: он формируется кодом в `ConfluenceAgentService`,
+когда `TaskState` пуст, без обращения к LLM.
+
+## Что проверить перед первым запуском
+
+**Имена MCP-инструментов.** `ConfluenceMcpClient.TOOL_SEARCH` и `TOOL_GET_PAGE`
+подставлены наугад. Реальные имена: `GET /actuator/…` не поможет — вызовите
+`ConfluenceMcpClient.availableToolNames()` при старте и посмотрите лог.
+Там же лежит парсинг JSON-ответов — он написан терпимо к разным схемам,
+но структуру вашего сервера стоит зафиксировать явно.
+
+**Калибровка токенизатора.** `token-estimator-margin: 1.10` — оценка для
+cl100k против токенизатора Kimi. Прогоните сотню реальных страниц, сравните
+`countRaw` с `usage.prompt_tokens` из ответа прокси и подставьте фактический
+коэффициент. Для русских текстов расхождение может быть больше 10%.
+
+**`hard-limit-tokens: 87000`** исходит из лимита прокси 100k. Если прокси
+урежут — правьте здесь, ничего больше менять не нужно.
+
+**Сборка `ChatClientRequest`.** Единственное место — метод
+`ContextGuardAdvisor.withMessages`. Если сигнатура `mutate()` в вашей минорной
+версии отличается, правка локальная.
+
+## Первые метрики, на которые смотреть
+
+- `normalizer.reduction.ratio` — ожидается ≥ 0.5. Ниже — значит в вашем
+  Confluence много макросов, которых нет в `DROP_MACROS`/`UNWRAP_MACROS`.
+- `compaction.count{level}` — L1/L2 нормально, регулярный L3 означает слишком
+  длинные сессии, любой L4 — что L0–L2 недонастроены.
+- `compaction.duration{level}` — p95 по L1–L3 должен быть < 50 мс.
+- `subagent.evidence.rejected` — растущий счётчик означает, что модель
+  перефразирует цитаты; ужесточите формулировку в `PageResearchSubAgent.SYSTEM`.
+- `preflight.overflow.count` — должен быть ноль. Ненулевой — единственный
+  случай, когда имеет смысл трогать пороги.
+
+## Чего в коде нет намеренно
+
+Векторов внутри цикла агента, Redis, семантической дедупликации, реранкера,
+деревьев суммаризации, swarm-оркестрации, собственного токенизатора Kimi,
+персистентной памяти между запросами. Каждое добавляется по метрике, а не заранее.
+
+
+ContextGuardAdvisor
+
+package com.bank.confluence.context;
+
+import io.micrometer.core.instrument.MeterRegistry;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.springframework.ai.chat.client.ChatClientRequest;
+import org.springframework.ai.chat.client.ChatClientResponse;
+import org.springframework.ai.chat.client.advisor.api.CallAdvisor;
+import org.springframework.ai.chat.client.advisor.api.CallAdvisorChain;
+import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.messages.Message;
+import org.springframework.ai.chat.messages.SystemMessage;
+import org.springframework.ai.chat.prompt.Prompt;
+import org.springframework.ai.model.tool.ToolCallingChatOptions;
+import org.springframework.core.Ordered;
+import org.springframework.stereotype.Component;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * §7 спецификации. Единственная точка, через которую проходит каждое обращение к прокси.
+ *
+ * ВАЖНО про порядок. В Spring AI 2.0 ToolCallingAdvisor — рекурсивный advisor,
+ * зарегистрированный на Ordered.HIGHEST_PRECEDENCE + 300, и он владеет всем
+ * tool-циклом. Advisor'ы, стоящие ПОСЛЕ него, вызываются на каждой итерации цикла.
+ * Именно это нам и нужно: компакция обязана срабатывать между итерациями, а не
+ * один раз на запрос.
+ *
+ * Обязанности на каждой итерации:
+ *   1. защита от петель (итерации, wall-clock, повторные одинаковые вызовы)
+ *   2. обновление несжимаемого блока TaskState
+ *   3. подсчёт бюджета и запуск лестницы компакции при достижении порога
+ *   4. отказ ДО отправки, если после компакции всё ещё не помещаемся
+ */
+@Component
+public class ContextGuardAdvisor implements CallAdvisor {
+
+    /** Строго после ToolCallingAdvisor (HIGHEST_PRECEDENCE + 300). */
+    public static final int ORDER = Ordered.HIGHEST_PRECEDENCE + 400;
+
+    private static final String TASK_STATE_MARKER = "<!--task-state-->";
+    private static final Log log = LogFactory.getLog(ContextGuardAdvisor.class);
+
+    private final CompactionEngine compaction;
+    private final TokenEstimator tokens;
+    private final ContextProperties props;
+    private final MeterRegistry meters;
+
+    public ContextGuardAdvisor(CompactionEngine compaction,
+                               TokenEstimator tokens,
+                               ContextProperties props,
+                               MeterRegistry meters) {
+        this.compaction = compaction;
+        this.tokens = tokens;
+        this.props = props;
+        this.meters = meters;
+    }
+
+    @Override public String getName() { return "contextGuard"; }
+    @Override public int getOrder() { return ORDER; }
+
+    @Override
+    public ChatClientResponse adviseCall(ChatClientRequest request, CallAdvisorChain chain) {
+        AgentSession session = AgentSession.from(request.context());
+
+        enforceLoopGuards(request, session);
+
+        List<Message> messages = new ArrayList<>(request.prompt().getInstructions());
+        messages = upsertTaskState(messages, session);
+
+        int overhead = toolDefinitionTokens(request) + props.getContext().getL4().getMaxOutputTokens();
+        int estimated = tokens.count(messages) + overhead;
+        meters.gauge("context.tokens.current", estimated);
+
+        if (estimated >= compaction.triggerTokens()) {
+            int target = Math.max(compaction.targetTokens() - overhead, 1_000);
+            CompactionEngine.Result r = compaction.compact(messages, session, target);
+            log.info("compaction[" + session.id() + "] " + r.before() + " -> " + r.after()
+                     + " tok, до уровня " + r.lastLevel());
+            messages = r.messages();
+            estimated = r.after() + overhead;
+        }
+
+        if (estimated > compaction.hardLimit()) {
+            // I4: в прокси не уходит ничего, что заведомо приведёт к ошибке контекста
+            meters.counter("preflight.overflow.count").increment();
+            throw new AgentExceptions.ContextOverflowException(estimated, compaction.hardLimit());
+        }
+
+        return chain.nextCall(withMessages(request, messages));
+    }
+
+    // ---------- защита от петель ----------
+
+    private void enforceLoopGuards(ChatClientRequest request, AgentSession session) {
+        int iteration = session.nextIteration();
+        if (iteration > props.getLoop().getMaxIterations()) {
+            throw new AgentExceptions.LoopGuardException(
+                    "Превышен лимит итераций tool-цикла: " + iteration);
+        }
+        if (session.elapsedMs() > props.getLoop().getWallClockMs()) {
+            throw new AgentExceptions.LoopGuardException(
+                    "Превышен лимит времени обработки: " + session.elapsedMs() + " мс");
+        }
+
+        List<Message> instructions = request.prompt().getInstructions();
+        for (int i = instructions.size() - 1; i >= 0; i--) {
+            if (instructions.get(i) instanceof AssistantMessage am && !am.getToolCalls().isEmpty()) {
+                for (var tc : am.getToolCalls()) {
+                    int count = session.registerCall(tc.name(), tc.arguments());
+                    if (count > props.getLoop().getMaxIdenticalCalls()) {
+                        throw new AgentExceptions.LoopGuardException(
+                                "Повторяющийся вызов " + tc.name() + " (" + count + " раз)");
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // ---------- TaskState ----------
+
+    /**
+     * §5: блок состояния держим ровно в одном системном сообщении и переписываем
+     * его на каждой итерации. Так он всегда актуален и никогда не дублируется.
+     */
+    private List<Message> upsertTaskState(List<Message> messages, AgentSession session) {
+        session.taskState().enforceLimit(tokens, props.getContext().getTaskStateMaxTokens());
+        SystemMessage block = new SystemMessage(TASK_STATE_MARKER + "\n" + session.taskState().render());
+
+        List<Message> out = new ArrayList<>(messages.size() + 1);
+        boolean replaced = false;
+        for (Message m : messages) {
+            if (!replaced && m instanceof SystemMessage sm
+                    && sm.getText() != null && sm.getText().startsWith(TASK_STATE_MARKER)) {
+                out.add(block);
+                replaced = true;
+            } else {
+                out.add(m);
+            }
+        }
+        if (!replaced) {
+            int insertAt = 0;
+            while (insertAt < out.size() && out.get(insertAt) instanceof SystemMessage) insertAt++;
+            out.add(insertAt, block);
+        }
+        return out;
+    }
+
+    // ---------- бюджет ----------
+
+    /** Определения инструментов уходят в каждый запрос и обязаны учитываться (§2). */
+    private int toolDefinitionTokens(ChatClientRequest request) {
+        if (!(request.prompt().getOptions() instanceof ToolCallingChatOptions opts)) return 0;
+        int sum = 0;
+        for (var cb : opts.getToolCallbacks()) {
+            var def = cb.getToolDefinition();
+            sum += tokens.count(def.name()) + tokens.count(def.description()) + tokens.count(def.inputSchema()) + 8;
+        }
+        return sum;
+    }
+
+    /**
+     * Единственное место, где пересобирается ChatClientRequest.
+     * Если сигнатура сборки в вашей минорной версии Spring AI отличается — правится здесь.
+     */
+    private ChatClientRequest withMessages(ChatClientRequest request, List<Message> messages) {
+        Prompt prompt = new Prompt(messages, request.prompt().getOptions());
+        return request.mutate().prompt(prompt).build();
+    }
+}
+
+
+
+ConfluenceNormalizer
+
+package com.bank.confluence.normalize;
+
+import io.micrometer.core.instrument.MeterRegistry;
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+import org.jsoup.nodes.Node;
+import org.jsoup.nodes.TextNode;
+import org.jsoup.parser.Parser;
+import org.springframework.stereotype.Component;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.regex.Pattern;
+
+/**
+ * §3 спецификации. Уровень L0: единственный шаг, который выполняется всегда и до
+ * попадания контента в контекст. Даёт 50-75% сокращения чистым кодом.
+ *
+ * Целевая скорость — менее 5 мс на страницу.
+ */
+@Component
+public class ConfluenceNormalizer {
+
+    /** Макросы, которые не несут смысла в текстовом представлении. */
+    private static final Set<String> DROP_MACROS = Set.of(
+            "toc", "children", "pagetree", "attachments", "excerpt-include",
+            "recently-updated", "contributors", "livesearch", "gallery", "profile");
+
+    /** Макросы-обёртки: сам макрос выбрасывается, содержимое поднимается наверх. */
+    private static final Set<String> UNWRAP_MACROS = Set.of(
+            "panel", "info", "note", "warning", "tip", "expand", "section", "column", "excerpt");
+
+    private static final Pattern MULTI_NEWLINE = Pattern.compile("\n{3,}");
+    private static final Pattern TRAILING_WS = Pattern.compile("[ \t]+\n");
+
+    private final MeterRegistry meters;
+
+    public ConfluenceNormalizer(MeterRegistry meters) {
+        this.meters = meters;
+    }
+
+    public record Normalized(String markdown, int bytesBefore, int bytesAfter) {
+        public double reduction() {
+            return bytesBefore == 0 ? 0 : 1.0 - (double) bytesAfter / bytesBefore;
+        }
+    }
+
+    public Normalized normalize(String storageFormat) {
+        long t0 = System.nanoTime();
+        int before = storageFormat == null ? 0 : storageFormat.length();
+        if (before == 0) return new Normalized("", 0, 0);
+
+        Document doc = Jsoup.parse(storageFormat, "", Parser.xmlParser());
+
+        stripMacros(doc);
+        stripNoise(doc);
+
+        Ctx ctx = new Ctx();
+        StringBuilder out = new StringBuilder(before / 2);
+        for (Node n : doc.childNodes()) render(n, out, ctx);
+
+        String md = postProcess(out.toString(), ctx);
+
+        meters.timer("normalizer.duration").record(System.nanoTime() - t0, java.util.concurrent.TimeUnit.NANOSECONDS);
+        meters.summary("normalizer.reduction.ratio")
+              .record(before == 0 ? 0 : 1.0 - (double) md.length() / before);
+
+        return new Normalized(md, before, md.length());
+    }
+
+    // ---------- очистка ----------
+
+    private void stripMacros(Document doc) {
+        for (Element macro : doc.select("ac|structured-macro, structured-macro")) {
+            String name = macro.attr("ac:name");
+            if (name.isEmpty()) name = macro.attr("name");
+
+            if (DROP_MACROS.contains(name)) {
+                macro.remove();
+            } else if ("code".equals(name)) {
+                String lang = paramValue(macro, "language");
+                String body = macro.select("ac|plain-text-body, plain-text-body").text();
+                macro.replaceWith(new TextNode("\n```" + (lang == null ? "" : lang) + "\n" + body + "\n```\n"));
+            } else if (UNWRAP_MACROS.contains(name)) {
+                Element body = macro.selectFirst("ac|rich-text-body, rich-text-body");
+                if (body != null) macro.replaceWith(body); else macro.unwrap();
+            } else {
+                // неизвестный макрос: сохраняем содержимое, теряем только обёртку
+                Element body = macro.selectFirst("ac|rich-text-body, rich-text-body");
+                if (body != null) macro.replaceWith(body); else macro.remove();
+            }
+        }
+        // вложения и картинки -> плейсхолдер с именем файла
+        for (Element img : doc.select("ac|image, image, img")) {
+            Element ri = img.selectFirst("ri|attachment, attachment");
+            String file = ri != null ? ri.attr("ri:filename") : img.attr("alt");
+            img.replaceWith(new TextNode("[img: " + (file.isEmpty() ? "attachment" : file) + "]"));
+        }
+        doc.select("ac|parameter, parameter").remove();
+    }
+
+    private void stripNoise(Document doc) {
+        doc.select("style, script").remove();
+        for (Element e : doc.getAllElements()) {
+            e.removeAttr("style");
+            e.removeAttr("class");
+            e.removeAttr("id");
+            e.attributes().asList().stream()
+                    .filter(a -> a.getKey().startsWith("data-"))
+                    .forEach(a -> e.removeAttr(a.getKey()));
+        }
+        doc.select("span, div, ac|layout, ac|layout-section, ac|layout-cell").unwrap();
+        doc.select("p:empty, td:empty, br").forEach(e -> {
+            if (e.tagName().equals("br")) e.replaceWith(new TextNode("\n")); else e.remove();
+        });
+    }
+
+    private static String paramValue(Element macro, String name) {
+        for (Element p : macro.select("ac|parameter, parameter")) {
+            String n = p.attr("ac:name").isEmpty() ? p.attr("name") : p.attr("ac:name");
+            if (name.equals(n)) return p.text();
+        }
+        return null;
+    }
+
+    // ---------- рендер ----------
+
+    private static final class Ctx {
+        final Map<String, String> links = new LinkedHashMap<>(); // текст -> url
+        int listDepth = 0;
+    }
+
+    private void render(Node node, StringBuilder out, Ctx ctx) {
+        if (node instanceof TextNode t) {
+            out.append(t.text().replace('\u00a0', ' '));
+            return;
+        }
+        if (!(node instanceof Element e)) return;
+
+        switch (e.tagName().toLowerCase()) {
+            case "h1", "h2", "h3", "h4", "h5", "h6" -> {
+                int level = e.tagName().charAt(1) - '0';
+                out.append('\n').append("#".repeat(level)).append(' ')
+                   .append(e.text().trim()).append('\n');
+            }
+            case "p" -> { out.append('\n'); renderChildren(e, out, ctx); out.append('\n'); }
+            case "ul", "ol" -> {
+                ctx.listDepth++;
+                out.append('\n');
+                int i = 1;
+                for (Element li : e.children()) {
+                    if (!li.tagName().equals("li")) continue;
+                    out.append("  ".repeat(ctx.listDepth - 1))
+                       .append(e.tagName().equals("ol") ? (i++) + ". " : "- ");
+                    renderChildren(li, out, ctx);
+                    out.append('\n');
+                }
+                ctx.listDepth--;
+            }
+            case "table" -> renderTable(e, out, ctx);
+            case "a" -> {
+                String text = e.text().trim();
+                String href = e.attr("href");
+                out.append(text.isEmpty() ? href : text);
+                // §3: длинные Confluence-URL выносятся в блок Links, а не остаются инлайн
+                if (!href.isEmpty() && !text.isEmpty()) ctx.links.put(text, href);
+            }
+            case "code" -> out.append('`').append(e.text()).append('`');
+            case "pre" -> out.append("\n```\n").append(e.text()).append("\n```\n");
+            case "strong", "b" -> { out.append("**"); renderChildren(e, out, ctx); out.append("**"); }
+            default -> renderChildren(e, out, ctx);
+        }
+    }
+
+    private void renderChildren(Element e, StringBuilder out, Ctx ctx) {
+        for (Node c : e.childNodes()) render(c, out, ctx);
+    }
+
+    /** Компактные pipe-таблицы: без выравнивающих пробелов — они стоят токенов и ничего не дают. */
+    private void renderTable(Element table, StringBuilder out, Ctx ctx) {
+        List<List<String>> rows = new ArrayList<>();
+        for (Element tr : table.select("tr")) {
+            List<String> cells = new ArrayList<>();
+            for (Element td : tr.select("th, td")) {
+                StringBuilder cell = new StringBuilder();
+                renderChildren(td, cell, ctx);
+                cells.add(cell.toString().replaceAll("\\s+", " ").replace("|", "\\|").trim());
+            }
+            if (cells.stream().anyMatch(c -> !c.isEmpty())) rows.add(cells);
+        }
+        if (rows.isEmpty()) return;
+
+        out.append('\n');
+        out.append('|').append(String.join("|", rows.get(0))).append("|\n");
+        out.append("|").append("---|".repeat(rows.get(0).size())).append('\n');
+        for (int i = 1; i < rows.size(); i++) {
+            out.append('|').append(String.join("|", rows.get(i))).append("|\n");
+        }
+    }
+
+    private String postProcess(String raw, Ctx ctx) {
+        String md = raw.replaceAll("[ \t]{2,}", " ");
+        md = TRAILING_WS.matcher(md).replaceAll("\n");
+        md = MULTI_NEWLINE.matcher(md).replaceAll("\n\n");
+        md = md.strip();
+
+        if (!ctx.links.isEmpty()) {
+            StringBuilder sb = new StringBuilder(md).append("\n\n## Links\n");
+            ctx.links.forEach((text, url) -> sb.append("- ").append(text).append(": ").append(url).append('\n'));
+            md = sb.toString();
+        }
+        return md;
+    }
+}
+
+
+PageResearchSubAgent
+
+package com.bank.confluence.research;
+
+import com.bank.confluence.context.ContextProperties;
+import com.bank.confluence.context.TokenEstimator;
+import com.bank.confluence.store.StoredDocument;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.stereotype.Component;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * §8 спецификации.
+ *
+ * Ключевое упрощение: sub-agent — это ОДИН вызов LLM, а не цикл.
+ * Страница уже загружена и нормализована оркестратором, поэтому инструменты
+ * ему не нужны вообще. Следствия:
+ *   - нет tool-цикла  -> не нужна защита от петель внутри
+ *   - контекст не растёт -> не нужна компакция внутри
+ *   - латентность предсказуема
+ *
+ * Для страницы, не помещающейся в бюджет, идём map-reduce по секциям.
+ * Итерацию ведёт код, не модель. Обрезки нет (I1).
+ */
+@Component
+public class PageResearchSubAgent {
+
+    private static final Log log = LogFactory.getLog(PageResearchSubAgent.class);
+
+    private static final String SYSTEM = """
+            Ты анализируешь ОДНУ страницу Confluence и отвечаешь только на поставленный вопрос.
+
+            Верни строго JSON без markdown-обрамления и без пояснений:
+            {"relevance":0.0-1.0,"answer":"…","evidence":[{"sectionId":"s2","quote":"…"}],"gaps":"…"}
+
+            Правила:
+            - quote — ДОСЛОВНАЯ подстрока из текста секции, не более 200 символов.
+              Ответы с изменёнными цитатами отбрасываются автоматически.
+            - sectionId бери из заголовков вида [s3] в тексте.
+            - Если страница не отвечает на вопрос — relevance ниже 0.2 и пустой answer.
+            - Не додумывай факты, которых нет на странице. Отсутствующее перечисли в gaps.
+            """;
+
+    private final ChatClient subAgentClient;
+    private final TokenEstimator tokens;
+    private final ContextProperties props;
+    private final ObjectMapper mapper = new ObjectMapper();
+    private final MeterRegistry meters;
+
+    public PageResearchSubAgent(@Qualifier("subAgentChatClient") ChatClient subAgentClient,
+                                TokenEstimator tokens,
+                                ContextProperties props,
+                                MeterRegistry meters) {
+        this.subAgentClient = subAgentClient;
+        this.tokens = tokens;
+        this.props = props;
+        this.meters = meters;
+    }
+
+    public Finding analyze(StoredDocument doc, String question) {
+        try {
+            int budget = props.getContext().getCompactTargetTokens();
+            Finding f = doc.tokens() <= budget
+                    ? analyzeWhole(doc, question)
+                    : analyzeByMapReduce(doc, question, budget);
+
+            Finding verified = verifyEvidence(f, doc);
+            meters.summary("subagent.findings.tokens").record(tokens.count(verified.render(doc.title())));
+            return verified;
+        } catch (Exception e) {
+            log.warn("sub-agent упал на " + doc.ref() + ": " + e.getMessage());
+            return Finding.failed(doc.ref(), e.getClass().getSimpleName());
+        }
+    }
+
+    // ---------- один вызов ----------
+
+    private Finding analyzeWhole(StoredDocument doc, String question) {
+        String user = """
+                ВОПРОС: %s
+
+                СТРАНИЦА «%s» (%s)
+                %s
+                """.formatted(question, doc.title(), doc.ref(), withSectionMarkers(doc.sections()));
+        return parse(subAgentClient.prompt().system(SYSTEM).user(user).call().content(), doc.ref());
+    }
+
+    // ---------- map-reduce по секциям ----------
+
+    private Finding analyzeByMapReduce(StoredDocument doc, String question, int budget) {
+        List<List<StoredDocument.Section>> batches = batch(doc.sections(), budget);
+        List<Finding> partials = new ArrayList<>(batches.size());
+
+        for (List<StoredDocument.Section> b : batches) {
+            String user = """
+                    ВОПРОС: %s
+
+                    ЧАСТЬ СТРАНИЦЫ «%s» (%s), секции %s из %d
+                    %s
+                    """.formatted(question, doc.title(), doc.ref(),
+                    b.get(0).id() + "-" + b.get(b.size() - 1).id(), doc.sections().size(),
+                    withSectionMarkers(b));
+            partials.add(parse(subAgentClient.prompt().system(SYSTEM).user(user).call().content(), doc.ref()));
+        }
+        return reduce(partials, doc.ref());
+    }
+
+    /** Reduce делается кодом: берём лучший ответ и объединяем evidence. Лишний вызов LLM не нужен. */
+    private Finding reduce(List<Finding> partials, String ref) {
+        Finding best = partials.stream()
+                .filter(f -> f.status() == Finding.Status.OK)
+                .max((a, b) -> Double.compare(a.relevance(), b.relevance()))
+                .orElse(null);
+        if (best == null) return Finding.parseError(ref);
+
+        List<Finding.Evidence> merged = new ArrayList<>();
+        for (Finding f : partials) {
+            if (f.evidence() != null) merged.addAll(f.evidence());
+        }
+        return best.withEvidence(merged.size() > 4 ? merged.subList(0, 4) : merged);
+    }
+
+    private List<List<StoredDocument.Section>> batch(List<StoredDocument.Section> sections, int budget) {
+        List<List<StoredDocument.Section>> out = new ArrayList<>();
+        List<StoredDocument.Section> cur = new ArrayList<>();
+        int sum = 0;
+        for (StoredDocument.Section s : sections) {
+            if (sum + s.tokens() > budget && !cur.isEmpty()) {
+                out.add(cur);
+                cur = new ArrayList<>();
+                sum = 0;
+            }
+            cur.add(s);
+            sum += s.tokens();
+        }
+        if (!cur.isEmpty()) out.add(cur);
+        return out;
+    }
+
+    private String withSectionMarkers(List<StoredDocument.Section> sections) {
+        StringBuilder sb = new StringBuilder();
+        for (StoredDocument.Section s : sections) {
+            sb.append("\n[").append(s.id()).append("] ").append(s.headingPath()).append('\n')
+              .append(s.text()).append('\n');
+        }
+        return sb.toString();
+    }
+
+    // ---------- парсинг и верификация ----------
+
+    private Finding parse(String content, String ref) {
+        if (content == null || content.isBlank()) return Finding.parseError(ref);
+        String json = content.strip()
+                .replaceAll("^```(?:json)?\\s*", "")
+                .replaceAll("\\s*```$", "");
+        try {
+            var node = mapper.readTree(json);
+            List<Finding.Evidence> ev = new ArrayList<>();
+            if (node.has("evidence") && node.get("evidence").isArray()) {
+                for (var e : node.get("evidence")) {
+                    ev.add(new Finding.Evidence(
+                            e.path("sectionId").asText(""),
+                            e.path("quote").asText("")));
+                }
+            }
+            return new Finding(
+                    ref,
+                    node.path("relevance").asDouble(0),
+                    node.path("answer").asText(""),
+                    ev,
+                    node.path("gaps").asText(""),
+                    Finding.Status.OK);
+        } catch (Exception e) {
+            return Finding.parseError(ref);
+        }
+    }
+
+    /**
+     * Hallucination protection: цитата проверяется точным строковым сравнением
+     * с секцией в сторе. Не совпало — evidence выбрасывается.
+     * Это работает только потому, что полный текст лежит в сторе, а не в контексте.
+     */
+    private Finding verifyEvidence(Finding f, StoredDocument doc) {
+        if (f.evidence() == null || f.evidence().isEmpty()) return f;
+
+        List<Finding.Evidence> valid = new ArrayList<>();
+        for (Finding.Evidence e : f.evidence()) {
+            StoredDocument.Section s = doc.section(e.sectionId());
+            String haystack = s != null ? s.text() : doc.markdown();
+            if (normalize(haystack).contains(normalize(e.quote())) && !e.quote().isBlank()) {
+                valid.add(e);
+            } else {
+                meters.counter("subagent.evidence.rejected").increment();
+            }
+        }
+        if (valid.isEmpty() && f.relevance() > 0.2) {
+            // ответ есть, но ничем не подтверждён — понижаем доверие, а не принимаем на веру
+            return new Finding(f.ref(), Math.min(f.relevance(), 0.19), f.answer(),
+                    List.of(), f.gaps(), Finding.Status.NOT_RELEVANT);
+        }
+        return f.withEvidence(valid);
+    }
+
+    private static String normalize(String s) {
+        return s == null ? "" : s.replaceAll("\\s+", " ").trim().toLowerCase();
+    }
+}
+
+
+AgentTools
+
+package com.bank.confluence.tools;
+
+import com.bank.confluence.context.AgentSession;
+import com.bank.confluence.context.ContextProperties;
+import com.bank.confluence.research.ConfluenceMcpClient;
+import com.bank.confluence.research.Finding;
+import com.bank.confluence.research.ResearchOrchestrator;
+import com.bank.confluence.store.StoredDocument;
+import org.springframework.ai.chat.model.ToolContext;
+import org.springframework.ai.tool.annotation.Tool;
+import org.springframework.ai.tool.annotation.ToolParam;
+import org.springframework.stereotype.Component;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Полный набор инструментов главного агента — четыре штуки.
+ *
+ * Сырые MCP-инструменты сюда НЕ входят намеренно: confluence_get_page
+ * вернул бы тело страницы прямо в главный контекст, что ломает всю схему.
+ * Загрузку страниц выполняет только оркестратор.
+ */
+@Component
+public class AgentTools {
+
+    /** Префикс, по которому L2 узнаёт ref без парсинга тела. */
+    private static final String REF_HEADER = "<!--ref:%s-->";
+
+    private final ConfluenceMcpClient mcp;
+    private final ResearchOrchestrator orchestrator;
+    private final ContextProperties props;
+
+    public AgentTools(ConfluenceMcpClient mcp, ResearchOrchestrator orchestrator, ContextProperties props) {
+        this.mcp = mcp;
+        this.orchestrator = orchestrator;
+        this.props = props;
+    }
+
+    @Tool(name = "confluence_search",
+          description = "Поиск страниц в Confluence по CQL или ключевым словам. "
+                      + "Возвращает только id, заголовок, пространство и короткий фрагмент — без тел страниц.")
+    public String search(@ToolParam(description = "CQL или ключевые слова") String query,
+                         ToolContext toolContext) {
+        AgentSession session = AgentSession.from(toolContext.getContext());
+        session.taskState().markSearch(query);
+
+        List<ConfluenceMcpClient.SearchHit> hits = mcp.search(query, 20);
+        if (hits.isEmpty()) return "Ничего не найдено по запросу: " + query;
+
+        StringBuilder sb = new StringBuilder(hits.size() * 60);
+        sb.append("Найдено ").append(hits.size()).append(":\n");
+        for (var h : hits) {
+            sb.append(h.pageId()).append(" | ").append(h.title())
+              .append(" | ").append(h.spaceKey()).append(" | ")
+              .append(trim(h.excerpt(), 140)).append('\n');
+        }
+        return sb.toString();
+    }
+
+    @Tool(name = "research_pages",
+          description = "Изучить несколько страниц Confluence параллельно и получить по каждой краткий "
+                      + "вывод с проверенными цитатами. Основной инструмент для глубокого поиска. "
+                      + "Передавай id страниц из confluence_search.")
+    public String researchPages(@ToolParam(description = "Список id страниц, максимум 8") List<String> pageIds,
+                                @ToolParam(description = "Конкретный вопрос к этим страницам") String question,
+                                ToolContext toolContext) {
+        AgentSession session = AgentSession.from(toolContext.getContext());
+        var outcome = orchestrator.research(pageIds, question, session);
+
+        if (outcome.findings().isEmpty()) {
+            return "Страницы не удалось загрузить: " + String.join(", ", pageIds);
+        }
+
+        StringBuilder sb = new StringBuilder(1024);
+        double threshold = props.getResearch().getRelevanceThreshold();
+        for (int i = 0; i < outcome.findings().size(); i++) {
+            Finding f = outcome.findings().get(i);
+            StoredDocument doc = outcome.docs().get(i);
+            sb.append(f.render(doc.title())).append('\n');
+
+            // подтверждённые находки сразу попадают в несжимаемый TaskState
+            if (f.status() == Finding.Status.OK && f.relevance() >= threshold && !f.answer().isBlank()) {
+                session.taskState().addFinding(trim(f.answer(), 200), f.ref());
+            }
+        }
+        sb.append("\nПолный текст любой секции: context_read.");
+        return sb.toString();
+    }
+
+    @Tool(name = "context_read",
+          description = "Вернуть полный текст конкретных секций страницы, выгруженной из контекста. "
+                      + "Используй, когда краткого вывода недостаточно.")
+    public String contextRead(@ToolParam(description = "Ссылка вида doc:12345") String ref,
+                              @ToolParam(description = "Идентификаторы секций, например s2,s5. Пусто = манифест") List<String> sectionIds,
+                              ToolContext toolContext) {
+        AgentSession session = AgentSession.from(toolContext.getContext());
+        StoredDocument doc = session.store().get(ref);
+        if (doc == null) {
+            return "Документ " + ref + " не загружен. Сначала вызови research_pages.";
+        }
+
+        String header = REF_HEADER.formatted(doc.ref()) + "\n";
+        if (sectionIds == null || sectionIds.isEmpty()) {
+            return header + doc.digest(null);
+        }
+
+        StringBuilder sb = new StringBuilder(2048).append(header);
+        List<String> missing = new ArrayList<>();
+        for (String id : sectionIds) {
+            StoredDocument.Section s = doc.section(id.trim());
+            if (s == null) { missing.add(id); continue; }
+            sb.append("\n[").append(s.id()).append("] ").append(s.headingPath()).append('\n')
+              .append(s.text()).append('\n');
+        }
+        if (!missing.isEmpty()) sb.append("\nНет таких секций: ").append(String.join(", ", missing));
+        return sb.toString();
+    }
+
+    @Tool(name = "notes_update",
+          description = "Записать подтверждённый факт в рабочие заметки. Заметки переживают сжатие "
+                      + "истории, поэтому фиксируй в них всё существенное сразу.")
+    public String notesUpdate(@ToolParam(description = "Формулировка факта") String finding,
+                              @ToolParam(description = "Ссылка-подтверждение, например doc:12345#s2") String ref,
+                              @ToolParam(description = "Что ещё осталось проверить") List<String> open,
+                              ToolContext toolContext) {
+        AgentSession session = AgentSession.from(toolContext.getContext());
+        if (finding != null && !finding.isBlank()) {
+            session.taskState().addFinding(trim(finding, 200), ref);
+        }
+        if (open != null) session.taskState().setOpen(open);
+        return "Заметки обновлены.";
+    }
+
+    private static String trim(String s, int max) {
+        if (s == null) return "";
+        String one = s.replaceAll("\\s+", " ").trim();
+        return one.length() <= max ? one : one.substring(0, max) + "…";
+    }
+}
+
+
+pom.xml
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>4.0.0</version>
+    <relativePath/>
+  </parent>
+
+  <groupId>com.bank</groupId>
+  <artifactId>confluence-agent</artifactId>
+  <version>1.0.0</version>
+
+  <properties>
+    <java.version>21</java.version>
+    <spring-ai.version>2.0.0</spring-ai.version>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework.ai</groupId>
+        <artifactId>spring-ai-bom</artifactId>
+        <version>${spring-ai.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+
+    <!-- kimi-k2-6 Ð¾ÑÐ´Ð°ÑÑÑÑ ÐºÐ¾ÑÐ¿Ð¾ÑÐ°ÑÐ¸Ð²Ð½ÑÐ¼ Ð¿ÑÐ¾ÐºÑÐ¸ Ð¿Ð¾ OpenAI-ÑÐ¾Ð²Ð¼ÐµÑÑÐ¸Ð¼Ð¾Ð¼Ñ ÐºÐ¾Ð½ÑÑÐ°ÐºÑÑ -->
+    <dependency>
+      <groupId>org.springframework.ai</groupId>
+      <artifactId>spring-ai-starter-model-openai</artifactId>
+    </dependency>
+
+    <!-- MCP client: Ð² 2.0 ÑÑÐ°Ð½ÑÐ¿Ð¾ÑÑ Ð¿Ð¾ ÑÐ¼Ð¾Ð»ÑÐ°Ð½Ð¸Ñ Streamable HTTP, SSE deprecated -->
+    <dependency>
+      <groupId>org.springframework.ai</groupId>
+      <artifactId>spring-ai-starter-mcp-client</artifactId>
+    </dependency>
+
+    <!-- L0: Ð¿Ð°ÑÑÐ¸Ð½Ð³ Confluence storage format -->
+    <dependency>
+      <groupId>org.jsoup</groupId>
+      <artifactId>jsoup</artifactId>
+      <version>1.18.3</version>
+    </dependency>
+
+    <!-- ÐÐ¾Ð´ÑÑÑÑ ÑÐ¾ÐºÐµÐ½Ð¾Ð² -->
+    <dependency>
+      <groupId>com.knuddels</groupId>
+      <artifactId>jtokkit</artifactId>
+      <version>1.1.0</version>
+    </dependency>
+
+    <dependency>
+      <groupId>io.micrometer</groupId>
+      <artifactId>micrometer-core</artifactId>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>
