@@ -1,0 +1,1406 @@
+readme
+# Confluence Search Agent — LangGraph + MCP
+
+Агент глубокого поиска по Confluence, где контекст **не растёт от числа прочитанных страниц**.
+В окне модели всегда только: `System + Question + PLAN + WORKING MEMORY + master summary + 6 строк trace`.
+
+## Граф
+
+```
+        ┌──────────────► planner ◄───────────────────┐
+        │              /   |   \                     │
+        │         search  read  answer → END         │
+        │            │      │                        │
+        └────────────┘   compress → memory_update ───┤
+                                        │            │
+                                       fold ─────────┘
+```
+
+## Где какая техника
+
+| Техника | Реализация |
+|---|---|
+| 1. Working memory вместо истории | `state.AgentState`: `facts / unknowns / next_step`; сырых страниц в state нет |
+| 2. Compression after every tool call | `nodes.compress_node` → `PageDigest` (факты, ссылки, команды, определения, вопросы); `raw_page` стирается в том же апдейте |
+| 3. Reasoning cleanup | все LLM-вызовы через `with_structured_output`; в `trace` попадают только `Action:` / `Observation:` |
+| 4. Relevance pruning | встроено в промпт компрессора (`known` + `unknowns` в контексте) + флаг `irrelevant` → дайджест отбрасывается целиком |
+| 5. Hierarchical summarization | `nodes.fold_node`: старые факты → узел L1, каждые `tree_branching` узлов L1 → L2 и т.д.; `master_summary` — верхушка дерева |
+| 6. План отдельно от истории | `plan: list[PlanStep]`, планировщик возвращает полный обновлённый список статусов |
+| 7. Semantic deduplication | `memory.SemanticIndex` — по эмбеддингам, иначе difflib; дубли фактов мержатся (копится список источников), near-duplicate заголовки («Kafka Guide v2») отсекаются до чтения |
+
+## Запуск
+
+```bash
+pip install -r requirements.txt
+
+export OPENAI_API_KEY=...                  # или свой провайдер / корп. прокси
+export CONFLUENCE_MCP_TRANSPORT=stdio
+export CONFLUENCE_MCP_COMMAND=uvx
+export CONFLUENCE_MCP_ARGS="mcp-atlassian"
+# опционально, если имена тулов нестандартные:
+export CONFLUENCE_SEARCH_TOOL=confluence_search
+export CONFLUENCE_READ_TOOL=confluence_get_page
+
+python -m confluence_agent.main "как настраиваются Kafka ACL в проде?"
+```
+
+Программно:
+
+```python
+from confluence_agent import Settings, ask
+result = await ask("где хранится конфиг Flink-джобы биллинга?", Settings())
+```
+
+## Ключевые пороги (`config.py`)
+
+| Параметр | Дефолт | Смысл |
+|---|---|---|
+| `max_memory_tokens` | 2500 | порог сворачивания working memory |
+| `fold_keep_ratio` | 0.35 | доля свежих фактов, остающихся после сворачивания |
+| `tree_branching` | 5 | сколько узлов уровня N схлопывается в N+1 |
+| `no_progress_limit` | 3 | подряд чтений без новых фактов → принудительный answer |
+| `max_pages` / `max_iterations` | 20 / 24 | жёсткий бюджет прогона |
+| `fact_sim_threshold` | 0.88 | порог семантического дубля факта |
+| `title_sim_threshold` | 0.93 | порог отсечения near-duplicate страницы |
+
+## Tradeoffs (что вы платите за что)
+
+- **Компрессия каждой страницы** — +1 LLM-вызов на страницу. 20 страниц = 20 дешёвых вызовов вместо одного дорогого перегруженного контекста. Если compressor берёт ту же модель, что planner, экономия контекста есть, экономии денег нет: держите `COMPRESSOR_MODEL` дешёвым.
+- **Потеря сырого текста необратима.** Если компрессор выбросил нужную деталь, восстановить её можно только перечитав страницу. Смягчение: `commands` хранит дословные значения, `links` возвращает страницу в кандидаты. Если нужна страховка — кэшируйте raw на диск (не в state) и добавьте узел re-read.
+- **Semantic dedup без эмбеддингов слаб**: difflib ловит переформулировки плохо. С эмбеддингами — +1 сетевой вызов на факт. Компромисс: включайте `EMBEDDING_MODEL` только при `max_pages > 10`.
+- **`skip_near_duplicate_titles`** экономит чтения, но может пропустить «Kafka Guide v2» с реальными изменениями. Если Confluence у вас захламлён версионированными копиями — оставьте `True`, если важна свежесть — `False`.
+- **Иерархическое сворачивание теряет гранулярность**: после fold факты нельзя пересчитать поштучно, только целиком в тексте узла. Поднимайте `max_memory_tokens`, если модель начинает «терять» детали в ответе.
+- **Планировщик не видит историю** — это фича (стабильный размер контекста), но он может повторить близкий по смыслу запрос. Защита частичная: список `queries_done` и суффикс «детали» при точном совпадении.
+- **Relevance pruning встроен в компрессию**, а не сделан отдельным узлом. Экономит вызов, но качество отсечения ниже, чем у отдельного «нужно ли это для ответа?» шага. Если ответы получаются шумными — вынесите в отдельный узел между `compress` и `memory_update`.
+
+## Адаптация под ваш MCP
+
+`mcp_client.py` — единственное место, знающее про формат ответов. Резолв инструментов эвристический
+(`search/cql/find` и `get_page/read_page/...`), парсинг результата: JSON → рекурсивный обход → фолбэк
+на regex по тексту. Под ваш сервер с тремя тулами (CQL search / section extract / full page) добавьте
+третий инструмент в `ConfluenceMCP` и отдельное действие `read_section` в `PlannerDecision` — это
+дешевле полного чтения на 3–5x.
+
+
+graph
+r"""Сборка графа LangGraph.
+
+        ┌──────────────► planner ◄───────────────────┐
+        │              /   |   \                     │
+        │         search  read  answer → END         │
+        │            │      │                        │
+        └────────────┘   compress → memory_update ───┤
+                                        │            │
+                                       fold ─────────┘
+"""
+
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+
+from .config import Settings
+from .mcp_client import ConfluenceMCP
+from .memory import SemanticIndex
+from .nodes import Nodes
+from .state import AgentState, init_state
+
+
+def _make_llm(name: str, temperature: float):
+    from langchain.chat_models import init_chat_model
+
+    return init_chat_model(name, temperature=temperature)
+
+
+def _make_embeddings(settings: Settings):
+    if not settings.embedding_model:
+        return None
+    from langchain.embeddings import init_embeddings
+
+    return init_embeddings(settings.embedding_model)
+
+
+def build_graph(nodes: Nodes, checkpointer=None):
+    g = StateGraph(AgentState)
+
+    g.add_node("planner", nodes.planner_node)
+    g.add_node("search", nodes.search_node)
+    g.add_node("read", nodes.read_node)
+    g.add_node("compress", nodes.compress_node)
+    g.add_node("memory_update", nodes.memory_update_node)
+    g.add_node("fold", nodes.fold_node)
+    g.add_node("answer", nodes.answer_node)
+
+    g.add_edge(START, "planner")
+    g.add_conditional_edges(
+        "planner",
+        nodes.route_after_planner,
+        {"search": "search", "read": "read", "answer": "answer"},
+    )
+    g.add_edge("search", "planner")
+    g.add_conditional_edges("read", nodes.route_after_read, {"compress": "compress", "planner": "planner"})
+    g.add_edge("compress", "memory_update")
+    g.add_conditional_edges("memory_update", nodes.route_after_memory, {"fold": "fold", "planner": "planner"})
+    g.add_edge("fold", "planner")
+    g.add_edge("answer", END)
+
+    return g.compile(checkpointer=checkpointer)
+
+
+@asynccontextmanager
+async def agent(settings: Settings | None = None, checkpointer=None):
+    """Контекст-менеджер: поднимает MCP-сессию и отдаёт скомпилированный граф."""
+    s = settings or Settings()
+    embeddings = _make_embeddings(s)
+
+    async with ConfluenceMCP(s) as mcp:
+        nodes = Nodes(
+            settings=s,
+            mcp=mcp,
+            planner_llm=_make_llm(s.planner_model, s.temperature),
+            compressor_llm=_make_llm(s.compressor_model, s.temperature),
+            summarizer_llm=_make_llm(s.summarizer_model, s.temperature),
+            fact_index=SemanticIndex(embeddings, s.fact_sim_threshold),
+            title_index=SemanticIndex(embeddings, s.title_sim_threshold),
+        )
+        yield build_graph(nodes, checkpointer=checkpointer or MemorySaver())
+
+
+async def ask(question: str, settings: Settings | None = None, thread_id: str = "default") -> dict:
+    """Одноразовый прогон: вопрос → ответ + статистика памяти."""
+    s = settings or Settings()
+    async with agent(s) as graph:
+        final = await graph.ainvoke(
+            init_state(question),
+            config={"configurable": {"thread_id": thread_id}, "recursion_limit": 4 * s.max_iterations + 10},
+        )
+    return {
+        "answer": final.get("answer", ""),
+        "sources": final.get("sources", []),
+        "facts": [f.text for f in final.get("facts", [])],
+        "unknowns": final.get("unknowns", []),
+        "pages_read": final.get("pages_read", 0),
+        "iterations": final.get("iterations", 0),
+        "tree_nodes": len(final.get("tree", [])),
+        "master_summary": final.get("master_summary", ""),
+    }
+
+
+nodes
+"""Узлы графа.
+
+Инварианты:
+* сырой markdown живёт ровно один шаг (read -> compress) и стирается;
+* chain of thought никогда не попадает в state — только строки Action/Observation;
+* в контекст планировщика уходит план + память, но не история.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from .config import Settings
+from .memory import (
+    SemanticIndex,
+    collect_sources,
+    dedupe_strings,
+    memory_size,
+    merge_facts,
+    nodes_to_fold,
+    render_candidates,
+    render_extras,
+    render_facts,
+    render_plan,
+    render_trace,
+    render_unknowns,
+    split_for_fold,
+)
+from .prompts import (
+    ANSWER_SYSTEM,
+    ANSWER_USER,
+    COMPRESSOR_SYSTEM,
+    COMPRESSOR_USER,
+    MASTER_SYSTEM,
+    MASTER_USER,
+    PLANNER_SYSTEM,
+    PLANNER_USER,
+    SUMMARIZER_SYSTEM,
+    SUMMARIZER_USER,
+)
+from .state import AgentState, FinalAnswer, PageDigest, PageRef, PlannerDecision, SummaryNode
+
+
+class Nodes:
+    """Держит зависимости (LLM, MCP, индексы) и отдаёт узлы как методы."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        mcp,
+        planner_llm,
+        compressor_llm,
+        summarizer_llm,
+        fact_index: SemanticIndex,
+        title_index: SemanticIndex,
+    ):
+        self.s = settings
+        self.mcp = mcp
+        self.planner = planner_llm.with_structured_output(PlannerDecision)
+        self.compressor = compressor_llm.with_structured_output(PageDigest)
+        self.answerer = planner_llm.with_structured_output(FinalAnswer)
+        self.summarizer = summarizer_llm
+        self.facts_idx = fact_index
+        self.titles_idx = title_index
+
+    # ------------------------------------------------------------------ #
+    def _log(self, msg: str) -> None:
+        if self.s.verbose:
+            print(msg)
+
+    # ------------------------------------------------------------------ #
+    # 1. Planner
+    # ------------------------------------------------------------------ #
+    async def planner_node(self, state: AgentState) -> dict[str, Any]:
+        iteration = state.get("iterations", 0) + 1
+
+        # жёсткие ограничители — дешевле, чем полагаться на дисциплину модели
+        if iteration > self.s.max_iterations:
+            return {"action": "answer", "iterations": iteration, "stop_reason": "лимит шагов"}
+        if state.get("pages_read", 0) >= self.s.max_pages:
+            return {"action": "answer", "iterations": iteration, "stop_reason": "лимит страниц"}
+        if state.get("no_progress", 0) >= self.s.no_progress_limit:
+            return {"action": "answer", "iterations": iteration, "stop_reason": "нет прироста фактов"}
+
+        decision: PlannerDecision = await self.planner.ainvoke(
+            [
+                {"role": "system", "content": PLANNER_SYSTEM},
+                {
+                    "role": "user",
+                    "content": PLANNER_USER.format(
+                        question=state["question"],
+                        plan=render_plan(state),
+                        facts=render_facts(state),
+                        extras=render_extras(state),
+                        unknowns=render_unknowns(state),
+                        master=state.get("master_summary") or "(пусто)",
+                        queries="\n".join(f"- {q}" for q in state.get("queries_done", [])) or "(нет)",
+                        candidates=render_candidates(state),
+                        trace=render_trace(state, self.s.trace_window),
+                        iteration=iteration,
+                        max_iterations=self.s.max_iterations,
+                        pages_read=state.get("pages_read", 0),
+                        max_pages=self.s.max_pages,
+                    ),
+                },
+            ]
+        )
+
+        update: dict[str, Any] = {
+            "iterations": iteration,
+            "action": decision.action,
+            "next_step": decision.next_step,
+        }
+        if decision.plan:
+            update["plan"] = decision.plan
+
+        if decision.action == "search":
+            query = (decision.query or state["question"]).strip()
+            if query in state.get("queries_done", []):
+                query = f"{query} детали"      # не даём зациклиться на том же запросе
+            update["pending_query"] = query
+        elif decision.action == "read":
+            page = self._resolve_page(state, decision.page_id)
+            if page is None:
+                update["action"] = "search"
+                update["pending_query"] = decision.query or state["question"]
+            else:
+                update["current_page"] = page
+
+        self._log(f"[plan] {iteration}: {update['action']} — {decision.next_step[:100]}")
+        return update
+
+    def _resolve_page(self, state: AgentState, page_id: str | None) -> PageRef | None:
+        visited = set(state.get("visited_ids", []))
+        cands = [c for c in state.get("candidates", []) if c.id not in visited]
+        if not cands:
+            return None
+        if page_id:
+            for c in cands:
+                if c.id == page_id:
+                    return c
+        return cands[0]
+
+    # ------------------------------------------------------------------ #
+    # 2. MCP search
+    # ------------------------------------------------------------------ #
+    async def search_node(self, state: AgentState) -> dict[str, Any]:
+        query = state.get("pending_query") or state["question"]
+        try:
+            found = await self.mcp.search(query, self.s.search_limit)
+        except Exception as exc:  # MCP недоступен — не роняем прогон
+            return {
+                "trace": state.get("trace", []) + [f'Action: search("{query}") → ошибка: {exc}'],
+                "queries_done": state.get("queries_done", []) + [query],
+            }
+
+        visited = set(state.get("visited_ids", []))
+        known = {c.id for c in state.get("candidates", [])}
+        fresh: list[PageRef] = []
+        skipped_dup = 0
+
+        for ref in found:
+            if ref.id in visited or ref.id in known:
+                continue
+            if self.s.skip_near_duplicate_titles and ref.title:
+                dup, _ = await self.titles_idx.match(ref.title)
+                if dup:
+                    skipped_dup += 1
+                    continue
+            fresh.append(ref)
+
+        obs = f"нашлось {len(found)}, новых {len(fresh)}"
+        if skipped_dup:
+            obs += f", отброшено дублей заголовков {skipped_dup}"
+
+        return {
+            "candidates": state.get("candidates", []) + fresh,
+            "queries_done": state.get("queries_done", []) + [query],
+            "trace": state.get("trace", []) + [f'Action: search("{query}") → {obs}'],
+            "no_progress": state.get("no_progress", 0) + (0 if fresh else 1),
+        }
+
+    # ------------------------------------------------------------------ #
+    # 3. Read page (сырой текст — транзиентный)
+    # ------------------------------------------------------------------ #
+    async def read_node(self, state: AgentState) -> dict[str, Any]:
+        page: PageRef = state["current_page"]
+        try:
+            content = await self.mcp.read_page(page.id)
+        except Exception as exc:
+            return {
+                "raw_page": None,
+                "current_page": None,
+                "visited_ids": state.get("visited_ids", []) + [page.id],
+                "trace": state.get("trace", []) + [f"Action: read({page.id}) → ошибка: {exc}"],
+            }
+
+        if page.title:
+            await self.titles_idx.add(page.id, page.title)
+
+        return {
+            "raw_page": content,
+            "visited_ids": state.get("visited_ids", []) + [page.id],
+            "pages_read": state.get("pages_read", 0) + 1,
+            "trace": state.get("trace", []) + [f"Action: read({page.id}) → {len(content)} симв."],
+        }
+
+    # ------------------------------------------------------------------ #
+    # 4. Compression + relevance pruning
+    # ------------------------------------------------------------------ #
+    async def compress_node(self, state: AgentState) -> dict[str, Any]:
+        raw = state.get("raw_page")
+        page: PageRef | None = state.get("current_page")
+        if not raw or page is None:
+            return {"raw_page": None, "digest": None, "current_page": None}
+
+        digest: PageDigest = await self.compressor.ainvoke(
+            [
+                {"role": "system", "content": COMPRESSOR_SYSTEM},
+                {
+                    "role": "user",
+                    "content": COMPRESSOR_USER.format(
+                        question=state["question"],
+                        known=render_facts(state, limit=40),
+                        unknowns=render_unknowns(state),
+                        title=page.title,
+                        page_id=page.id,
+                        content=raw,
+                    ),
+                },
+            ]
+        )
+        # сырой markdown уничтожается здесь и больше нигде не появляется
+        return {"digest": digest, "raw_page": None}
+
+    # ------------------------------------------------------------------ #
+    # 5. Memory update + semantic dedup
+    # ------------------------------------------------------------------ #
+    async def memory_update_node(self, state: AgentState) -> dict[str, Any]:
+        digest: PageDigest | None = state.get("digest")
+        page: PageRef | None = state.get("current_page")
+        update: dict[str, Any] = {"digest": None, "current_page": None}
+
+        if digest is None or page is None:
+            return update
+
+        if digest.irrelevant or not (digest.facts or digest.commands or digest.definitions):
+            update["trace"] = state.get("trace", []) + [f"Observation: {page.id} нерелевантна, отброшена"]
+            update["no_progress"] = state.get("no_progress", 0) + 1
+            return update
+
+        source = page.url or page.id
+        facts, added, merged = await merge_facts(state.get("facts", []), digest.facts, source, self.facts_idx)
+
+        update["facts"] = facts
+        update["definitions"] = dedupe_strings(state.get("definitions", []), digest.definitions)
+        update["commands"] = dedupe_strings(state.get("commands", []), digest.commands)
+        update["unknowns"] = dedupe_strings(state.get("unknowns", []), digest.open_questions, limit=15)
+        update["no_progress"] = 0 if added else state.get("no_progress", 0) + 1
+        update["trace"] = state.get("trace", []) + [
+            f"Observation: memory updated (+{added} фактов, {merged} дублей слито)"
+        ]
+
+        # ссылки со страницы становятся кандидатами без отдельного поиска
+        if digest.links:
+            known = {c.id for c in state.get("candidates", [])} | set(state.get("visited_ids", []))
+            extra = [
+                PageRef(id=link, title="", snippet="ссылка со страницы " + page.id)
+                for link in digest.links
+                if link.isdigit() and link not in known
+            ]
+            if extra:
+                update["candidates"] = state.get("candidates", []) + extra
+
+        self._log(f"[mem] +{added} фактов, слито {merged}, всего {len(facts)}")
+        return update
+
+    # ------------------------------------------------------------------ #
+    # 6. Hierarchical summarization (сворачивание при переполнении)
+    # ------------------------------------------------------------------ #
+    async def fold_node(self, state: AgentState) -> dict[str, Any]:
+        facts = state.get("facts", [])
+        old, keep = split_for_fold(facts, self.s.fold_keep_ratio)
+        if not old:
+            return {}
+
+        block = "\n".join(f.render() for f in old)
+        text = await self.summarizer.ainvoke(
+            [
+                {"role": "system", "content": SUMMARIZER_SYSTEM},
+                {"role": "user", "content": SUMMARIZER_USER.format(question=state["question"], block=block)},
+            ]
+        )
+        node = SummaryNode(level=1, text=text.content.strip(), sources=collect_sources(old), n_facts=len(old))
+
+        tree = state.get("tree", []) + [node]
+        for f in old:
+            await self.facts_idx.drop(f.id)
+
+        # каскадное сворачивание уровней
+        level = 1
+        while True:
+            group = nodes_to_fold(tree, level, self.s.tree_branching)
+            if not group:
+                break
+            joined = "\n\n".join(f"[{i+1}] {n.text}" for i, n in enumerate(group))
+            up = await self.summarizer.ainvoke(
+                [
+                    {"role": "system", "content": MASTER_SYSTEM},
+                    {"role": "user", "content": MASTER_USER.format(question=state["question"], nodes=joined)},
+                ]
+            )
+            merged_node = SummaryNode(
+                level=level + 1,
+                text=up.content.strip(),
+                sources=list(dict.fromkeys(s for n in group for s in n.sources)),
+                n_facts=sum(n.n_facts for n in group),
+            )
+            tree = [n for n in tree if all(n is not g for g in group)] + [merged_node]
+            level += 1
+
+        top_level = max(n.level for n in tree)
+        top_nodes = [n for n in tree if n.level == top_level]
+        if len(top_nodes) == 1:
+            master = top_nodes[0].text
+        else:
+            joined = "\n\n".join(f"[{i+1}] {n.text}" for i, n in enumerate(top_nodes))
+            resp = await self.summarizer.ainvoke(
+                [
+                    {"role": "system", "content": MASTER_SYSTEM},
+                    {"role": "user", "content": MASTER_USER.format(question=state["question"], nodes=joined)},
+                ]
+            )
+            master = resp.content.strip()
+
+        self._log(f"[fold] свёрнуто {len(old)} фактов, узлов в дереве {len(tree)}")
+        return {
+            "facts": keep,
+            "tree": tree,
+            "master_summary": master,
+            "trace": state.get("trace", []) + [f"Observation: memory folded ({len(old)} фактов → саммари)"],
+        }
+
+    # ------------------------------------------------------------------ #
+    # 7. Answer
+    # ------------------------------------------------------------------ #
+    async def answer_node(self, state: AgentState) -> dict[str, Any]:
+        sources = collect_sources(state.get("facts", []))
+        for n in state.get("tree", []):
+            for s in n.sources:
+                if s not in sources:
+                    sources.append(s)
+
+        result: FinalAnswer = await self.answerer.ainvoke(
+            [
+                {"role": "system", "content": ANSWER_SYSTEM},
+                {
+                    "role": "user",
+                    "content": ANSWER_USER.format(
+                        question=state["question"],
+                        facts=render_facts(state),
+                        extras=render_extras(state),
+                        master=state.get("master_summary") or "(пусто)",
+                        unknowns=render_unknowns(state),
+                        sources="\n".join(f"- {s}" for s in sources) or "(нет)",
+                    ),
+                },
+            ]
+        )
+        answer = result.answer
+        if state.get("stop_reason"):
+            answer += f"\n\n_(остановка: {state['stop_reason']})_"
+        return {"answer": answer, "sources": result.sources or sources}
+
+    # ------------------------------------------------------------------ #
+    # Роутеры
+    # ------------------------------------------------------------------ #
+    def route_after_planner(self, state: AgentState) -> str:
+        return {"search": "search", "read": "read", "answer": "answer"}.get(state.get("action", "search"), "search")
+
+    def route_after_memory(self, state: AgentState) -> str:
+        return "fold" if memory_size(state) > self.s.max_memory_tokens else "planner"
+
+    def route_after_read(self, state: AgentState) -> str:
+        return "compress" if state.get("raw_page") else "planner"
+
+memory
+"""Working memory: семантическая дедупликация, рендер компактного контекста,
+иерархическое сворачивание.
+"""
+
+from __future__ import annotations
+
+import difflib
+import math
+import re
+from typing import Iterable, Optional
+
+from .state import AgentState, Fact, SummaryNode, fact_id
+
+# --------------------------------------------------------------------------- #
+# Оценка размера
+# --------------------------------------------------------------------------- #
+
+
+def estimate_tokens(text: str) -> int:
+    """Дешёвая оценка без tiktoken: ~3.5 символа на токен для смешанного ru/en."""
+    return math.ceil(len(text) / 3.5)
+
+
+# --------------------------------------------------------------------------- #
+# Semantic deduplication
+# --------------------------------------------------------------------------- #
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s.\-/]", " ", text.lower())).strip()
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    num = sum(x * y for x, y in zip(a, b))
+    da = math.sqrt(sum(x * x for x in a)) or 1e-9
+    db = math.sqrt(sum(y * y for y in b)) or 1e-9
+    return num / (da * db)
+
+
+class SemanticIndex:
+    """Индекс для поиска почти-дублей.
+
+    С embeddings — семантическое сравнение; без них — difflib по нормализованному тексту.
+    Второй вариант заметно слабее на перефразировках, но не требует внешних вызовов.
+    """
+
+    def __init__(self, embeddings=None, threshold: float = 0.88):
+        self.embeddings = embeddings
+        self.threshold = threshold
+        self._vectors: dict[str, list[float]] = {}
+        self._texts: dict[str, str] = {}
+
+    async def _vector(self, text: str) -> Optional[list[float]]:
+        if self.embeddings is None:
+            return None
+        return await self.embeddings.aembed_query(text)
+
+    async def match(self, text: str) -> tuple[Optional[str], float]:
+        """Вернуть id ближайшего элемента, если он выше порога."""
+        if not self._texts:
+            return None, 0.0
+        key = _norm(text)
+        if self.embeddings is not None:
+            vec = await self._vector(text)
+            best, score = None, 0.0
+            for kid, kvec in self._vectors.items():
+                s = _cosine(vec, kvec)
+                if s > score:
+                    best, score = kid, s
+            return (best, score) if score >= self.threshold else (None, score)
+
+        best, score = None, 0.0
+        for kid, ktext in self._texts.items():
+            s = difflib.SequenceMatcher(None, key, ktext).ratio()
+            if s > score:
+                best, score = kid, s
+        return (best, score) if score >= self.threshold else (None, score)
+
+    async def add(self, key: str, text: str) -> None:
+        self._texts[key] = _norm(text)
+        if self.embeddings is not None:
+            self._vectors[key] = await self._vector(text)
+
+    async def drop(self, key: str) -> None:
+        self._texts.pop(key, None)
+        self._vectors.pop(key, None)
+
+
+async def merge_facts(
+    existing: list[Fact],
+    new_texts: Iterable[str],
+    source: str,
+    index: SemanticIndex,
+) -> tuple[list[Fact], int, int]:
+    """Слить новые факты с памятью. Возвращает (память, добавлено, слито)."""
+    by_id = {f.id: f for f in existing}
+    added = merged = 0
+
+    for text in new_texts:
+        text = text.strip()
+        if len(text) < 8:
+            continue
+        fid = fact_id(text)
+        if fid in by_id:
+            if source and source not in by_id[fid].sources:
+                by_id[fid].sources.append(source)
+            merged += 1
+            continue
+
+        dup_id, _ = await index.match(text)
+        if dup_id and dup_id in by_id:
+            old = by_id[dup_id]
+            # более длинная формулировка обычно конкретнее — оставляем её
+            if len(text) > len(old.text) * 1.25:
+                old.text = text
+            if source and source not in old.sources:
+                old.sources.append(source)
+            merged += 1
+            continue
+
+        fact = Fact(text=text, sources=[source] if source else [])
+        by_id[fact.id] = fact
+        await index.add(fact.id, fact.text)
+        added += 1
+
+    return list(by_id.values()), added, merged
+
+
+def dedupe_strings(existing: list[str], new: Iterable[str], limit: int = 40) -> list[str]:
+    seen = {_norm(x) for x in existing}
+    out = list(existing)
+    for item in new:
+        item = item.strip()
+        if not item or _norm(item) in seen:
+            continue
+        seen.add(_norm(item))
+        out.append(item)
+    return out[-limit:]
+
+
+# --------------------------------------------------------------------------- #
+# Рендер контекста (единственная функция, формирующая промпт-контекст)
+# --------------------------------------------------------------------------- #
+
+
+def render_plan(state: AgentState) -> str:
+    return "\n".join(s.render() for s in state.get("plan", [])) or "(плана ещё нет)"
+
+
+def render_facts(state: AgentState, limit: int | None = None) -> str:
+    facts = state.get("facts", [])
+    if limit:
+        facts = facts[-limit:]
+    return "\n".join(f.render() for f in facts) or "(пусто)"
+
+
+def render_extras(state: AgentState) -> str:
+    parts = []
+    if state.get("definitions"):
+        parts.append("Определения:\n" + "\n".join(f"- {d}" for d in state["definitions"]))
+    if state.get("commands"):
+        parts.append("Команды/конфиги:\n" + "\n".join(f"- {c}" for c in state["commands"]))
+    return "\n".join(parts) or "(пусто)"
+
+
+def render_unknowns(state: AgentState) -> str:
+    return "\n".join(f"- {u}" for u in state.get("unknowns", [])) or "(пусто)"
+
+
+def render_candidates(state: AgentState, limit: int = 12) -> str:
+    cands = [c for c in state.get("candidates", []) if c.id not in set(state.get("visited_ids", []))]
+    return "\n".join(c.render() for c in cands[:limit]) or "(нет)"
+
+
+def render_trace(state: AgentState, window: int) -> str:
+    return "\n".join(state.get("trace", [])[-window:]) or "(нет)"
+
+
+def memory_size(state: AgentState) -> int:
+    blob = "\n".join(
+        [
+            render_facts(state),
+            render_extras(state),
+            render_unknowns(state),
+            state.get("master_summary", ""),
+        ]
+    )
+    return estimate_tokens(blob)
+
+
+# --------------------------------------------------------------------------- #
+# Hierarchical summarization
+# --------------------------------------------------------------------------- #
+
+
+def split_for_fold(facts: list[Fact], keep_ratio: float) -> tuple[list[Fact], list[Fact]]:
+    """Старые факты -> в сворачивание, свежие -> остаются в working memory."""
+    keep_n = max(int(len(facts) * keep_ratio), 5)
+    if len(facts) <= keep_n:
+        return [], facts
+    return facts[:-keep_n], facts[-keep_n:]
+
+
+def collect_sources(facts: list[Fact]) -> list[str]:
+    out: list[str] = []
+    for f in facts:
+        for s in f.sources:
+            if s not in out:
+                out.append(s)
+    return out
+
+
+def nodes_to_fold(tree: list[SummaryNode], level: int, branching: int) -> list[SummaryNode]:
+    same = [n for n in tree if n.level == level]
+    return same if len(same) >= branching else []
+
+
+state
+"""Модели состояния агента.
+
+Ключевой принцип: в state нет истории поиска и нет сырых страниц.
+Только PLAN + WORKING MEMORY + свёрнутое дерево саммари + компактный trace.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from typing import Literal, Optional, TypedDict
+
+from pydantic import BaseModel, Field
+
+# --------------------------------------------------------------------------- #
+# Атомы памяти
+# --------------------------------------------------------------------------- #
+
+
+def fact_id(text: str) -> str:
+    norm = re.sub(r"[^\w\s]", " ", text.lower())
+    norm = re.sub(r"\s+", " ", norm).strip()
+    return hashlib.sha1(norm.encode("utf-8")).hexdigest()[:12]
+
+
+class Fact(BaseModel):
+    text: str
+    sources: list[str] = Field(default_factory=list)
+    id: str = ""
+
+    def model_post_init(self, __context) -> None:  # noqa: D105
+        if not self.id:
+            self.id = fact_id(self.text)
+
+    def render(self) -> str:
+        src = f"  [{', '.join(self.sources[:2])}]" if self.sources else ""
+        return f"- {self.text}{src}"
+
+
+class PlanStep(BaseModel):
+    id: int
+    goal: str
+    status: Literal["todo", "in_progress", "done", "dropped"] = "todo"
+
+    def render(self) -> str:
+        mark = {"todo": " ", "in_progress": "~", "done": "✔", "dropped": "×"}[self.status]
+        return f"{self.id}. [{mark}] {self.goal}"
+
+
+class PageRef(BaseModel):
+    id: str
+    title: str = ""
+    url: str = ""
+    snippet: str = ""
+
+    def render(self) -> str:
+        snip = f" — {self.snippet[:120]}" if self.snippet else ""
+        return f"[{self.id}] {self.title}{snip}"
+
+
+class SummaryNode(BaseModel):
+    """Узел иерархического дерева памяти."""
+
+    level: int
+    text: str
+    sources: list[str] = Field(default_factory=list)
+    n_facts: int = 0
+
+
+# --------------------------------------------------------------------------- #
+# Структурированные выходы LLM
+# --------------------------------------------------------------------------- #
+
+
+class PageDigest(BaseModel):
+    """Сжатие одной страницы. Сырой markdown удаляется сразу после этого шага."""
+
+    irrelevant: bool = Field(
+        default=False,
+        description="true, если страница вообще не помогает ответить на вопрос пользователя",
+    )
+    facts: list[str] = Field(
+        default_factory=list,
+        description="Атомарные факты, нужные для ответа. Одно утверждение = один пункт.",
+    )
+    definitions: list[str] = Field(default_factory=list)
+    commands: list[str] = Field(
+        default_factory=list, description="Команды, конфиги, endpoint'ы, имена топиков/таблиц"
+    )
+    links: list[str] = Field(
+        default_factory=list, description="Ссылки на другие страницы Confluence, стоящие прочтения"
+    )
+    open_questions: list[str] = Field(
+        default_factory=list, description="Что осталось неизвестным после этой страницы"
+    )
+
+
+class PlannerDecision(BaseModel):
+    """Решение планировщика. Рассуждения НЕ сохраняются в state."""
+
+    action: Literal["search", "read", "answer"] = "search"
+    query: Optional[str] = Field(default=None, description="CQL/текстовый запрос для action=search")
+    page_id: Optional[str] = Field(default=None, description="id страницы для action=read")
+    plan: list[PlanStep] = Field(default_factory=list, description="Полный обновлённый план")
+    next_step: str = Field(default="", description="Одна строка: что делаем дальше и зачем")
+
+
+class FinalAnswer(BaseModel):
+    answer: str
+    sources: list[str] = Field(default_factory=list)
+    not_found: bool = False
+
+
+# --------------------------------------------------------------------------- #
+# State графа
+# --------------------------------------------------------------------------- #
+
+
+class AgentState(TypedDict, total=False):
+    # вход
+    question: str
+
+    # план (отдельно от истории)
+    plan: list[PlanStep]
+    next_step: str
+
+    # working memory
+    facts: list[Fact]
+    definitions: list[str]
+    commands: list[str]
+    unknowns: list[str]
+
+    # иерархическая память
+    tree: list[SummaryNode]
+    master_summary: str
+
+    # навигация
+    pending_query: Optional[str]
+    candidates: list[PageRef]
+    visited_ids: list[str]
+    queries_done: list[str]
+    current_page: Optional[PageRef]
+
+    # транзиентные поля (обнуляются в том же проходе)
+    raw_page: Optional[str]
+    digest: Optional[PageDigest]
+
+    # компактный trace: только Action/Observation, без CoT
+    trace: list[str]
+
+    # управление циклом
+    action: str
+    iterations: int
+    pages_read: int
+    no_progress: int
+    stop_reason: str
+
+    # выход
+    answer: str
+    sources: list[str]
+
+
+def init_state(question: str) -> AgentState:
+    return AgentState(
+        question=question,
+        plan=[],
+        next_step="",
+        facts=[],
+        definitions=[],
+        commands=[],
+        unknowns=[],
+        tree=[],
+        master_summary="",
+        pending_query=None,
+        candidates=[],
+        visited_ids=[],
+        queries_done=[],
+        current_page=None,
+        raw_page=None,
+        digest=None,
+        trace=[],
+        action="",
+        iterations=0,
+        pages_read=0,
+        no_progress=0,
+        stop_reason="",
+        answer="",
+        sources=[],
+    )
+
+prompts
+"""Промпты. Все требуют структурированный вывод — свободный CoT нигде не сохраняется."""
+
+PLANNER_SYSTEM = """Ты — планировщик поискового агента по корпоративной Confluence.
+
+Ты НЕ видишь историю поиска и НЕ видишь текст прочитанных страниц. Ты видишь только:
+план, рабочую память (факты / неизвестное), свёрнутые саммари и список непрочитанных кандидатов.
+Этого достаточно: история почти никогда не влияет на следующий шаг.
+
+Каждый ход выбери ровно одно действие:
+- search — если непонятно, где искать, или нужен новый угол (используй ДРУГИЕ формулировки,
+  не повторяй уже выполненные запросы);
+- read   — если среди кандидатов есть страница, которая закроет пункт плана или "неизвестное";
+- answer — если фактов хватает на полный ответ, ИЛИ поиск исчерпан и новые страницы не дают прироста.
+
+Правила:
+1. План веди сам: возвращай ПОЛНЫЙ обновлённый список шагов со статусами.
+   Шаг помечается done только когда в памяти есть подтверждающие факты.
+2. Не читай страницу, если её тема уже полностью покрыта фактами в памяти.
+3. Лучше 3 точных запроса, чем 10 общих. Запросы формулируй терминами предметной области.
+4. next_step — одна строка, без рассуждений.
+5. Если два поиска подряд не дали новых кандидатов — переходи к answer."""
+
+PLANNER_USER = """ВОПРОС ПОЛЬЗОВАТЕЛЯ:
+{question}
+
+ПЛАН:
+{plan}
+
+WORKING MEMORY — факты:
+{facts}
+
+WORKING MEMORY — определения и команды:
+{extras}
+
+НЕИЗВЕСТНО:
+{unknowns}
+
+СВЁРНУТАЯ ПАМЯТЬ (иерархические саммари):
+{master}
+
+УЖЕ ВЫПОЛНЕННЫЕ ЗАПРОСЫ (не повторять дословно):
+{queries}
+
+НЕПРОЧИТАННЫЕ КАНДИДАТЫ:
+{candidates}
+
+ПОСЛЕДНИЕ ДЕЙСТВИЯ:
+{trace}
+
+БЮДЖЕТ: шаг {iteration}/{max_iterations}, прочитано страниц {pages_read}/{max_pages}.
+
+Выбери следующее действие."""
+
+COMPRESSOR_SYSTEM = """Ты — компрессор страниц Confluence. Твоя задача — превратить сырой markdown
+в структурированный дайджест. Исходный текст после тебя УДАЛЯЕТСЯ, поэтому всё нужное должно
+попасть в дайджест.
+
+Жёсткие правила:
+1. Relevance pruning: включай ТОЛЬКО то, что понадобится для ответа на вопрос пользователя.
+   Всё остальное — выбрасывай, даже если оно интересное.
+2. Факты атомарны и самодостаточны: "Kafka ACL настраиваются через kafka-acls.sh на брокере",
+   а не "здесь описана настройка".
+3. Числа, версии, имена топиков, таблиц, сервисов, параметров — сохраняй дословно.
+4. Ничего не додумывай. Нет данных — не пиши.
+5. Если страница не помогает ответить на вопрос — поставь irrelevant=true и оставь списки пустыми.
+6. Никаких рассуждений, только заполненные поля."""
+
+COMPRESSOR_USER = """ВОПРОС ПОЛЬЗОВАТЕЛЯ:
+{question}
+
+ЧТО УЖЕ ИЗВЕСТНО (не дублируй это в facts):
+{known}
+
+ЧЕГО НЕ ХВАТАЕТ:
+{unknowns}
+
+СТРАНИЦА: {title} (id={page_id})
+---
+{content}
+---
+
+Верни структурированный дайджест."""
+
+SUMMARIZER_SYSTEM = """Ты сворачиваешь часть рабочей памяти агента в один плотный блок.
+
+Требования:
+- сохрани все конкретные факты: числа, версии, имена, пути, параметры;
+- сгруппируй по темам, 5–12 строк;
+- без вводных фраз, без "в этом блоке описано";
+- то, что противоречит друг другу, оставь обе версии с пометкой источника."""
+
+SUMMARIZER_USER = """ВОПРОС ПОЛЬЗОВАТЕЛЯ (ориентир, что важно):
+{question}
+
+БЛОК ПАМЯТИ ДЛЯ СВОРАЧИВАНИЯ:
+{block}
+
+Верни только свёрнутый текст."""
+
+MASTER_SYSTEM = """Ты собираешь мастер-саммари из нескольких свёрнутых блоков памяти.
+Убери повторы, сохрани конкретику, структурируй по темам. Без вводных фраз."""
+
+MASTER_USER = """ВОПРОС ПОЛЬЗОВАТЕЛЯ:
+{question}
+
+БЛОКИ:
+{nodes}
+
+Верни только текст мастер-саммари."""
+
+ANSWER_SYSTEM = """Ты отвечаешь пользователю по корпоративной Confluence.
+
+Правила:
+1. Опирайся ТОЛЬКО на рабочую память и саммари. Ничего не додумывай.
+2. Если данных не хватает — прямо скажи, чего именно не хватает, и поставь not_found=true,
+   если ответа нет вообще.
+3. Ответ структурируй: суть → детали → команды/конфиги → что осталось неясным.
+4. В sources перечисли использованные страницы (id или url)."""
+
+ANSWER_USER = """ВОПРОС:
+{question}
+
+ФАКТЫ:
+{facts}
+
+ОПРЕДЕЛЕНИЯ И КОМАНДЫ:
+{extras}
+
+СВЁРНУТАЯ ПАМЯТЬ:
+{master}
+
+ОСТАЛОСЬ НЕИЗВЕСТНЫМ:
+{unknowns}
+
+ИСТОЧНИКИ:
+{sources}
+
+Сформируй финальный ответ."""
+
+
+mcp client
+"""Тонкая обёртка над Confluence MCP server.
+
+Единственное место, где агент знает про транспорт и формат ответов MCP.
+Имена инструментов резолвятся эвристикой, чтобы код не ломался о конкретный сервер.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from typing import Any
+
+from langchain_mcp_adapters.client import MultiServerMCPClient
+
+from .config import Settings
+from .state import PageRef
+
+SEARCH_HINTS = ("search", "cql", "find", "query")
+READ_HINTS = ("get_page", "read_page", "page_content", "get_content", "fetch_page", "page")
+
+
+def _pick_tool(tools: list[Any], explicit: str | None, hints: tuple[str, ...]) -> Any:
+    by_name = {t.name: t for t in tools}
+    if explicit:
+        if explicit not in by_name:
+            raise RuntimeError(f"Инструмент {explicit!r} не найден. Доступны: {list(by_name)}")
+        return by_name[explicit]
+    for hint in hints:
+        for name, tool in by_name.items():
+            if hint in name.lower():
+                return tool
+    raise RuntimeError(f"Не удалось подобрать инструмент по подсказкам {hints}. Доступны: {list(by_name)}")
+
+
+def _as_text(result: Any) -> str:
+    """MCP возвращает строку, список content-блоков или dict — приводим к тексту."""
+    if result is None:
+        return ""
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        if "content" in result:
+            return _as_text(result["content"])
+        return json.dumps(result, ensure_ascii=False)
+    if isinstance(result, (list, tuple)):
+        parts = []
+        for item in result:
+            if isinstance(item, dict):
+                parts.append(item.get("text") or json.dumps(item, ensure_ascii=False))
+            else:
+                parts.append(getattr(item, "text", None) or str(item))
+        return "\n".join(p for p in parts if p)
+    return str(result)
+
+
+def _coerce_refs(payload: Any) -> list[PageRef]:
+    """Достаём страницы из произвольной JSON-структуры ответа поиска."""
+    items: list[dict] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            keys = {k.lower() for k in node}
+            if keys & {"id", "page_id", "content_id"} and keys & {"title", "name"}:
+                items.append(node)
+                return
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(payload)
+
+    refs: list[PageRef] = []
+    for it in items:
+        pid = str(it.get("id") or it.get("page_id") or it.get("content_id") or "").strip()
+        if not pid:
+            continue
+        refs.append(
+            PageRef(
+                id=pid,
+                title=str(it.get("title") or it.get("name") or "")[:200],
+                url=str(it.get("url") or it.get("_links", {}).get("webui", "") if isinstance(it.get("_links"), dict) else it.get("url") or ""),
+                snippet=re.sub(r"\s+", " ", str(it.get("excerpt") or it.get("snippet") or it.get("summary") or ""))[:300],
+            )
+        )
+    return refs
+
+
+def _refs_from_text(text: str) -> list[PageRef]:
+    """Фолбэк: сервер вернул человекочитаемый текст, а не JSON."""
+    refs: list[PageRef] = []
+    for line in text.splitlines():
+        m = re.search(r"(?:id[=:\s]+)(\d{4,})", line, flags=re.I)
+        if not m:
+            continue
+        title = re.sub(r"\s+", " ", re.sub(r"(?:id[=:\s]+)\d{4,}", "", line)).strip(" -•|")
+        refs.append(PageRef(id=m.group(1), title=title[:200]))
+    return refs
+
+
+class ConfluenceMCP:
+    def __init__(self, settings: Settings):
+        self.s = settings
+        self._client: MultiServerMCPClient | None = None
+        self._search = None
+        self._read = None
+
+    async def __aenter__(self) -> "ConfluenceMCP":
+        self._client = MultiServerMCPClient({"confluence": self.s.mcp_connection()})
+        tools = await self._client.get_tools()
+        self._search = _pick_tool(tools, self.s.search_tool, SEARCH_HINTS)
+        self._read = _pick_tool(tools, self.s.read_tool, READ_HINTS)
+        if self.s.verbose:
+            print(f"[mcp] search={self._search.name} read={self._read.name}")
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        self._client = None
+
+    # ------------------------------------------------------------------ #
+
+    async def search(self, query: str, limit: int | None = None) -> list[PageRef]:
+        limit = limit or self.s.search_limit
+        args = {"query": query, "limit": limit}
+        try:
+            raw = await self._search.ainvoke(args)
+        except Exception:
+            # некоторые серверы называют параметры иначе
+            raw = await self._search.ainvoke({"cql": query, "max_results": limit})
+        text = _as_text(raw)
+        try:
+            refs = _coerce_refs(json.loads(text))
+        except (json.JSONDecodeError, TypeError):
+            refs = _refs_from_text(text)
+        return refs[:limit]
+
+    async def read_page(self, page_id: str) -> str:
+        try:
+            raw = await self._read.ainvoke({"page_id": page_id})
+        except Exception:
+            raw = await self._read.ainvoke({"id": page_id})
+        text = _as_text(raw)
+        if len(text) > self.s.max_page_chars:
+            text = text[: self.s.max_page_chars] + "\n…[обрезано по лимиту сырого текста]"
+        return text
+
+
+config
+"""Конфигурация агента. Все пороги в одном месте."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Settings:
+    # --- модели ---------------------------------------------------------- #
+    planner_model: str = os.getenv("PLANNER_MODEL", "openai:gpt-4.1")
+    compressor_model: str = os.getenv("COMPRESSOR_MODEL", "openai:gpt-4.1-mini")
+    summarizer_model: str = os.getenv("SUMMARIZER_MODEL", "openai:gpt-4.1-mini")
+    embedding_model: str | None = os.getenv("EMBEDDING_MODEL")  # None -> difflib fallback
+    temperature: float = 0.0
+
+    # --- MCP ------------------------------------------------------------- #
+    mcp_transport: str = os.getenv("CONFLUENCE_MCP_TRANSPORT", "stdio")  # stdio | streamable_http
+    mcp_command: str = os.getenv("CONFLUENCE_MCP_COMMAND", "uvx")
+    mcp_args: list[str] = field(
+        default_factory=lambda: os.getenv("CONFLUENCE_MCP_ARGS", "mcp-atlassian").split()
+    )
+    mcp_url: str = os.getenv("CONFLUENCE_MCP_URL", "http://localhost:8000/mcp")
+    mcp_headers: dict[str, str] = field(default_factory=dict)
+
+    # явные имена инструментов; если пусто — резолвятся эвристикой по имени
+    search_tool: str | None = os.getenv("CONFLUENCE_SEARCH_TOOL")
+    read_tool: str | None = os.getenv("CONFLUENCE_READ_TOOL")
+
+    # --- бюджеты --------------------------------------------------------- #
+    max_iterations: int = 24          # шагов планировщика
+    max_pages: int = 20               # прочитанных страниц
+    search_limit: int = 10            # результатов на один поиск
+    max_page_chars: int = 60_000      # жёсткая отсечка сырого текста перед сжатием
+    no_progress_limit: int = 3        # подряд чтений без новых фактов -> отвечаем
+
+    # --- working memory --------------------------------------------------- #
+    max_memory_tokens: int = 2_500    # порог сворачивания working memory
+    fold_keep_ratio: float = 0.35     # какую долю свежих фактов оставляем при сворачивании
+    tree_branching: int = 5           # сколько узлов уровня N сворачиваем в узел N+1
+    trace_window: int = 6             # сколько последних строк Action/Observation держим
+
+    # --- дедупликация ------------------------------------------------------ #
+    fact_sim_threshold: float = 0.88      # порог семантического дубля факта
+    title_sim_threshold: float = 0.93     # порог near-duplicate заголовка страницы
+    skip_near_duplicate_titles: bool = True
+
+    # --- прочее ------------------------------------------------------------ #
+    verbose: bool = True
+
+    def mcp_connection(self) -> dict:
+        if self.mcp_transport == "stdio":
+            return {"transport": "stdio", "command": self.mcp_command, "args": self.mcp_args}
+        return {"transport": self.mcp_transport, "url": self.mcp_url, "headers": self.mcp_headers}
+
+
+main
+"""CLI: python -m confluence_agent.main "как настраиваются Kafka ACL?" """
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+
+from .config import Settings
+from .graph import ask
+
+
+async def _run(args) -> None:
+    s = Settings()
+    s.verbose = not args.quiet
+    if args.max_pages:
+        s.max_pages = args.max_pages
+    if args.memory_tokens:
+        s.max_memory_tokens = args.memory_tokens
+
+    result = await ask(args.question, s)
+
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    print("\n" + "=" * 70)
+    print(result["answer"])
+    print("=" * 70)
+    print(f"страниц прочитано: {result['pages_read']} | шагов: {result['iterations']} "
+          f"| фактов в памяти: {len(result['facts'])} | узлов дерева: {result['tree_nodes']}")
+    if result["sources"]:
+        print("источники:")
+        for src in result["sources"]:
+            print(f"  - {src}")
+    if result["unknowns"]:
+        print("осталось неизвестным:")
+        for u in result["unknowns"]:
+            print(f"  - {u}")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Confluence search agent (LangGraph + MCP)")
+    p.add_argument("question")
+    p.add_argument("--max-pages", type=int)
+    p.add_argument("--memory-tokens", type=int, help="порог сворачивания working memory")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--quiet", action="store_true")
+    asyncio.run(_run(p.parse_args()))
+
+
+if __name__ == "__main__":
+    main()
+
+
+init
+from .config import Settings
+from .graph import agent, ask, build_graph
+from .state import AgentState, init_state
+
+__all__ = ["Settings", "agent", "ask", "build_graph", "AgentState", "init_state"]
+
+
+requirements 
+langgraph>=0.2.60
+langchain>=0.3.14
+langchain-mcp-adapters>=0.1.0
+pydantic>=2.7
+# провайдер по вкусу:
+langchain-openai>=0.3.0
+
