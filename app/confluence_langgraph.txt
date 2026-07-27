@@ -1,3 +1,850 @@
+Добавил слой structured.py — with_structured_output больше не обязателен.
+
+Режимы (STRUCTURED_MODE): auto → native → guided (vLLM guided_json) → json_object (llama.cpp/Ollama) → prompt. Для kimi ставьте guided, если у вас vLLM; иначе prompt.
+
+Что делает prompt-режим:
+
+	•	в промпт уходит скелет схемы ("action": "search" | "read" | "answer"), а не JSON Schema — слабые модели читают его сильно лучше
+	•	чистка <think>…</think>, в том числе незакрытого тега (проверено — JSON после него всё равно находится)
+	•	парсер берёт первый сбалансированный {…} с учётом строк/экранирования, чинит висячие запятые, True/None, «умные» кавычки, пробует ast.literal_eval
+	•	пре-коэрсинг: строка вместо списка → сплит по строкам, "true" → bool
+	•	2 repair-ретрая с текстом ошибки валидации
+
+Деградация вместо падения, если JSON не вышел совсем:
+
+	•	planner → детерминированное решение (есть кандидаты → читаем, есть факты → отвечаем, иначе ищем)
+	•	compressor → просим маркированный список, парсим строки
+	•	answer → отдаём сырой текст модели
+
+Tradeoffs: guided строго лучше prompt (0 ретраев, валидный JSON гарантирован), но некоторые бэкенды плохо тянут anyOf в грамматике. prompt стоит ~150–400 токенов скелета на каждый вызов плюс полный повтор на каждом repair. Деградация компрессора в plain-list теряет links — ссылки со страниц перестанут пополнять кандидатов, глубина обхода упадёт.
+
+
+Structed:
+"""Структурированный вывод для моделей без нативного function calling / json schema.
+
+Стратегия (config.structured_mode):
+  native  — llm.with_structured_output(...) как есть;
+  guided  — server-side грамматика (vLLM guided_json / llama.cpp json_schema) через extra_body;
+  prompt  — схема-скелет в промпте + толерантный парсер + repair-ретрай;
+  auto    — пробуем native один раз, при первой же ошибке навсегда переключаемся на prompt.
+
+Локальные сборки (kimi-k2, qwen, glm через llama.cpp / vLLM / ollama) почти всегда
+падают на native: сервер либо игнорирует tools, либо возвращает JSON внутри текста
+или внутри <think>. Режим prompt рассчитан именно на это.
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import re
+from typing import Any, Type, TypeVar
+
+from pydantic import BaseModel, ValidationError
+
+T = TypeVar("T", bound=BaseModel)
+
+
+class StructuredParseError(RuntimeError):
+    pass
+
+
+# --------------------------------------------------------------------------- #
+# Очистка ответа
+# --------------------------------------------------------------------------- #
+
+_THINK_RE = re.compile(
+    r"<(think|thinking|reasoning|reflection|scratchpad)>.*?</\1>", re.DOTALL | re.IGNORECASE
+)
+_UNCLOSED_THINK_RE = re.compile(r"<(think|thinking|reasoning)>.*", re.DOTALL | re.IGNORECASE)
+_FENCE_RE = re.compile(r"```(?:json|JSON)?\s*(.*?)```", re.DOTALL)
+
+
+def strip_reasoning(text: str) -> str:
+    """Убрать <think>…</think> и прочие reasoning-обёртки (kimi/qwen/deepseek стиль)."""
+    text = _THINK_RE.sub(" ", text or "")
+    text = _UNCLOSED_THINK_RE.sub(" ", text)
+    return text.strip()
+
+
+def _balanced_json(text: str) -> str | None:
+    """Найти первый сбалансированный { … } с учётом строк и экранирования."""
+    start = text.find("{")
+    while start != -1:
+        depth, in_str, esc = 0, False, False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+        start = text.find("{", start + 1)
+    return None
+
+
+def _repair_json_text(raw: str) -> str:
+    raw = re.sub(r",\s*([}\]])", r"\1", raw)              # висячие запятые
+    raw = re.sub(r"\bTrue\b", "true", raw)
+    raw = re.sub(r"\bFalse\b", "false", raw)
+    raw = re.sub(r"\b(None|NULL|Null)\b", "null", raw)
+    raw = raw.replace("“", '"').replace("”", '"').replace("’", "'")
+    return raw
+
+
+def parse_json_lenient(text: str) -> dict[str, Any]:
+    """Достать dict из произвольного ответа модели."""
+    original = text or ""
+    text = strip_reasoning(original)
+
+    candidates: list[str] = []
+    fenced = _FENCE_RE.findall(text)
+    candidates.extend(f.strip() for f in fenced)
+    block = _balanced_json(text)
+    if block:
+        candidates.append(block)
+    candidates.append(text.strip())
+    # незакрытый <think> — ищем JSON и в исходном тексте
+    raw_block = _balanced_json(original)
+    if raw_block:
+        candidates.append(raw_block)
+
+    for cand in candidates:
+        if not cand:
+            continue
+        for attempt in (cand, _repair_json_text(cand)):
+            try:
+                data = json.loads(attempt)
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                pass
+            try:  # last resort: питоновский литерал с одинарными кавычками
+                data = ast.literal_eval(attempt)
+                if isinstance(data, dict):
+                    return data
+            except (ValueError, SyntaxError):
+                pass
+    raise StructuredParseError("не удалось выделить JSON из ответа модели")
+
+
+# --------------------------------------------------------------------------- #
+# Схема-скелет (для слабых моделей понятнее, чем сырой JSON Schema)
+# --------------------------------------------------------------------------- #
+
+
+def _render(node: dict, defs: dict, depth: int = 0) -> str:
+    if "$ref" in node:
+        return _render(defs[node["$ref"].split("/")[-1]], defs, depth)
+
+    if "anyOf" in node:
+        parts = [_render(v, defs, depth) for v in node["anyOf"] if v.get("type") != "null"]
+        nullable = any(v.get("type") == "null" for v in node["anyOf"])
+        out = " | ".join(dict.fromkeys(parts)) or "any"
+        return f"{out} | null" if nullable else out
+
+    if "enum" in node:
+        return " | ".join(json.dumps(v, ensure_ascii=False) for v in node["enum"])
+
+    t = node.get("type")
+    if t == "array":
+        return f"[{_render(node.get('items', {}), defs, depth + 1)}]"
+    if t == "object" or "properties" in node:
+        pad = "  " * (depth + 1)
+        lines = []
+        for name, prop in (node.get("properties") or {}).items():
+            desc = prop.get("description")
+            comment = f"   // {desc}" if desc else ""
+            lines.append(f'{pad}"{name}": {_render(prop, defs, depth + 1)},{comment}')
+        inner = "\n".join(lines)
+        return "{\n" + inner + "\n" + "  " * depth + "}"
+    return {"string": "string", "integer": "int", "number": "float", "boolean": "true | false"}.get(t, "any")
+
+
+def schema_skeleton(model_cls: Type[BaseModel]) -> str:
+    schema = model_cls.model_json_schema()
+    return _render(schema, schema.get("$defs", {}))
+
+
+JSON_RULES = """Ответь ТОЛЬКО одним JSON-объектом ровно по этой схеме.
+
+{skeleton}
+
+Требования:
+- никакого текста до и после JSON, никаких ```, никаких комментариев в самом ответе;
+- все ключи из схемы обязательны;
+- строки — в двойных кавычках, без переводов строки внутри;
+- если значения нет — используй null или пустой список [], но ключ оставь."""
+
+REPAIR_RULES = """Предыдущий ответ не прошёл валидацию.
+
+Ошибка: {error}
+
+Твой ответ был:
+{previous}
+
+Верни исправленный JSON-объект по той же схеме. Только JSON."""
+
+
+# --------------------------------------------------------------------------- #
+# Пре-коэрсинг типичных косяков локальных моделей
+# --------------------------------------------------------------------------- #
+
+
+def coerce(model_cls: Type[BaseModel], data: dict) -> dict:
+    fields = model_cls.model_fields
+    out = dict(data)
+    for name, field in fields.items():
+        if name not in out:
+            continue
+        val = out[name]
+        ann = str(field.annotation)
+        wants_list = ann.startswith("list") or "List[" in ann
+        if wants_list and isinstance(val, str):
+            parts = [p.strip(" -•\t") for p in val.splitlines() if p.strip()]
+            out[name] = parts or ([val] if val.strip() else [])
+        elif wants_list and val is None:
+            out[name] = []
+        elif not wants_list and isinstance(val, list) and "str" in ann:
+            out[name] = "\n".join(str(v) for v in val)
+        elif isinstance(val, str) and "bool" in ann:
+            out[name] = val.strip().lower() in {"true", "1", "yes", "да"}
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Основной класс
+# --------------------------------------------------------------------------- #
+
+
+class StructuredLLM:
+    def __init__(
+        self,
+        llm,
+        model_cls: Type[T],
+        mode: str = "auto",
+        repairs: int = 2,
+        extra_body: dict | None = None,
+        verbose: bool = True,
+    ):
+        self.llm = llm
+        self.cls = model_cls
+        self.mode = mode
+        self.repairs = repairs
+        self.verbose = verbose
+        self._native = None
+        self._native_broken = False
+
+        if mode in {"native", "auto"}:
+            try:
+                self._native = llm.with_structured_output(model_cls)
+            except Exception:
+                self._native_broken = True
+
+        if mode == "guided":
+            schema = model_cls.model_json_schema()
+            body = extra_body or {"guided_json": schema}
+            try:
+                self.llm = llm.bind(extra_body=body)
+            except Exception:
+                pass
+        elif mode == "json_object":
+            try:
+                self.llm = llm.bind(response_format={"type": "json_object"})
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------ #
+    async def ainvoke(self, messages: list[dict]) -> T:
+        if self._native is not None and not self._native_broken:
+            try:
+                return await self._native.ainvoke(messages)
+            except Exception as exc:
+                self._native_broken = True
+                if self.verbose:
+                    print(f"[structured] native structured output не работает ({type(exc).__name__}), "
+                          f"переключаюсь на prompt-режим для {self.cls.__name__}")
+                if self.mode == "native":
+                    raise
+
+        return await self._prompt_invoke(messages)
+
+    async def _prompt_invoke(self, messages: list[dict]) -> T:
+        msgs = list(messages)
+        msgs.append({"role": "user", "content": JSON_RULES.format(skeleton=schema_skeleton(self.cls))})
+
+        last_text, last_err = "", ""
+        for attempt in range(self.repairs + 1):
+            resp = await self.llm.ainvoke(msgs)
+            last_text = resp.content if hasattr(resp, "content") else str(resp)
+            if isinstance(last_text, list):  # мультимодальный формат блоков
+                last_text = "".join(b.get("text", "") for b in last_text if isinstance(b, dict))
+            try:
+                data = parse_json_lenient(last_text)
+                return self.cls(**coerce(self.cls, data))
+            except (StructuredParseError, ValidationError, TypeError) as exc:
+                last_err = str(exc)[:600]
+                if attempt == self.repairs:
+                    break
+                if self.verbose:
+                    print(f"[structured] попытка {attempt + 1} не прошла: {last_err[:120]}")
+                msgs = messages + [
+                    {"role": "user", "content": JSON_RULES.format(skeleton=schema_skeleton(self.cls))},
+                    {"role": "assistant", "content": last_text[:2000]},
+                    {"role": "user", "content": REPAIR_RULES.format(error=last_err, previous=last_text[:2000])},
+                ]
+
+        raise StructuredParseError(f"{self.cls.__name__}: {last_err}")
+
+
+def make_structured(llm, model_cls: Type[T], settings) -> StructuredLLM:
+    return StructuredLLM(
+        llm,
+        model_cls,
+        mode=getattr(settings, "structured_mode", "auto"),
+        repairs=getattr(settings, "structured_repairs", 2),
+        extra_body=getattr(settings, "structured_extra_body", None),
+        verbose=getattr(settings, "verbose", True),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Деградация до plain text (когда JSON не выходит вообще)
+# --------------------------------------------------------------------------- #
+
+
+def parse_bullet_list(text: str, limit: int = 40) -> list[str]:
+    """Разобрать ответ вида '- факт' / '1. факт' в список строк."""
+    out: list[str] = []
+    for line in strip_reasoning(text).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        line = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
+        if len(line) < 8 or line.endswith(":"):
+            continue
+        out.append(line)
+    return out[:limit]
+
+
+nodes:
+"""Узлы графа.
+
+Инварианты:
+* сырой markdown живёт ровно один шаг (read -> compress) и стирается;
+* chain of thought никогда не попадает в state — только строки Action/Observation;
+* в контекст планировщика уходит план + память, но не история.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from .config import Settings
+from .memory import (
+    SemanticIndex,
+    collect_sources,
+    dedupe_strings,
+    memory_size,
+    merge_facts,
+    nodes_to_fold,
+    render_candidates,
+    render_extras,
+    render_facts,
+    render_plan,
+    render_trace,
+    render_unknowns,
+    split_for_fold,
+)
+from .prompts import (
+    ANSWER_SYSTEM,
+    ANSWER_USER,
+    COMPRESSOR_SYSTEM,
+    COMPRESSOR_USER,
+    MASTER_SYSTEM,
+    MASTER_USER,
+    PLANNER_SYSTEM,
+    PLANNER_USER,
+    SUMMARIZER_SYSTEM,
+    SUMMARIZER_USER,
+)
+from .state import AgentState, FinalAnswer, PageDigest, PageRef, PlannerDecision, PlanStep, SummaryNode
+from .structured import (
+    StructuredParseError,
+    make_structured,
+    parse_bullet_list,
+    strip_reasoning,
+)
+
+
+class Nodes:
+    """Держит зависимости (LLM, MCP, индексы) и отдаёт узлы как методы."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        mcp,
+        planner_llm,
+        compressor_llm,
+        summarizer_llm,
+        fact_index: SemanticIndex,
+        title_index: SemanticIndex,
+    ):
+        self.s = settings
+        self.mcp = mcp
+        # структурированный вывод с фолбэком для локальных моделей без tool calling
+        self.planner = make_structured(planner_llm, PlannerDecision, settings)
+        self.compressor = make_structured(compressor_llm, PageDigest, settings)
+        self.answerer = make_structured(planner_llm, FinalAnswer, settings)
+        self.summarizer = summarizer_llm
+        self.compressor_raw = compressor_llm
+        self.facts_idx = fact_index
+        self.titles_idx = title_index
+
+    # ------------------------------------------------------------------ #
+    def _log(self, msg: str) -> None:
+        if self.s.verbose:
+            print(msg)
+
+    # ------------------------------------------------------------------ #
+    # 1. Planner
+    # ------------------------------------------------------------------ #
+    async def planner_node(self, state: AgentState) -> dict[str, Any]:
+        iteration = state.get("iterations", 0) + 1
+
+        # жёсткие ограничители — дешевле, чем полагаться на дисциплину модели
+        if iteration > self.s.max_iterations:
+            return {"action": "answer", "iterations": iteration, "stop_reason": "лимит шагов"}
+        if state.get("pages_read", 0) >= self.s.max_pages:
+            return {"action": "answer", "iterations": iteration, "stop_reason": "лимит страниц"}
+        if state.get("no_progress", 0) >= self.s.no_progress_limit:
+            return {"action": "answer", "iterations": iteration, "stop_reason": "нет прироста фактов"}
+
+        messages = [
+                {"role": "system", "content": PLANNER_SYSTEM},
+                {
+                    "role": "user",
+                    "content": PLANNER_USER.format(
+                        question=state["question"],
+                        plan=render_plan(state),
+                        facts=render_facts(state),
+                        extras=render_extras(state),
+                        unknowns=render_unknowns(state),
+                        master=state.get("master_summary") or "(пусто)",
+                        queries="\n".join(f"- {q}" for q in state.get("queries_done", [])) or "(нет)",
+                        candidates=render_candidates(state),
+                        trace=render_trace(state, self.s.trace_window),
+                        iteration=iteration,
+                        max_iterations=self.s.max_iterations,
+                        pages_read=state.get("pages_read", 0),
+                        max_pages=self.s.max_pages,
+                    ),
+                },
+        ]
+        try:
+            decision: PlannerDecision = await self.planner.ainvoke(messages)
+        except StructuredParseError as exc:
+            # модель не смогла отдать валидный JSON — не роняем прогон
+            self._log(f"[plan] fallback: {exc}")
+            decision = self._fallback_decision(state)
+
+        update: dict[str, Any] = {
+            "iterations": iteration,
+            "action": decision.action,
+            "next_step": decision.next_step,
+        }
+        if decision.plan:
+            update["plan"] = decision.plan
+
+        if decision.action == "search":
+            query = (decision.query or state["question"]).strip()
+            if query in state.get("queries_done", []):
+                query = f"{query} детали"      # не даём зациклиться на том же запросе
+            update["pending_query"] = query
+        elif decision.action == "read":
+            page = self._resolve_page(state, decision.page_id)
+            if page is None:
+                update["action"] = "search"
+                update["pending_query"] = decision.query or state["question"]
+            else:
+                update["current_page"] = page
+
+        self._log(f"[plan] {iteration}: {update['action']} — {decision.next_step[:100]}")
+        return update
+
+    def _fallback_decision(self, state: AgentState) -> PlannerDecision:
+        """Детерминированный план Б, если планировщик не отдал структурированный ответ."""
+        visited = set(state.get("visited_ids", []))
+        unread = [c for c in state.get("candidates", []) if c.id not in visited]
+        plan = state.get("plan", []) or [PlanStep(id=1, goal=state["question"])]
+        if unread:
+            return PlannerDecision(action="read", page_id=unread[0].id, plan=plan, next_step="fallback: читаю кандидата")
+        if state.get("facts"):
+            return PlannerDecision(action="answer", plan=plan, next_step="fallback: отвечаю по накопленным фактам")
+        unknown = state.get("unknowns") or []
+        query = unknown[0] if unknown else state["question"]
+        return PlannerDecision(action="search", query=query, plan=plan, next_step="fallback: расширяю поиск")
+
+    def _resolve_page(self, state: AgentState, page_id: str | None) -> PageRef | None:
+        visited = set(state.get("visited_ids", []))
+        cands = [c for c in state.get("candidates", []) if c.id not in visited]
+        if not cands:
+            return None
+        if page_id:
+            for c in cands:
+                if c.id == page_id:
+                    return c
+        return cands[0]
+
+    # ------------------------------------------------------------------ #
+    # 2. MCP search
+    # ------------------------------------------------------------------ #
+    async def search_node(self, state: AgentState) -> dict[str, Any]:
+        query = state.get("pending_query") or state["question"]
+        try:
+            found = await self.mcp.search(query, self.s.search_limit)
+        except Exception as exc:  # MCP недоступен — не роняем прогон
+            return {
+                "trace": state.get("trace", []) + [f'Action: search("{query}") → ошибка: {exc}'],
+                "queries_done": state.get("queries_done", []) + [query],
+            }
+
+        visited = set(state.get("visited_ids", []))
+        known = {c.id for c in state.get("candidates", [])}
+        fresh: list[PageRef] = []
+        skipped_dup = 0
+
+        for ref in found:
+            if ref.id in visited or ref.id in known:
+                continue
+            if self.s.skip_near_duplicate_titles and ref.title:
+                dup, _ = await self.titles_idx.match(ref.title)
+                if dup:
+                    skipped_dup += 1
+                    continue
+            fresh.append(ref)
+
+        obs = f"нашлось {len(found)}, новых {len(fresh)}"
+        if skipped_dup:
+            obs += f", отброшено дублей заголовков {skipped_dup}"
+
+        return {
+            "candidates": state.get("candidates", []) + fresh,
+            "queries_done": state.get("queries_done", []) + [query],
+            "trace": state.get("trace", []) + [f'Action: search("{query}") → {obs}'],
+            "no_progress": state.get("no_progress", 0) + (0 if fresh else 1),
+        }
+
+    # ------------------------------------------------------------------ #
+    # 3. Read page (сырой текст — транзиентный)
+    # ------------------------------------------------------------------ #
+    async def read_node(self, state: AgentState) -> dict[str, Any]:
+        page: PageRef = state["current_page"]
+        try:
+            content = await self.mcp.read_page(page.id)
+        except Exception as exc:
+            return {
+                "raw_page": None,
+                "current_page": None,
+                "visited_ids": state.get("visited_ids", []) + [page.id],
+                "trace": state.get("trace", []) + [f"Action: read({page.id}) → ошибка: {exc}"],
+            }
+
+        if page.title:
+            await self.titles_idx.add(page.id, page.title)
+
+        return {
+            "raw_page": content,
+            "visited_ids": state.get("visited_ids", []) + [page.id],
+            "pages_read": state.get("pages_read", 0) + 1,
+            "trace": state.get("trace", []) + [f"Action: read({page.id}) → {len(content)} симв."],
+        }
+
+    # ------------------------------------------------------------------ #
+    # 4. Compression + relevance pruning
+    # ------------------------------------------------------------------ #
+    async def compress_node(self, state: AgentState) -> dict[str, Any]:
+        raw = state.get("raw_page")
+        page: PageRef | None = state.get("current_page")
+        if not raw or page is None:
+            return {"raw_page": None, "digest": None, "current_page": None}
+
+        messages = [
+            {"role": "system", "content": COMPRESSOR_SYSTEM},
+            {
+                "role": "user",
+                "content": COMPRESSOR_USER.format(
+                    question=state["question"],
+                    known=render_facts(state, limit=40),
+                    unknowns=render_unknowns(state),
+                    title=page.title,
+                    page_id=page.id,
+                    content=raw,
+                ),
+            },
+        ]
+        try:
+            digest: PageDigest = await self.compressor.ainvoke(messages)
+        except StructuredParseError as exc:
+            self._log(f"[compress] JSON не получился ({exc}) — деградирую до списка строк")
+            digest = await self._compress_plaintext(state, page, raw)
+
+        # сырой markdown уничтожается здесь и больше нигде не появляется
+        return {"digest": digest, "raw_page": None}
+
+    async def _compress_plaintext(self, state: AgentState, page: PageRef, raw: str) -> PageDigest:
+        """Фолбэк для моделей, которые не держат JSON: просим маркированный список."""
+        prompt = (
+            f"Вопрос пользователя: {state['question']}\n\n"
+            f"Ниже страница Confluence '{page.title}'. Выпиши маркированным списком только те "
+            f"факты, команды и параметры, которые нужны для ответа на вопрос. "
+            f"Один факт — одна строка, начинай строку с '- '. Никакого вступления.\n\n"
+            f"---\n{raw}\n---"
+        )
+        resp = await self.compressor_raw.ainvoke([{"role": "user", "content": prompt}])
+        lines = parse_bullet_list(getattr(resp, "content", "") or "")
+        return PageDigest(facts=lines, irrelevant=not lines)
+
+    # ------------------------------------------------------------------ #
+    # 5. Memory update + semantic dedup
+    # ------------------------------------------------------------------ #
+    async def memory_update_node(self, state: AgentState) -> dict[str, Any]:
+        digest: PageDigest | None = state.get("digest")
+        page: PageRef | None = state.get("current_page")
+        update: dict[str, Any] = {"digest": None, "current_page": None}
+
+        if digest is None or page is None:
+            return update
+
+        if digest.irrelevant or not (digest.facts or digest.commands or digest.definitions):
+            update["trace"] = state.get("trace", []) + [f"Observation: {page.id} нерелевантна, отброшена"]
+            update["no_progress"] = state.get("no_progress", 0) + 1
+            return update
+
+        source = page.url or page.id
+        facts, added, merged = await merge_facts(state.get("facts", []), digest.facts, source, self.facts_idx)
+
+        update["facts"] = facts
+        update["definitions"] = dedupe_strings(state.get("definitions", []), digest.definitions)
+        update["commands"] = dedupe_strings(state.get("commands", []), digest.commands)
+        update["unknowns"] = dedupe_strings(state.get("unknowns", []), digest.open_questions, limit=15)
+        update["no_progress"] = 0 if added else state.get("no_progress", 0) + 1
+        update["trace"] = state.get("trace", []) + [
+            f"Observation: memory updated (+{added} фактов, {merged} дублей слито)"
+        ]
+
+        # ссылки со страницы становятся кандидатами без отдельного поиска
+        if digest.links:
+            known = {c.id for c in state.get("candidates", [])} | set(state.get("visited_ids", []))
+            extra = [
+                PageRef(id=link, title="", snippet="ссылка со страницы " + page.id)
+                for link in digest.links
+                if link.isdigit() and link not in known
+            ]
+            if extra:
+                update["candidates"] = state.get("candidates", []) + extra
+
+        self._log(f"[mem] +{added} фактов, слито {merged}, всего {len(facts)}")
+        return update
+
+    # ------------------------------------------------------------------ #
+    # 6. Hierarchical summarization (сворачивание при переполнении)
+    # ------------------------------------------------------------------ #
+    async def fold_node(self, state: AgentState) -> dict[str, Any]:
+        facts = state.get("facts", [])
+        old, keep = split_for_fold(facts, self.s.fold_keep_ratio)
+        if not old:
+            return {}
+
+        block = "\n".join(f.render() for f in old)
+        text = await self.summarizer.ainvoke(
+            [
+                {"role": "system", "content": SUMMARIZER_SYSTEM},
+                {"role": "user", "content": SUMMARIZER_USER.format(question=state["question"], block=block)},
+            ]
+        )
+        node = SummaryNode(level=1, text=strip_reasoning(text.content), sources=collect_sources(old), n_facts=len(old))
+
+        tree = state.get("tree", []) + [node]
+        for f in old:
+            await self.facts_idx.drop(f.id)
+
+        # каскадное сворачивание уровней
+        level = 1
+        while True:
+            group = nodes_to_fold(tree, level, self.s.tree_branching)
+            if not group:
+                break
+            joined = "\n\n".join(f"[{i+1}] {n.text}" for i, n in enumerate(group))
+            up = await self.summarizer.ainvoke(
+                [
+                    {"role": "system", "content": MASTER_SYSTEM},
+                    {"role": "user", "content": MASTER_USER.format(question=state["question"], nodes=joined)},
+                ]
+            )
+            merged_node = SummaryNode(
+                level=level + 1,
+                text=strip_reasoning(up.content),
+                sources=list(dict.fromkeys(s for n in group for s in n.sources)),
+                n_facts=sum(n.n_facts for n in group),
+            )
+            tree = [n for n in tree if all(n is not g for g in group)] + [merged_node]
+            level += 1
+
+        top_level = max(n.level for n in tree)
+        top_nodes = [n for n in tree if n.level == top_level]
+        if len(top_nodes) == 1:
+            master = top_nodes[0].text
+        else:
+            joined = "\n\n".join(f"[{i+1}] {n.text}" for i, n in enumerate(top_nodes))
+            resp = await self.summarizer.ainvoke(
+                [
+                    {"role": "system", "content": MASTER_SYSTEM},
+                    {"role": "user", "content": MASTER_USER.format(question=state["question"], nodes=joined)},
+                ]
+            )
+            master = strip_reasoning(resp.content)
+
+        self._log(f"[fold] свёрнуто {len(old)} фактов, узлов в дереве {len(tree)}")
+        return {
+            "facts": keep,
+            "tree": tree,
+            "master_summary": master,
+            "trace": state.get("trace", []) + [f"Observation: memory folded ({len(old)} фактов → саммари)"],
+        }
+
+    # ------------------------------------------------------------------ #
+    # 7. Answer
+    # ------------------------------------------------------------------ #
+    async def answer_node(self, state: AgentState) -> dict[str, Any]:
+        sources = collect_sources(state.get("facts", []))
+        for n in state.get("tree", []):
+            for s in n.sources:
+                if s not in sources:
+                    sources.append(s)
+
+        messages = [
+                {"role": "system", "content": ANSWER_SYSTEM},
+                {
+                    "role": "user",
+                    "content": ANSWER_USER.format(
+                        question=state["question"],
+                        facts=render_facts(state),
+                        extras=render_extras(state),
+                        master=state.get("master_summary") or "(пусто)",
+                        unknowns=render_unknowns(state),
+                        sources="\n".join(f"- {s}" for s in sources) or "(нет)",
+                    ),
+                },
+        ]
+        try:
+            result: FinalAnswer = await self.answerer.ainvoke(messages)
+            answer, out_sources = result.answer, result.sources
+        except StructuredParseError:
+            # финальный ответ важнее схемы: берём сырой текст модели
+            resp = await self.summarizer.ainvoke(messages)
+            answer, out_sources = strip_reasoning(getattr(resp, "content", "") or ""), sources
+        if state.get("stop_reason"):
+            answer += f"\n\n_(остановка: {state['stop_reason']})_"
+        return {"answer": answer, "sources": out_sources or sources}
+
+    # ------------------------------------------------------------------ #
+    # Роутеры
+    # ------------------------------------------------------------------ #
+    def route_after_planner(self, state: AgentState) -> str:
+        return {"search": "search", "read": "read", "answer": "answer"}.get(state.get("action", "search"), "search")
+
+    def route_after_memory(self, state: AgentState) -> str:
+        return "fold" if memory_size(state) > self.s.max_memory_tokens else "planner"
+
+    def route_after_read(self, state: AgentState) -> str:
+        return "compress" if state.get("raw_page") else "planner"
+
+
+config:
+"""Конфигурация агента. Все пороги в одном месте."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Settings:
+    # --- модели ---------------------------------------------------------- #
+    planner_model: str = os.getenv("PLANNER_MODEL", "openai:gpt-4.1")
+    compressor_model: str = os.getenv("COMPRESSOR_MODEL", "openai:gpt-4.1-mini")
+    summarizer_model: str = os.getenv("SUMMARIZER_MODEL", "openai:gpt-4.1-mini")
+    embedding_model: str | None = os.getenv("EMBEDDING_MODEL")  # None -> difflib fallback
+    temperature: float = 0.0
+
+    # --- структурированный вывод ------------------------------------------ #
+    # auto | native | guided | json_object | prompt
+    # локальные сборки (kimi-k2, qwen и т.п.) обычно требуют prompt или guided
+    structured_mode: str = os.getenv("STRUCTURED_MODE", "auto")
+    structured_repairs: int = int(os.getenv("STRUCTURED_REPAIRS", "2"))
+    # для guided: vLLM -> {"guided_json": <schema>} подставляется автоматически;
+    # llama.cpp -> {"response_format": {"type": "json_object"}} задайте здесь вручную
+    structured_extra_body: dict | None = None
+
+    # --- MCP ------------------------------------------------------------- #
+    mcp_transport: str = os.getenv("CONFLUENCE_MCP_TRANSPORT", "stdio")  # stdio | streamable_http
+    mcp_command: str = os.getenv("CONFLUENCE_MCP_COMMAND", "uvx")
+    mcp_args: list[str] = field(
+        default_factory=lambda: os.getenv("CONFLUENCE_MCP_ARGS", "mcp-atlassian").split()
+    )
+    mcp_url: str = os.getenv("CONFLUENCE_MCP_URL", "http://localhost:8000/mcp")
+    mcp_headers: dict[str, str] = field(default_factory=dict)
+
+    # явные имена инструментов; если пусто — резолвятся эвристикой по имени
+    search_tool: str | None = os.getenv("CONFLUENCE_SEARCH_TOOL")
+    read_tool: str | None = os.getenv("CONFLUENCE_READ_TOOL")
+
+    # --- бюджеты --------------------------------------------------------- #
+    max_iterations: int = 24          # шагов планировщика
+    max_pages: int = 20               # прочитанных страниц
+    search_limit: int = 10            # результатов на один поиск
+    max_page_chars: int = 60_000      # жёсткая отсечка сырого текста перед сжатием
+    no_progress_limit: int = 3        # подряд чтений без новых фактов -> отвечаем
+
+    # --- working memory --------------------------------------------------- #
+    max_memory_tokens: int = 2_500    # порог сворачивания working memory
+    fold_keep_ratio: float = 0.35     # какую долю свежих фактов оставляем при сворачивании
+    tree_branching: int = 5           # сколько узлов уровня N сворачиваем в узел N+1
+    trace_window: int = 6             # сколько последних строк Action/Observation держим
+
+    # --- дедупликация ------------------------------------------------------ #
+    fact_sim_threshold: float = 0.88      # порог семантического дубля факта
+    title_sim_threshold: float = 0.93     # порог near-duplicate заголовка страницы
+    skip_near_duplicate_titles: bool = True
+
+    # --- прочее ------------------------------------------------------------ #
+    verbose: bool = True
+
+    def mcp_connection(self) -> dict:
+        if self.mcp_transport == "stdio":
+            return {"transport": "stdio", "command": self.mcp_command, "args": self.mcp_args}
+        return {"transport": self.mcp_transport, "url": self.mcp_url, "headers": self.mcp_headers}
+
+
+
+
+
+
+
+
 readme
 # Confluence Search Agent — LangGraph + MCP
 
